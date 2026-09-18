@@ -1,0 +1,21 @@
+# secrets & account data - NEVER commit
+acc.env
+acc.enc
+*.enc
+*.key
+
+# live databases
+trades.db
+trades_test*.db
+*.db-journal
+
+# python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# wine / terminal artifacts
+*.log
+nohup.out
+MQL5/Files/
+*.ex5

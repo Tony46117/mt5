@@ -1,0 +1,285 @@
+#!/usr/bin/env python3.12
+"""metrics.py - trading performance for the web dashboard.
+
+A background observer watches both terminals' trades.csv (0.5 s poll):
+  * when a position ticket disappears it is recorded as a CLOSED trade
+    with its last known P/L + swap (works for manual and bot trades);
+  * balance/equity are sampled every 10 s into a per-account equity
+    curve (self-updating, shown as a chart in the dashboard).
+
+Everything is persisted through database.py's kv store, so the numbers
+survive restarts.  Consumers (front.py / app.py) call:
+    stats(n)         -> trades taken, wins/losses, winrate, net, pairs
+    equity_curve(n)  -> [[epoch_s, balance, equity], ...] downsampled
+    pairs_traded(n)  -> {symbol: count}
+Run directly:  python metrics.py        # print the stats tables once
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+import time
+import datetime as dt
+
+import config
+from config import CONFIG, setup_logging
+
+from spot import (read_accounts, read_header, pick_terminal, BOLD, DIM,
+                  RESET, GREEN, RED, YELLOW)
+import database as db
+
+log = setup_logging(__name__)
+
+POLL = CONFIG.metrics_poll_seconds          # position watch poll (catches every close)
+SAMPLE_EVERY = CONFIG.metrics_sample_seconds   # equity-curve sampling (s)
+MAX_TRADES = CONFIG.max_closed_trades   # closed-trade history cap per account
+MAX_SAMPLES = CONFIG.max_equity_samples  # 12 h of 10 s samples
+
+
+def f(v) -> float:
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# --------------------------------------------------------------------------
+# storage (through database.kv)
+# --------------------------------------------------------------------------
+
+def _load(key: str, default):
+    v = db.kv_get(key)
+    return v if v is not None else default
+
+
+def _save(key: str, value) -> None:
+    db.kv_set(key, value)
+
+
+# --------------------------------------------------------------------------
+# observer
+# --------------------------------------------------------------------------
+
+class MetricsObserver(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="metrics-observer")
+        self.stop_flag = threading.Event()
+        self._open: dict[int, dict[str, dict]] = {1: {}, 2: {}}
+        self._last_sample = 0.0
+
+    # -- read one account's open positions --------------------------------
+    def _read(self, inst: int) -> tuple[dict, list[dict]]:
+        login = read_accounts().get(inst, {}).get("login", "")
+        term = pick_terminal(login) if login else None
+        if not term:
+            return {}, []
+        head = read_header(term["trades_path"])
+        if not head or head.get("login") != login:
+            return head, []
+        try:
+            raw = term["trades_path"].read_text(encoding="cp1252",
+                                                errors="replace")
+        except OSError:
+            return head, []
+        rows: list[dict] = []
+        for line in raw.splitlines():
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 2 and parts[0] == "NONE":
+                continue
+            if len(parts) >= 11:
+                rows.append({"ticket": parts[0], "symbol": parts[1],
+                             "side": parts[2], "volume": parts[3],
+                             "pl": parts[6], "swap": parts[7],
+                             "time": parts[9]})
+        return head, rows
+
+    # -- one poll -----------------------------------------------------------
+    def _poll_account(self, inst: int) -> None:
+        head, rows = self._read(inst)
+        key = f"closed_trades_{inst}"
+        closed = _load(key, [])
+
+        seen: dict[str, dict] = {}
+        for r in rows:
+            seen[r["ticket"]] = r
+            # refresh last-known P/L for still-open tickets
+            if r["ticket"] in self._open[inst]:
+                self._open[inst][r["ticket"]].update(
+                    pl=f(r["pl"]), swap=f(r["swap"]))
+
+        # vanished tickets = closed trades
+        gone = [t for t in self._open[inst] if t not in seen]
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        for t in gone:
+            info = self._open[inst].pop(t)
+            net = info.get("pl", 0.0) + info.get("swap", 0.0)
+            closed.append({"ticket": t, "symbol": info["symbol"],
+                           "side": info["side"], "lot": info.get("lot", 0.0),
+                           "net": round(net, 2), "opened": info.get("time", ""),
+                           "closed": now})
+        if gone:
+            _save(key, closed[-MAX_TRADES:])
+
+        # newly opened tickets
+        for t, r in seen.items():
+            if t not in self._open[inst]:
+                self._open[inst][t] = {"symbol": r["symbol"], "side": r["side"],
+                                       "lot": f(r["volume"]), "pl": f(r["pl"]),
+                                       "swap": f(r["swap"]), "time": r["time"]}
+
+        # equity-curve sampling
+        if head and time.monotonic() - self._last_sample >= SAMPLE_EVERY:
+            self._last_sample = time.monotonic()
+            curve = _load(f"equity_curve_{inst}", [])
+            curve.append([int(time.time()),
+                          f(head.get("balance", "")),
+                          f(head.get("equity", ""))])
+            _save(f"equity_curve_{inst}", curve[-MAX_SAMPLES:])
+
+    def run(self) -> None:
+        log.info(f"metrics observer started ({POLL} s poll, {SAMPLE_EVERY} s sample)")
+        while not self.stop_flag.is_set():
+            try:
+                for inst in (1, 2):
+                    self._poll_account(inst)
+            except Exception as exc:
+                log.error(f"metrics error: {exc}")
+            self.stop_flag.wait(POLL)
+
+
+# --------------------------------------------------------------------------
+# public API
+# --------------------------------------------------------------------------
+
+def closed_trades(account: int) -> list[dict]:
+    return _load(f"closed_trades_{account}", [])
+
+
+def open_trades(account: int) -> list[dict]:
+    obs = _observer
+    if obs and obs.is_alive():
+        return list(obs._open.get(account, {}).values())
+    return []
+
+
+def pairs_traded(account: int) -> dict[str, int]:
+    """{symbol: trade count} over closed + currently open trades."""
+    counts: dict[str, int] = {}
+    for t in closed_trades(account):
+        counts[t["symbol"]] = counts.get(t["symbol"], 0) + 1
+    for t in open_trades(account):
+        counts[t["symbol"]] = counts.get(t["symbol"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def stats(account: int) -> dict:
+    """Dashboard card for one account."""
+    closed = closed_trades(account)
+    opened = open_trades(account)
+    wins = sum(1 for t in closed if t["net"] > 0)
+    losses = sum(1 for t in closed if t["net"] < 0)
+    net = round(sum(t["net"] for t in closed), 2)
+    total = len(closed)
+    return {
+        "trades_taken": total + len(opened),
+        "open": len(opened),
+        "closed": total,
+        "wins": wins,
+        "losses": losses,
+        "winrate": round(100.0 * wins / total, 1) if total else 0.0,
+        "net_closed": net,
+        "pairs": pairs_traded(account),
+    }
+
+
+def equity_curve(account: int, max_points: int = 240) -> list[list]:
+    """[[epoch_s, balance, equity], ...] downsampled to max_points."""
+    curve = _load(f"equity_curve_{account}", [])
+    if len(curve) <= max_points:
+        return curve
+    step = len(curve) / max_points
+    return [curve[int(i * step)] for i in range(max_points)]
+
+
+_observer: MetricsObserver | None = None
+
+
+def is_running() -> bool:
+    """Check if the metrics observer is running."""
+    global _observer
+    return _observer is not None and _observer.is_alive()
+
+
+def start_observer() -> MetricsObserver:
+    global _observer
+    if _observer is None or not _observer.is_alive():
+        _observer = MetricsObserver()
+        _observer.start()
+    return _observer
+
+
+def stop_observer() -> None:
+    """Gracefully stop the metrics observer."""
+    global _observer
+    if _observer is not None and _observer.is_alive():
+        log.info("stopping metrics observer...")
+        _observer.stop_flag.set()
+        _observer.join(timeout=5.0)
+        log.info("metrics observer stopped")
+    _observer = None
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    import signal
+    ap = argparse.ArgumentParser(description="Trading metrics (dashboard data)")
+    ap.add_argument("--watch", action="store_true", help="refresh every 2 s")
+    args = ap.parse_args()
+
+    start_observer()
+    
+    def _sigterm(*_):
+        stop_observer()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            print(f"{BOLD}TRADING METRICS{RESET}  {DIM}{dt.datetime.now():%H:%M:%S}{RESET}\n")
+            for acc in (1, 2):
+                s = stats(acc)
+                wr = s["winrate"]
+                wr_c = GREEN if wr >= 50 else (RED if s["closed"] and wr < 50 else YELLOW)
+                net = s["net_closed"]
+                net_c = GREEN if net > 0 else (RED if net < 0 else "")
+                print(f"  {BOLD}ACCOUNT {acc}{RESET}")
+                print(f"    trades taken  {s['trades_taken']:>6}   "
+                      f"(open {s['open']}, closed {s['closed']})")
+                print(f"    winrate       {wr_c}{wr:>5.1f} %{RESET}   "
+                      f"(W {s['wins']} / L {s['losses']})")
+                print(f"    net closed    {net_c}{net:>+10.2f}{RESET}")
+                print(f"    pairs         {', '.join(f'{k} x{v}' for k, v in s['pairs'].items()) or '-'}")
+                curve = equity_curve(acc)
+                if curve:
+                    eq = curve[-1][2]
+                    print(f"    equity last   {eq:.2f}   ({len(curve)} samples)")
+                print()
+            if not args.watch:
+                break
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_observer()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
