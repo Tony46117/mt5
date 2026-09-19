@@ -8,12 +8,11 @@ Tables:
     this table and fires each trade to the second;
   * fired log     : one row per executed schedule slot (id, ticket,
     result) so the panel can show what actually happened;
-  * kv            : small JSON blobs (equity-curve history, hft stats).
-  * hft_stats     : HFT bot trade history with indicators and Markov state.
+  * kv            : small JSON blobs (equity-curve history, metrics).
 
 Threading: connections are per-call (context manager) and every
 write is wrapped in a transaction, so the Flask threads, the executor
-thread and hft.py can share the database safely.
+thread and the metrics observer can share the database safely.
 
 Schema is created on first import - no migrations needed for now.
 """
@@ -29,7 +28,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import config
 from config import CONFIG, setup_logging
 
 log = setup_logging(__name__)
@@ -99,28 +97,49 @@ def _pg_conn():
         p.putconn(conn)
 
 
+_sqlite_conn_obj: sqlite3.Connection | None = None
+
+
 @contextmanager
 def _sqlite_conn():
-    """Get a SQLite connection - optimized for speed."""
+    """ONE autocommit connection, reused, serialised by _sqlite_lock.
+
+    Every call used to open a fresh connection and re-issue eight pragmas.
+    Three of those (journal_mode, page_size, auto_vacuum) persist in the
+    file header and were no-ops after the first run; the rest cost a round
+    trip each.  More importantly the connect() itself dominated, and the
+    scheduler re-lists due schedules up to 200x/s in the two seconds before
+    a fire WHILE HOLDING THIS LOCK - so the setup cost sat on the web app's
+    critical path as well.
+
+    Reusing one connection is safe here: the lock already serialises every
+    caller, and isolation_level=None means each statement is its own
+    transaction, so no reader ever pins a WAL snapshot.
+    """
+    global _sqlite_conn_obj
     with _sqlite_lock:
-        conn = sqlite3.connect(_sqlite_path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        # Performance pragmas
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-32768")       # 32MB cache
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA mmap_size=268435456")    # 256MB mmap
-        conn.execute("PRAGMA page_size=4096")
-        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        conn = _sqlite_conn_obj
+        if conn is None:
+            conn = sqlite3.connect(_sqlite_path, timeout=10,
+                                   isolation_level=None,
+                                   check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32768")     # 32 MB
+            _sqlite_conn_obj = conn
         try:
             yield conn
         except Exception:
-            conn.rollback()
+            # autocommit: only an explicitly opened transaction can be
+            # pending, but never leave one behind on a shared connection.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             raise
-        finally:
-            conn.close()
 
 
 @contextmanager
@@ -213,33 +232,6 @@ def _init_pg() -> None:
             value JSONB   NOT NULL
         );
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS hft_stats (
-            id           BIGSERIAL PRIMARY KEY,
-            account      INTEGER NOT NULL,
-            symbol       TEXT    NOT NULL,
-            side         TEXT    NOT NULL,
-            lot          REAL    NOT NULL,
-            entry_price  REAL    NOT NULL,
-            exit_price   REAL,
-            pnl          REAL,
-            rsi          REAL,
-            macd_line    REAL,
-            macd_signal  REAL,
-            markov_state TEXT,
-            confidence   REAL,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            closed_at    TIMESTAMPTZ
-        );
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account
-            ON hft_stats (account);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol
-            ON hft_stats (symbol);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account_created
-            ON hft_stats (account, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol_created
-            ON hft_stats (symbol, created_at DESC);
-        """)
 
 
 def _init_sqlite() -> None:
@@ -285,30 +277,6 @@ def _init_sqlite() -> None:
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS hft_stats (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            account      INTEGER NOT NULL,
-            symbol       TEXT    NOT NULL,
-            side         TEXT    NOT NULL,
-            lot          REAL    NOT NULL,
-            entry_price  REAL    NOT NULL,
-            exit_price   REAL,
-            pnl          REAL,
-            rsi          REAL,
-            macd_line    REAL,
-            macd_signal  REAL,
-            markov_state TEXT,
-            confidence   REAL,
-            created_at   TEXT    NOT NULL,
-            closed_at    TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account ON hft_stats (account);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol ON hft_stats (symbol);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account_created
-            ON hft_stats (account, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol_created
-            ON hft_stats (symbol, created_at DESC);
         """)
 
 
@@ -576,7 +544,7 @@ def list_fired(limit: int = 50) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# kv blobs (equity curve, hft stats)
+# kv blobs (equity curve, metrics)
 # --------------------------------------------------------------------------
 
 def kv_set(key: str, value: Any) -> None:
@@ -603,111 +571,6 @@ def kv_get(key: str, default=None):
             _exec(cur, "SELECT value FROM kv WHERE key=?", (key,))
         r = _fetchone(cur)
         return json.loads(r["value"]) if r else default
-
-
-# --------------------------------------------------------------------------
-# hft stats
-# --------------------------------------------------------------------------
-
-def log_hft_trade(account: int, symbol: str, side: str, lot: float,
-                  entry_price: float, rsi: float, macd_line: float,
-                  macd_signal: float, markov_state: str, confidence: float) -> int:
-    """Log an HFT trade entry."""
-    with _conn() as c:
-        cur = c.cursor()
-        import datetime as dt
-        now = dt.datetime.now(dt.timezone.utc)
-        if USE_POSTGRES:
-            _exec(cur,
-                """INSERT INTO hft_stats
-                   (account, symbol, side, lot, entry_price, rsi, macd_line,
-                    macd_signal, markov_state, confidence, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   RETURNING id""",
-                (account, symbol, side, lot, entry_price, rsi, macd_line,
-                 macd_signal, markov_state, confidence, now))
-            return int(cur.fetchone()["id"])
-        else:
-            _exec(cur,
-                """INSERT INTO hft_stats
-                   (account, symbol, side, lot, entry_price, rsi, macd_line,
-                    macd_signal, markov_state, confidence, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (account, symbol, side, lot, entry_price, rsi, macd_line,
-                 macd_signal, markov_state, confidence, now.isoformat(timespec="seconds")))
-            return int(cur.lastrowid)
-
-
-def update_hft_trade(trade_id: int, exit_price: float, pnl: float) -> None:
-    """Update HFT trade with exit info."""
-    import datetime as dt
-    with _conn() as c:
-        cur = c.cursor()
-        now = dt.datetime.now(dt.timezone.utc)
-        if USE_POSTGRES:
-            _exec(cur,
-                "UPDATE hft_stats SET exit_price=%s, pnl=%s, closed_at=%s WHERE id=%s",
-                (exit_price, pnl, now, trade_id))
-        else:
-            _exec(cur,
-                "UPDATE hft_stats SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
-                (exit_price, pnl, now.isoformat(timespec="seconds"), trade_id))
-
-
-def get_hft_stats(account: int | None = None, symbol: str | None = None, limit: int = 100) -> list[dict]:
-    """Get HFT trade statistics."""
-    with _conn() as c:
-        cur = c.cursor()
-        q = "SELECT * FROM hft_stats"
-        params = []
-        conditions = []
-        if account is not None:
-            conditions.append("account = %s" if USE_POSTGRES else "account = ?")
-            params.append(account)
-        if symbol is not None:
-            conditions.append("symbol = %s" if USE_POSTGRES else "symbol = ?")
-            params.append(symbol)
-        if conditions:
-            q += " WHERE " + " AND ".join(conditions)
-        q += " ORDER BY created_at DESC LIMIT %s" if USE_POSTGRES else " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-        _exec(cur, q, tuple(params))
-        return _fetchall(cur)
-
-
-def get_hft_performance(account: int) -> dict:
-    """Get HFT performance summary for an account."""
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, """
-                SELECT 
-                    COUNT(*) as total_trades,
-                    COUNT(CASE WHEN pnl > 0 THEN 1 END) as wins,
-                    COUNT(CASE WHEN pnl < 0 THEN 1 END) as losses,
-                    COALESCE(SUM(pnl), 0) as net_pnl,
-                    AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
-                    AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
-                    MAX(pnl) as max_win,
-                    MIN(pnl) as max_loss
-                FROM hft_stats
-                WHERE account = %s AND pnl IS NOT NULL
-            """, (account,))
-        else:
-            _exec(cur, """
-                SELECT 
-                    COUNT(*) as total_trades,
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
-                    COALESCE(SUM(pnl), 0) as net_pnl,
-                    AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
-                    AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
-                    MAX(pnl) as max_win,
-                    MIN(pnl) as max_loss
-                FROM hft_stats
-                WHERE account = ? AND pnl IS NOT NULL
-            """, (account,))
-        return dict(_fetchone(cur) or {})
 
 
 if __name__ == "__main__":
