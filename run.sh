@@ -33,10 +33,9 @@ EOF
 }
 
 if [ "${1:-}" = "stop" ]; then
-  echo "stopping bridge / app / probes / terminals..."
+  echo "stopping bridge / app / terminals..."
   pkill -f "bridge.py" 2>/dev/null
   pkill -f "app.py" 2>/dev/null
-  pkill -f "burst_probe|minute_probe|probe_schedules" 2>/dev/null
   stop_terminals
   echo "all stopped."
   exit 0
@@ -63,9 +62,12 @@ cleanup() {
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-# leftovers of a previous run must not hold :8000 or double-supervise
+# leftovers of a previous run must not hold :8000, double-supervise, or
+# race the boot (a terminal still exiting when the bridge launches its own
+# copy double-boots MT5 and the EA can end up detached - observed live)
 pkill -f "bridge.py" 2>/dev/null
 pkill -f "app.py" 2>/dev/null
+stop_terminals
 sleep 1
 
 echo "starting web app on :8000 (log: $APP_LOG)..."

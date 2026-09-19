@@ -249,7 +249,7 @@ ${B}install complete.${N}
     1. ${B}python bridge.py${N}   - boots both terminals into the stored session (ALGO ON); logging into any account on any terminal is adopted live
     2. ${B}python app.py${N}      - web terminal (dashboard, panel, broker probe)
     3. ${B}python info.py${N}     - account info incl. spreads + best filling
-    4. ${B}python probe_schedules.py${N} - verify scheduled trades execute fast
+    4. ${B}python executor.py --status${N} - show scheduled trades + fired log
 
 ${D}run everything with the venv python:  ~/python312/bin/python ...${N}
 EOF

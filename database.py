@@ -546,8 +546,7 @@ def log_fired(schedule_id: int, account: int, pair: str, side: str,
               lot: float, kind: str, ticket: str, ok: bool, detail: str,
               ms: float | None = None) -> None:
     """Log one fired command.  `ms` = wall milliseconds the whole fire took
-    (batch of n opens -> same ms on each of the n rows) - probe_schedules
-    reads it for latency stats."""
+    (batch of n opens -> same ms on each of the n rows) - latency auditing"""
     import datetime as dt
     with _conn() as c:
         cur = c.cursor()

@@ -1,7 +1,0 @@
-listen you are going to run this mt5 software by first running bridge which will launch the two minimalistic mt5 terminals
-the two terminals should be launched while algo trading is already turned on so the executor doesnt get blocked so add that feature
-then you will run app.py that will run the server ,then you are going to start scheduling trades that start being executed right from when you will start scheduling ,so you will schedule  four 0.5 eurusd trades in a continuous loop until you make sure that the executor is working for scheduled trades and at lightning speed ,also you willfix the buy and sell buttons in the accounts panel so that they also execute and at light speed 
-i was getting a 10027 retcode error while scheduling trades 
-so if you start scheduling trades you should schedule in a way you will be able to continuosly debug execution so dont start by scheduling trades that are far in time but rather trades that are executing shortly and you acn monitor if they ae actually executing 
-also try executing trades with the buy and sell buttons in the accounts panel and resolve any execution problems i want execution to be lightning fast
-also fix close.py 10027 retcode error fix this execution 10027 retcode error i swear its so fucking annoying 
