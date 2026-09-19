@@ -1,21 +1,20 @@
 #!/usr/bin/env python3.12
-"""app.py - the web trading terminal (Flask + production WSGI).
+"""app.py - the web trading terminal (Flask) and the scheduler's host process.
 
-IMPROVEMENTS:
-- Production WSGI server (waitress) with configurable workers/threads
-- Health check endpoint (/health)
-- Graceful shutdown with signal handling
-- API rate limiting (in-memory)
-- Better JSON error responses
-- CORS support for external dashboards
-- Request logging middleware
-- HFT stats endpoints
-- Full API coverage from mt5
+Serves the dashboard ("/") and the trading panel ("/panel") rendered by
+front.py, exposes the JSON API those pages poll, and owns the three
+background workers: the future-trade scheduler (executor.py), the closed-
+trade/equity observer (metrics.py) and the broker capability prober.
+
+SECURITY: there is NO authentication on this API and every /api/trade,
+/api/close and /api/schedule call moves real money.  Bind it to localhost
+only (the default) and do not expose the port.  Cross-origin access is
+refused unless MT5_CORS_ORIGIN names an exact origin.
 
 Usage:
-    python app.py              # http://localhost:8000
-    python app.py --production # Use waitress WSGI server
-    python app.py --port 9000  # Custom port
+    python app.py              # http://127.0.0.1:8000
+    python app.py --production # serve via waitress instead of the dev server
+    python app.py --port 9000  # custom port
 """
 
 from __future__ import annotations
@@ -31,16 +30,15 @@ import time
 from functools import wraps
 from typing import Callable
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 
-import config
 from config import CONFIG, setup_logging, validate_config
 
 import front
 import database as db
 from info import snapshot
 from spot import read_spots, feed_age, term_running
-from executor import start_scheduler, stop_scheduler, sender_for
+from executor import start_scheduler, sender_for
 from monitor import read_positions, account_info
 import metrics
 import broker_prober
@@ -95,10 +93,20 @@ def log_request():
 # --------------------------------------------------------------------------
 
 @app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+def add_security_headers(response):
+    """This API places and closes REAL orders and has no authentication.
+    It used to answer with Access-Control-Allow-Origin: * , which let any
+    web page the operator happened to visit read account state and fire
+    trades on their behalf.  No cross-origin access is granted; set
+    MT5_CORS_ORIGIN to an exact origin if an external dashboard needs it."""
+    origin = os.getenv("MT5_CORS_ORIGIN", "").strip()
+    if origin and origin != "*":
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Vary"] = "Origin"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     return response
 
 
@@ -302,7 +310,9 @@ def api_trade():
         return _fail("bad account")
     if account not in (1, 2):
         return _fail("account must be 1 or 2")
-    symbol = str(d.get("symbol", "")).upper()
+    # MT5 symbol names are CASE-SENSITIVE ("Boom 1000 Index"): pass the
+    # symbol through exactly as the feed reported it.
+    symbol = str(d.get("symbol", "")).strip()
     side = str(d.get("side", "")).upper()
     if side not in ("BUY", "SELL"):
         return _fail("side must be BUY or SELL")
@@ -400,7 +410,8 @@ def api_schedule():
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
-        pair = str(d.get("pair", "")).upper()
+        pair = str(d.get("pair", "")).strip()   # case-sensitive symbol name
+        side = str(d.get("side", "BUY")).upper()
         lot = float(d.get("lot", 0))
         n = int(d.get("n", 1))
         ex, cl = d.get("exec") or [0, 0, 0], d.get("close") or [0, 0, 0]
@@ -410,6 +421,10 @@ def api_schedule():
         return _fail("bad schedule fields")
     if account not in (1, 2):
         return _fail("account must be 1 or 2")
+    if side not in ("BUY", "SELL"):
+        return _fail("side must be BUY or SELL")
+    if not pair:
+        return _fail("pair is required")
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
     if not 1 <= n <= 50:
@@ -422,7 +437,7 @@ def api_schedule():
     for h, m, s in ((eh, em, es), (ch, cm, cs)):
         if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
             return _fail("time out of range")
-    sid = db.add_future_trade(account, pair, "BUY", lot, n, eh, em, es, ch, cm, cs)
+    sid = db.add_future_trade(account, pair, side, lot, n, eh, em, es, ch, cm, cs)
     return _ok({"id": sid, "next_fire": db.get_schedule(sid)["next_fire"]})
 
 
@@ -453,41 +468,30 @@ def api_fired():
     return jsonify({"ok": True, "fired": db.list_fired(80)})
 
 
+@app.get("/api/clock")
+@rate_limit(max_requests=120, window=60)
+def api_clock():
+    """Which clock schedule times are interpreted in.
+
+    Schedules are stored and fired in UTC (database.add_future_trade), but
+    the panel used to render a bare "14:30:00" with no zone, so an operator
+    in UTC+3 scheduled 14:30 and the order fired at 17:30 their time.  The
+    panel now labels the zone and shows the local equivalent.
+    """
+    now_local = dt.datetime.now().astimezone()
+    return _ok({
+        "schedule_tz": "UTC",
+        "utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "local": now_local.isoformat(timespec="seconds"),
+        "local_name": now_local.tzname() or "local",
+        "utc_offset_minutes": int(now_local.utcoffset().total_seconds() // 60),
+    })
+
+
 @app.get("/api/schedules")
 @rate_limit(max_requests=60, window=60)
 def api_schedules():
     return jsonify({"ok": True, "schedules": db.list_future_trades()})
-
-
-@app.get("/api/hft/stats")
-@rate_limit(max_requests=30, window=60)
-def api_hft_stats():
-    """Get HFT bot statistics for both accounts."""
-    return jsonify({
-        "ok": True,
-        "ts": dt.datetime.now().isoformat(timespec="seconds"),
-        "accounts": {
-            "1": db.get_hft_performance(1),
-            "2": db.get_hft_performance(2)
-        },
-        "recent_trades": {
-            "1": db.get_hft_stats(1, limit=20),
-            "2": db.get_hft_stats(2, limit=20)
-        }
-    })
-
-
-@app.get("/api/hft/trades")
-@rate_limit(max_requests=30, window=60)
-def api_hft_trades():
-    """Get HFT trade history."""
-    account = request.args.get("account", type=int)
-    symbol = request.args.get("symbol", type=str)
-    limit = request.args.get("limit", default=100, type=int)
-    return jsonify({
-        "ok": True,
-        "trades": db.get_hft_stats(account, symbol, limit)
-    })
 
 
 @app.get("/api/metrics/<int:acc>")
@@ -550,17 +554,6 @@ def server_error(e):
 # --------------------------------------------------------------------------
 
 _scheduler = None
-_shutdown_event = threading.Event()
-
-
-def _signal_handler(signum, frame):
-    sig_name = signal.Signals(signum).name
-    log.info(f"Received {sig_name}, shutting down gracefully...")
-    _shutdown_event.set()
-    stop_scheduler()
-    metrics.stop_observer()
-    broker_prober.stop_prober()
-    sys.exit(0)
 
 
 def _warmup_first_orders() -> None:
@@ -573,19 +566,33 @@ def _warmup_first_orders() -> None:
     live: the first scheduled trade after a fresh boot timed out and its
     close timed out twice, while every later order ran at ~550 ms.  A
     warm-up trade absorbs that cold path at deploy time, so the first
-    REAL scheduled order is never the one that pays for it."""
-    import threading
+    REAL scheduled order is never the one that pays for it.
+
+    This places and closes a REAL order on both accounts at every start,
+    so it is opt-OUT (MT5_WARMUP=0) and the symbol/lot are configurable
+    instead of a hardcoded XAUUSD247 0.01 that only suits one broker.
+    """
+    if os.getenv("MT5_WARMUP", "1") != "1":
+        log.info("deploy warm-up disabled (MT5_WARMUP=0)")
+        return
+    symbol = os.getenv("MT5_WARMUP_SYMBOL", "XAUUSD247")
+    try:
+        lot = float(os.getenv("MT5_WARMUP_LOT", "0.01"))
+    except ValueError:
+        lot = 0.01
+    log.info(f"deploy warm-up armed: one {symbol} {lot} open+close per "
+             f"terminal in 20 s (MT5_WARMUP=0 disables)")
 
     def _warm(inst: int) -> None:
         try:
             time.sleep(20.0)               # let feeds/login settle first
             from executor import _close_one
-            ok, det = sender_for(inst).open_trade("XAUUSD247", "BUY", 0.01,
+            ok, det = sender_for(inst).open_trade(symbol, "BUY", lot,
                                                   magic=777099,
                                                   comment="warmup")
             if ok:
                 time.sleep(0.4)
-                _close_one(inst, "XAUUSD247")
+                _close_one(inst, symbol)
                 log.info(f"terminal {inst}: deploy warm-up trade done")
             else:
                 log.warning(f"terminal {inst}: warm-up open failed ({det}) - "
@@ -606,8 +613,6 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=CONFIG.web_port)
     ap.add_argument("--production", action="store_true",
                     help="serve via waitress (production WSGI) instead of the dev server")
-    ap.add_argument("--workers", type=int, default=CONFIG.web_workers,
-                    help="waitress worker processes (production mode)")
     ap.add_argument("--threads", type=int, default=CONFIG.web_threads,
                     help="waitress worker threads (production mode)")
     ap.add_argument("--debug", action="store_true")
@@ -635,15 +640,6 @@ def main() -> int:
         broker_prober.stop_prober()
         sys.exit(0)
 
-    # Graceful shutdown: stop the scheduler thread + metrics observer
-    def _shutdown(*_):
-        log.info("shutting down - stopping scheduler + metrics observer...")
-        if _scheduler:
-            _scheduler.stop_flag.set()
-        metrics.stop_observer()
-        broker_prober.stop_prober()
-        sys.exit(0)
-
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
@@ -659,7 +655,7 @@ def main() -> int:
             app.run(host=args.host, port=args.port, debug=False,
                     threaded=True, use_reloader=False)
         else:
-            log.info(f"production WSGI (waitress, {args.workers} workers, {args.threads} threads) "
+            log.info(f"production WSGI (waitress, {args.threads} threads) "
                      f"-> http://{args.host}:{args.port}")
             serve(app, host=args.host, port=args.port, threads=args.threads,
                   connection_limit=200)

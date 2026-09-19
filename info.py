@@ -24,8 +24,7 @@ import sys
 import time
 import datetime as dt
 
-import config
-from config import CONFIG, setup_logging
+from config import setup_logging
 
 from spot import (
     BOLD, DIM, RESET, GREEN, RED, YELLOW,
@@ -128,7 +127,6 @@ def snapshot() -> dict:
         out["feeds"][f"running_{inst}"] = term_running(inst)
         cur = head.get("currency", "") or "USD"
         login_got = head.get("login", "") or ""
-        lev = f(head.get("leverage", "")) or 0.0
         bal, eq = f(head.get("balance", "")), f(head.get("equity", ""))
         profit = f(head.get("profit", ""))
         try:
