@@ -1,0 +1,14 @@
+# --- runtime state: never commit ---
+acc.env
+acc.enc
+session.json
+session.enc
+apis.txt
+*.log
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+.pytest_cache/
+*.pyc
+nohup.out

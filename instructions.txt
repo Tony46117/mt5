@@ -1,0 +1,22 @@
+listen you are going to do the following 
+we are going to test and troubleshoot the software together  will program the bridge.py to always ask for login in both terminals just after the two terminals have launched and then the accounts now get linked to the whole software
+also i want the bridge launch and that whole process to be concurrent that mean thay dont launch one after the other but rather concurrently as in together 
+so you will program that then run it so i can enter the logins manually so we make sure the process works
+then you are going to program the execution buttons and scheduled trades to be executed concurrently also that means all trades open concurrntly as in all at once and also close concurrently and also include this concurrent logic to close.py
+then once the login is complete automatic algotrading turned on,antidetect,
+then in th broker prober you are going to add broker server optimization logic in the prober so it enhances order filling and server configuration
+then the install.sh will be optimized with auto retry,auto detct os,and fast install
+now for this test i want you to run it with terminal the ptyxis terminal so you are going to launch it open multiple windows then run the software there starting right from bridge.py 
+also use the python312 venv with 300+ packages for development and testing so you will run source ~/python312/bin/activate concurrently in the windows as many as you need maximum 10
+then you will trobleshoot anything with the processes running in the terminal
+you will continuosly schedule trades until execution for scheduled trades problem is resolve use xauusd247
+-here is the updated part
+make the terminals minimal like when they launch im seeing they are both opening like a million chart windows so make it only open with only one chart window for eurusd in both terminals 
+then increase execution time accuracy,speed and concurrency in executor.py,close.py
+also enhance terminal launch concurrency and speed 
+also enhance account switching adaptation like when someone logs into another trade account it is fsatly incorporated into the software with enhanced concurrency
+harden executor with a 500ms auto retry on positions that failed to open or close
+make close.py independent from database so its lightning fast
+make monitor.py only show live ongoing trades so it should not show log of opened or closed trades
+then run another scheduled trades execution test cycle should start from 4:45 with eac account executing four positions after every 5 seconds so that  concurrency
+so kill any processes and implement this 
