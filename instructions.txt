@@ -1,0 +1,4 @@
+the executor for for future scheduled trades is not actually executing when trades are scheduled
+the accounts panel but and sell executions are not getting truggered either probably ans mq5 ea dump block or auto trading not allowed in terminal thus the 10027 ret error
+the dashboard is getting a js minimumfractionsdigits error
+fix those bugs
