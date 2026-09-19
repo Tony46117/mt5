@@ -70,6 +70,27 @@ pkill -f "app.py" 2>/dev/null
 stop_terminals
 sleep 1
 
+# a stack started by ANOTHER USER (e.g. `sudo bash run.sh` in some window)
+# cannot be killed from here and will silently fight this one for the port
+# and the terminals - refuse to start instead of half-working.
+for pid in $(pgrep -f "bridge.py|app.py" 2>/dev/null); do
+  owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [ -n "$owner" ] && [ "$owner" != "$(id -un)" ]; then
+    echo "ERROR: an instance is already running as user '$owner' (pid $pid)."
+    echo "  Kill it first (e.g. close that terminal window or: sudo pkill -f bridge.py)."
+    echo "  Running this script with sudo is NOT supported - run it as yourself."
+    exit 1
+  fi
+done
+
+# port 8000 must be free BEFORE we start our own app on it
+if curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
+  echo "ERROR: something is already serving on port 8000."
+  echo "  Find it with:  ss -tlnp | grep 8000"
+  echo "  Then stop it (or change web_port in config.py) and run again."
+  exit 1
+fi
+
 echo "starting web app on :8000 (log: $APP_LOG)..."
 : > "$APP_LOG"
 "$PY" -u app.py >>"$APP_LOG" 2>&1 &
@@ -79,10 +100,15 @@ for _ in $(seq 1 30); do
   curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1 && break
   sleep 0.5
 done
+if ! kill -0 "$APP_PID" 2>/dev/null; then
+  echo "ERROR: the web app exited during startup - last log lines:"
+  tail -8 "$APP_LOG"
+  exit 1
+fi
 if curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
   echo "  web panel ready:  http://127.0.0.1:8000"
 else
-  echo "  (web panel not answering yet - see $APP_LOG)"
+  echo "  (web panel not answering yet - see $APP_LOG; app pid $APP_PID is running)"
 fi
 
 echo "starting bridge supervisor - boots both MT5 terminals into the stored"
