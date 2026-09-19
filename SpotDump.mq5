@@ -496,7 +496,12 @@ void ExecuteLine(string line)
          AppendOut(id, "ERR", "unknown symbol " + sym);
          return;
         }
-      long ptype = (StringToUpper(p[3]) == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      // NOTE: StringToUpper() returns a bool and uppercases IN PLACE.
+      // Using it inline as a value made this comparison always false,
+      // so every SELL was silently sent as a BUY.
+      string sidestr = p[3];
+      StringToUpper(sidestr);
+      long ptype = (sidestr == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
       double vol = StringToDouble(p[4]);
       double sl  = (k > 5) ? StringToDouble(p[5]) : 0.0;
       double tp  = (k > 6) ? StringToDouble(p[6]) : 0.0;
