@@ -35,7 +35,7 @@
 //|   and caches the proven mode per symbol.                         |                |
 //+------------------------------------------------------------------+
 #property copyright "spot bridge"
-#property version   "1.60"
+#property version   "1.61"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -43,6 +43,7 @@
 #define EXEC_IN      "exec_in.csv"
 #define EXEC_OUT     "exec_out.csv"
 #define EXEC_NEXT    "exec_next.txt"   // pointer: filename of newest queued cmd
+#define SPOT_DUMP_MS 50                // spots.csv rewrite interval (display feed)
 
 int        g_interval_ms = 1; // FIXED (non-input): charts can restore stale
                            // saved inputs; a plain global guarantees the
@@ -101,6 +102,23 @@ ENUM_ORDER_TYPE_FILLING NextFilling(ENUM_ORDER_TYPE_FILLING f)
    if(f == ORDER_FILLING_FOK)  return(ORDER_FILLING_IOC);
    if(f == ORDER_FILLING_IOC)  return(ORDER_FILLING_RETURN);
    return((ENUM_ORDER_TYPE_FILLING)0);
+  }
+
+// Round a requested volume onto the symbol's real volume step and clamp it
+// into [vol_min, vol_max].  A hardcoded 2-decimal round rejected or
+// mis-sized every symbol whose step is not 0.01 (many indices / crypto).
+double NormalizeVolume(string sym, double vol)
+  {
+   double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double vmax  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double vstep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(vstep <= 0.0)
+      vstep = 0.01;
+   double v = MathRound(vol / vstep) * vstep;
+   if(vmin > 0.0 && v < vmin) v = vmin;
+   if(vmax > 0.0 && v > vmax) v = vmax;
+   // step can be 0.001 -> keep enough decimals for the server
+   return(NormalizeDouble(v, 8));
   }
 
 // send a DEAL request, falling back through filling modes on 10030.
@@ -167,12 +185,22 @@ void OnTick()
 
 void OnTimer()
   {
-   ProcessExecIn();                 // FIRST - order pickup runs 500x/s for
-                                    // sub-5 ms command latency
+   ProcessExecIn();                 // FIRST - order pickup runs every tick
+                                    // for sub-5 ms command latency
    long now_min = (long)(TimeCurrent() / 60);
    if(now_min != g_last_rescan_min)  // rescan Market Watch each new minute
       RefreshSymbols();
-   DumpSpots();                     // quotes every tick - feeds panel prices
+   // spots.csv is a DISPLAY feed (panel prices + staleness watchdog) - it
+   // does not need the 1 ms order-channel cadence.  Rewriting a 40-symbol
+   // CSV 1000x/s through wine burned I/O and starved the exec channel;
+   // 50 ms matches what the bridge and README already document.
+   static uint s_last_spot_ms = 0;
+   uint now_ms = GetTickCount();
+   if(now_ms - s_last_spot_ms >= SPOT_DUMP_MS)
+     {
+      s_last_spot_ms = now_ms;
+      DumpSpots();                  // quotes at ~20 Hz - feeds panel prices
+     }
    DumpCandles();                   // self-throttled to a new M1 bar
    // trades.csv only when positions changed or every 20th tick (~40 ms):
    // rewriting it every tick starved the order channel on wine.
@@ -522,7 +550,7 @@ void ExecuteLine(string line)
       ZeroMemory(res);
       req.action    = TRADE_ACTION_DEAL;
       req.symbol    = sym;
-      req.volume    = NormalizeDouble(vol, 2);
+      req.volume    = NormalizeVolume(sym, vol);
       req.type      = (ENUM_ORDER_TYPE)ptype;
       req.price     = NormalizeDouble(price, digits);
       req.sl        = (sl > 0.0) ? NormalizeDouble(sl, digits) : 0.0;
@@ -556,7 +584,7 @@ void ExecuteLine(string line)
         }
       string sym  = PositionGetString(POSITION_SYMBOL);
       long   type = PositionGetInteger(POSITION_TYPE);
-double vol  = PositionGetDouble(POSITION_VOLUME);
+      double vol  = PositionGetDouble(POSITION_VOLUME);
       int digits  = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       double price = (type == POSITION_TYPE_BUY)
                       ? SymbolInfoDouble(sym, SYMBOL_BID)   // closing a buy = sell bid
@@ -583,8 +611,14 @@ double vol  = PositionGetDouble(POSITION_VOLUME);
 
    if(cmd == "CLOSEALL" && k >= 3)
      {
+      // Symbol names are CASE-SENSITIVE ("Boom 1000 Index", "XAUUSD247").
+      // Uppercasing here made every mixed-case symbol match nothing, so a
+      // CLOSEALL closed zero positions and still reported success.  Only
+      // the literal keyword ALL is matched case-insensitively.
       string sym = p[2];
-      StringToUpper(sym);
+      string symup = sym;
+      StringToUpper(symup);
+      bool all = (symup == "ALL");
       int closed = 0, failed = 0;
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
@@ -592,7 +626,7 @@ double vol  = PositionGetDouble(POSITION_VOLUME);
          if(ticket == 0 || !PositionSelectByTicket(ticket))
             continue;
          string psym = PositionGetString(POSITION_SYMBOL);
-         if(sym != "ALL" && psym != sym)
+         if(!all && psym != sym)
             continue;
          long   type  = PositionGetInteger(POSITION_TYPE);
          double vol   = PositionGetDouble(POSITION_VOLUME);
@@ -616,15 +650,17 @@ double vol  = PositionGetDouble(POSITION_VOLUME);
          else
             failed++;
         }
-      AppendOut(id, "OK", "closed " + IntegerToString(closed) +
-                                " failed " + IntegerToString(failed));
+      // A partial/total failure must NOT report OK: python's 500 ms
+      // close retry keys off the ok flag and could never fire before.
+      string cdetail = "closed " + IntegerToString(closed) +
+                       " failed " + IntegerToString(failed);
+      AppendOut(id, (failed > 0) ? "ERR" : "OK", cdetail);
       return;
      }
 
    if(cmd == "PROBE" && k >= 3)
      {
-      string sym = p[2];
-      StringToUpper(sym);
+      string sym = p[2];          // case-sensitive: do NOT uppercase
       if(!SymbolSelect(sym, true))
         {
          AppendOut(id, "ERR", "unknown symbol " + sym);
