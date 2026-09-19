@@ -171,7 +171,7 @@ def compiled_paths(inst: int | None = None) -> list[Path]:
 
 # --------------------------------------------------------------------------
 # shared TTL caches - one bridge read serves every consumer (spot.py,
-# monitor.py, info.py, ms.py, hft.py, app.py, bridge.py).  The EA rewrites
+# monitor.py, info.py, ms.py, app.py, bridge.py).  The EA rewrites
 # the CSVs every 50 ms, so a 100 ms cache keeps every reader coherent while
 # cutting repeated file parses (and repeated pgrep forks) to near zero.
 # --------------------------------------------------------------------------
@@ -491,7 +491,15 @@ def _write_start_cfg(inst: int, with_login: bool = True) -> None:
                 "Template=Bridge\r\n"
                 "Symbol=EURUSD\r\nPeriod=H1\r\n"
                 f"Profile=SpotBridge{inst}\r\n")
-        ini.write_text(common + body, encoding="ascii")
+        # The login block is a PLAINTEXT password on disk until the
+        # post-boot scrub runs.  write_text() left it world-readable (0644);
+        # create it 0600 so that window is not also a permissions hole.
+        fd = os.open(str(ini), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (common + body).encode("ascii"))
+        finally:
+            os.close(fd)
+        os.chmod(ini, 0o600)
     except OSError:
         pass
 
@@ -726,7 +734,6 @@ def compile_mq5(dst_mq5: Path, inst: int = 1) -> bool:
     env = os.environ.copy()
     env["WINEPREFIX"] = str(WINEPREFIX)
     env["WINEDEBUG"] = "-all"
-    t0 = time.time()
     ex5 = dst_mq5.with_suffix(".ex5")
     old_mtime = ex5.stat().st_mtime if ex5.exists() else 0.0
     try:
@@ -781,7 +788,7 @@ def read_spots(max_age: float = 0.1) -> dict[str, tuple[str, str, str]]:
     the whole Market Watch, not just the classic trio).
 
     Shared 100 ms TTL cache: the EA rewrites spots.csv every 50 ms, so
-    callers polling at 10-20 Hz (ms.py, hft.py, web APIs) share one file
+    callers polling at 10-20 Hz (ms.py, web APIs) share one file
     read instead of each reparsing it.  Pass max_age=0 to force a refresh.
     """
     global _SPOTS_CACHE
@@ -816,7 +823,7 @@ def read_spots(max_age: float = 0.1) -> dict[str, tuple[str, str, str]]:
 
 
 # --------------------------------------------------------------------------
-# M1 candles (ms.py chart + hft.py features)
+# M1 candles (ms.py chart)
 # --------------------------------------------------------------------------
 
 def _parse_msc(s: str) -> int:

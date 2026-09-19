@@ -17,6 +17,18 @@ PY="$HOME/python312/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3.12 || command -v python3)"
 APP_LOG="app_run.log"
 
+# Everything below targets ONLY this checkout.  The previous version ran
+# `pkill -f app.py` / `pkill -f bridge.py` / `pkill -9 -f terminal64.exe`,
+# which matched any process anywhere on the machine with those strings in
+# its command line - including the sibling mt5_v2 project that shares this
+# wine prefix (see config.py), and any unrelated `app.py`.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# pkill restricted to this user AND to command lines rooted in this dir
+kill_ours() {  # kill_ours <signal> <script name>
+  pkill -"$1" -u "$(id -u)" -f "$HERE/$2" 2>/dev/null
+}
+
 stop_terminals() {
   "$PY" - <<'EOF' 2>/dev/null
 try:
@@ -29,13 +41,15 @@ try:
 except Exception:
     pass
 EOF
-  pkill -9 -f "terminal64.exe" 2>/dev/null
+  # spot.stop_terminal() targets each terminal by its own install path; a
+  # blanket `pkill -9 -f terminal64.exe` would also kill MT5 terminals this
+  # stack does not own, so it is deliberately NOT done here.
 }
 
 if [ "${1:-}" = "stop" ]; then
   echo "stopping bridge / app / terminals..."
-  pkill -f "bridge.py" 2>/dev/null
-  pkill -f "app.py" 2>/dev/null
+  kill_ours TERM bridge.py
+  kill_ours TERM app.py
   stop_terminals
   echo "all stopped."
   exit 0
@@ -65,19 +79,19 @@ trap 'cleanup; exit 143' TERM
 # leftovers of a previous run must not hold :8000, double-supervise, or
 # race the boot (a terminal still exiting when the bridge launches its own
 # copy double-boots MT5 and the EA can end up detached - observed live)
-pkill -f "bridge.py" 2>/dev/null
-pkill -f "app.py" 2>/dev/null
+kill_ours TERM bridge.py
+kill_ours TERM app.py
 stop_terminals
 sleep 1
 
 # a stack started by ANOTHER USER (e.g. `sudo bash run.sh` in some window)
 # cannot be killed from here and will silently fight this one for the port
 # and the terminals - refuse to start instead of half-working.
-for pid in $(pgrep -f "bridge.py|app.py" 2>/dev/null); do
+for pid in $(pgrep -f "$HERE/(bridge|app)\\.py" 2>/dev/null); do
   owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
   if [ -n "$owner" ] && [ "$owner" != "$(id -un)" ]; then
     echo "ERROR: an instance is already running as user '$owner' (pid $pid)."
-    echo "  Kill it first (e.g. close that terminal window or: sudo pkill -f bridge.py)."
+    echo "  Kill it first (e.g. close that terminal window, or: sudo kill $pid)."
     echo "  Running this script with sudo is NOT supported - run it as yourself."
     exit 1
   fi
@@ -93,7 +107,7 @@ fi
 
 echo "starting web app on :8000 (log: $APP_LOG)..."
 : > "$APP_LOG"
-"$PY" -u app.py >>"$APP_LOG" 2>&1 &
+"$PY" -u "$HERE/app.py" >>"$APP_LOG" 2>&1 &
 APP_PID=$!
 
 for _ in $(seq 1 30); do
@@ -113,7 +127,7 @@ fi
 
 echo "starting bridge supervisor - boots both MT5 terminals into the stored"
 echo "accounts (ALGO ON, one EURUSD chart each).  Ctrl+C stops EVERYTHING."
-"$PY" -u bridge.py &
+"$PY" -u "$HERE/bridge.py" &
 BRIDGE_PID=$!
 
 wait "$BRIDGE_PID"
