@@ -20,7 +20,10 @@ from typing import Callable
 # --------------------------------------------------------------------------
 # Paths
 # --------------------------------------------------------------------------
-WINEPREFIX = Path.home() / ".mt5"
+# MT5_WINEPREFIX lets Docker (or any sandbox) relocate the wine prefix;
+# default stays the historical ~/.mt5 for native Linux installs.
+_WINEPREFIX_ENV = os.getenv("MT5_WINEPREFIX", "").strip()
+WINEPREFIX = Path(_WINEPREFIX_ENV) if _WINEPREFIX_ENV else Path.home() / ".mt5"
 MT5_DIR = WINEPREFIX / "drive_c" / "Program Files" / "MetaTrader 5"
 MT5_DIR2 = WINEPREFIX / "drive_c" / "Program Files" / "MetaTrader 5-2"
 DB_PATH = Path(__file__).resolve().parent / "trades.db"

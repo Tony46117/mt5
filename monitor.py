@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 import datetime as dt
 
@@ -38,7 +39,7 @@ from spot import (
     BOLD, DIM, RESET, GREEN, RED, YELLOW,
     read_accounts, pick_terminal, read_header, scan_terminals,
     ensure_terminal, restart_terminal, install_script, setup_terminal2,
-    compiled_paths, wait_for_bridge, term_running, WINEPREFIX, MT5_DIR2,
+    compiled_paths, wait_for_bridge, term_running, feed_age, WINEPREFIX, MT5_DIR2,
 )
 
 log = setup_logging(__name__)
@@ -339,39 +340,85 @@ def setup2() -> int:
     return 0
 
 
+def _wait_bridges(insts: tuple[int, ...], timeout: float) -> dict[int, bool]:
+    """Wait for SEVERAL terminals' EA feeds CONCURRENTLY (the old code waited
+    serially - one dead terminal stalled startup for the full timeout).
+    Prints a progress line every 15 s so a slow boot never looks hung."""
+    res: dict[int, bool] = {i: False for i in insts}
+
+    def w(inst: int) -> None:
+        deadline = time.time() + timeout
+        next_progress = time.time() + 15.0
+        while time.time() < deadline:
+            if feed_age(inst) < 5:
+                res[inst] = True
+                return
+            if time.time() >= next_progress:
+                log.info(f"  still waiting for terminal {inst} feed... "
+                         f"{int(deadline - time.time())} s left")
+                next_progress = time.time() + 15.0
+            time.sleep(1)
+
+    threads = [threading.Thread(target=w, args=(i,), daemon=True,
+                                name=f"wait-bridge-{i}") for i in insts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return res
+
+
 def run(once: bool, interval: float, restart: int | None) -> int:
     log.info("MT5 DUAL ACCOUNT MONITOR starting - account1 + account2, one screen, strict identity")
 
-    for inst in (1, 2):
-        if inst == 2 and not (MT5_DIR2 / "terminal64.exe").exists():
-            if not setup_terminal2():
+    # --once mode: skip terminal launch / compile / long waits entirely -
+    # just read whatever data the EA has already written and print one frame.
+    if not once:
+        for inst in (1, 2):
+            if inst == 2 and not (MT5_DIR2 / "terminal64.exe").exists():
+                if not setup_terminal2():
+                    return 1
+            if restart == inst or restart == 0:
+                install_script(inst)       # compile BEFORE the restart boot
+                if not restart_terminal(inst):
+                    return 1
+            elif not term_running(inst):
+                install_script(inst)       # EA ready BEFORE the first boot
+                if not ensure_terminal(inst):
+                    return 1
+            else:
+                install_script(inst)       # no-op when unchanged
+            if not any(p.exists() for p in compiled_paths(inst)):
+                log.error(f"SpotDump.ex5 missing for terminal {inst} - compilation failed.")
                 return 1
-        if restart == inst or restart == 0:
-            if not restart_terminal(inst):
-                return 1
-        elif not ensure_terminal(inst):
-            return 1
-        install_script(inst)
-        if not any(p.exists() for p in compiled_paths(inst)):
-            log.error(f"SpotDump.ex5 missing for terminal {inst} - compilation failed.")
-            return 1
 
-    log.info("waiting for the EA bridges...")
-    for inst in (1, 2):
-        if not wait_for_bridge(inst, timeout=180):
-            log.error(f"bridge of terminal {inst} is not producing data - SpotDump EA is not attached.")
-            log.error(f"Run:  python monitor.py --restart {inst}")
-            return 1
+        # Parallel 45 s wait, then ONE automatic self-heal restart for a dead
+        # bridge (the old code sat on a serial 180 s wait and then told the
+        # user to run --restart by hand - three minutes of nothing).
+        log.info("waiting for the EA bridges (both terminals, 45 s max)...")
+        ok = _wait_bridges((1, 2), timeout=45.0)
+        dead = [i for i in (1, 2) if not ok[i]]
+        if dead:
+            for inst in dead:
+                log.warning(f"terminal {inst} has no EA feed after 45 s - "
+                            f"restarting it once (self-heal)")
+                restart_terminal(inst)
+            ok.update(_wait_bridges(tuple(dead), timeout=45.0))
+        for inst in (1, 2):
+            if not ok[inst]:
+                log.error(f"bridge of terminal {inst} is not producing data - SpotDump EA is not attached.")
+                log.error(f"Run:  python monitor.py --restart {inst}")
+                return 1
 
     monitors = {1: Monitor(1), 2: Monitor(2)}
+    if once:
+        print(build_frame(monitors))
+        return 0
     last_frame = ""
     first = True
     try:
         while True:
             frame = build_frame(monitors)
-            if once:
-                print(frame)
-                return 0
             if frame != last_frame:            # redraw ONLY on real change
                 if first:
                     sys.stdout.write("\033[2J\033[H" + frame + "\033[?25l")

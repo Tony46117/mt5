@@ -71,7 +71,11 @@ def _machine_key() -> bytes:
     """
     import platform
     import uuid
-    node = f"{platform.node()}|{uuid.getnode()}|{os.getuid() if hasattr(os, 'getuid') else 0}"
+    # MT5_MACHINE_KEY: stable override for containers - docker MACs and
+    # hostnames are random per recreation, which would make session.json
+    # undecryptable after every restart.  The docker entrypoint pins it.
+    node = (os.getenv("MT5_MACHINE_KEY", "").strip()
+            or f"{platform.node()}|{uuid.getnode()}|{os.getuid() if hasattr(os, 'getuid') else 0}")
     return hashlib.sha256(node.encode() + b"|" + _SALT).digest()
 
 
@@ -160,6 +164,9 @@ def load() -> dict[int, dict[str, str]]:
     rewrites session.json (bridge re-login, --seed, web login form), the
     very next load() in EVERY process re-reads the file - hot account
     switches propagate everywhere without restarts.
+
+    If session.json exists but decrypts to empty (wrong machine key),
+    auto-seed from the legacy acc.env as a fallback.
     """
     if _OVERRIDE is not None:
         try:
@@ -176,6 +183,16 @@ def load() -> dict[int, dict[str, str]]:
         if _MEM is None or key != _CACHE_STAT:
             _MEM = _file_accounts()
             _CACHE_STAT = key
+            # Auto-seed from acc.env if session is empty but file exists
+            # (happens when session.json was created on a different machine)
+            if not _MEM and SESSION_FILE.exists():
+                _seed_from_acc_env()
+                _MEM = _file_accounts()
+                try:
+                    st = SESSION_FILE.stat()
+                    _CACHE_STAT = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    _CACHE_STAT = None
         return {k: dict(v) for k, v in _MEM.items()}
 
 

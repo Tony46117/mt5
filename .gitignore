@@ -12,3 +12,4 @@ __pycache__/
 .pytest_cache/
 *.pyc
 nohup.out
+data/

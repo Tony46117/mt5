@@ -154,7 +154,13 @@ def login_and_boot() -> tuple[bool, list[int]]:
     boot_res: dict[int, bool] = {}
 
     def boot_one(inst: int) -> None:
-        """stop -> ALGO ON -> launch with the session's login.  Thread body."""
+        """stop -> compile EA -> ALGO ON -> launch with the session's login.
+
+        The EA is installed/compiled BEFORE the launch, while the terminal is
+        stopped: compiling after boot (the old order) meant the very first
+        boot after any EA change ran WITHOUT a working EA, its feed never
+        came up, and the supervisor 'healed' it with a pointless restart a
+        minute later - the boot->restart dance the user kept seeing."""
         try:
             if not (TERMINALS[inst]["dir"] / "terminal64.exe").exists():
                 print(f"{RED}terminal {inst} executable missing{RESET}")
@@ -163,6 +169,7 @@ def login_and_boot() -> tuple[bool, list[int]]:
             if term_running(inst):
                 print(f"  terminal {inst} is running - stopping it for a clean boot...")
                 stop_terminal(inst)
+            install_script(inst)                 # EA present BEFORE first boot
             ensure_autotrading(inst)             # not running anymore - safe to force
             launch_terminal(inst)                # WITH login block = auto-login
             st_last_start[inst] = time.monotonic()
@@ -249,7 +256,8 @@ def header_for(inst: int) -> dict:
 
 class TermState:
     __slots__ = ('inst', 'running', 'age_bucket', 'login', 'last_start',
-                 'last_heal', 'last_check', 'ever_session')
+                 'last_heal', 'last_check', 'ever_session', 'header', 'header_ts',
+                 'launch_fails', 'heal_fails')
 
     def __init__(self, inst: int):
         self.inst = inst
@@ -260,6 +268,10 @@ class TermState:
         self.last_heal = 0.0
         self.last_check = 0.0
         self.ever_session = False   # EA seen on the session account at least once
+        self.header: dict = {}
+        self.header_ts = 0.0
+        self.launch_fails = 0       # consecutive launches that never came up
+        self.heal_fails = 0         # consecutive heals that did not restore the feed
 
     def bucket(self) -> str:
         if not self.running:
@@ -355,16 +367,25 @@ class Supervisor:
                 if running:
                     self.log(f"terminal {inst} is {GREEN}UP{RESET}")
                     st.last_start = time.monotonic()
+                    st.launch_fails = 0          # it came up - backoff resets
                     install_script(inst)
                 else:
                     self.log(f"terminal {inst} is {RED}DOWN{RESET}")
+                    # died right after a launch (or never appeared): count the
+                    # failure so the next relaunch backs off exponentially
+                    if (st.last_start
+                            and 0 < time.monotonic() - st.last_start < 60.0):
+                        st.launch_fails += 1
                 st.running = running
 
             if not running:
-                # relaunch with a cooldown so a broken install can never
-                # spawn-storm wine processes
-                if exe_ok and now - st.last_start > RELAUNCH_COOLDOWN_S:
+                # relaunch with an EXPONENTIAL cooldown so a broken install
+                # can never spawn-storm wine processes: 10 s -> 20 -> 40 -> 80
+                # -> 160 s, reset the moment the terminal is up + live again
+                cooldown = min(RELAUNCH_COOLDOWN_S * (2 ** min(st.launch_fails, 5)), 300.0)
+                if exe_ok and now - st.last_start > cooldown:
                     self.log(f"terminal {inst} not running - {DIM}starting{RESET}")
+                    install_script(inst)         # EA ready BEFORE the launch
                     launch_terminal(inst)
                     st.last_start = time.monotonic()
                     st.running = True
@@ -375,6 +396,8 @@ class Supervisor:
             if b != st.age_bucket:
                 if b == "live":
                     self.log(f"terminal {inst} bridge is {GREEN}LIVE{RESET}")
+                    st.launch_fails = 0                # boot succeeded
+                    st.heal_fails = 0                  # feed restored
                 elif b == "stale":
                     self.log(f"terminal {inst} bridge {RED}STALE{RESET}")
                 elif b == "laggy":
@@ -400,7 +423,11 @@ class Supervisor:
 
             if b == "stale":
                 in_grace = time.monotonic() - st.last_start < GRACE_S
-                cooled = time.monotonic() - st.last_heal > COOLDOWN_S
+                # heal backoff: a terminal whose EA never comes back is
+                # restarted after 120 s, then 240 s, then 480 s ... capped at
+                # 15 min - it reports on screen instead of restart-looping
+                heal_gap = min(COOLDOWN_S * (2 ** min(st.heal_fails, 4)), 900.0)
+                cooled = time.monotonic() - st.last_heal > heal_gap
                 if not in_grace and cooled:
                     self.log(f"{YELLOW}healing terminal {inst} "
                              f"(restart to re-attach EA){RESET}")
@@ -410,11 +437,14 @@ class Supervisor:
                         st.running = True
                     else:
                         self.log(f"{RED}heal of terminal {inst} failed{RESET}")
+                    st.heal_fails += 1
 
             # account identity check (less frequent)
             if time.monotonic() - st.last_check > 10:
                 st.last_check = time.monotonic()
                 h = header_for(inst)
+                st.header = h
+                st.header_ts = time.monotonic()
                 login = h.get("login", "")
                 if login and login != st.login:
                     if st.login:
@@ -458,10 +488,21 @@ class Supervisor:
                         a = accs.get(inst, {})
                         if a.get("login") and a["login"] != login:
                             a["login"] = login
+                            # the EA header knows the new broker server too -
+                            # adopt it so a future auto-relogin targets the
+                            # right server (the PASSWORD can never be captured
+                            # from a UI login; reseed with session.py --seed
+                            # if auto-relogin into this account is needed)
+                            if h.get("server"):
+                                a["server"] = h["server"]
                             session.set_accounts(accs, persist=True)
                             self.log(f"{YELLOW}terminal {inst} switched to "
                                      f"account {login} - session adopted, "
                                      f"whole software follows{RESET}")
+                            log.warning(f"terminal {inst}: adopted account "
+                                        f"{login} (server {a.get('server')}) - "
+                                        f"password unknown; run 'python session.py "
+                                        f"--seed' if auto-relogin is needed")
                             st.login = login
                             st.ever_session = False
                             self._fast_frame = True
@@ -490,7 +531,7 @@ class Supervisor:
         for inst, st in self.terms.items():
             a = accs.get(inst, {})
             exp = a.get("login", "?")
-            h = header_for(inst)
+            h = st.header if st.header else header_for(inst)
             login = h.get("login", "") or "-"
             ok = (login == exp)
             age = feed_age(inst)

@@ -8,12 +8,11 @@ Tables:
     this table and fires each trade to the second;
   * fired log     : one row per executed schedule slot (id, ticket,
     result) so the panel can show what actually happened;
-  * kv            : small JSON blobs (equity-curve history, hft stats).
-  * hft_stats     : HFT bot trade history with indicators and Markov state.
+  * kv            : small JSON blobs (equity-curve history, metrics).
 
 Threading: connections are per-call (context manager) and every
 write is wrapped in a transaction, so the Flask threads, the executor
-thread and hft.py can share the database safely.
+thread and the metrics observer can share the database safely.
 
 Schema is created on first import - no migrations needed for now.
 """
@@ -213,33 +212,6 @@ def _init_pg() -> None:
             value JSONB   NOT NULL
         );
         """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS hft_stats (
-            id           BIGSERIAL PRIMARY KEY,
-            account      INTEGER NOT NULL,
-            symbol       TEXT    NOT NULL,
-            side         TEXT    NOT NULL,
-            lot          REAL    NOT NULL,
-            entry_price  REAL    NOT NULL,
-            exit_price   REAL,
-            pnl          REAL,
-            rsi          REAL,
-            macd_line    REAL,
-            macd_signal  REAL,
-            markov_state TEXT,
-            confidence   REAL,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            closed_at    TIMESTAMPTZ
-        );
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account
-            ON hft_stats (account);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol
-            ON hft_stats (symbol);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account_created
-            ON hft_stats (account, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol_created
-            ON hft_stats (symbol, created_at DESC);
-        """)
 
 
 def _init_sqlite() -> None:
@@ -285,30 +257,6 @@ def _init_sqlite() -> None:
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS hft_stats (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            account      INTEGER NOT NULL,
-            symbol       TEXT    NOT NULL,
-            side         TEXT    NOT NULL,
-            lot          REAL    NOT NULL,
-            entry_price  REAL    NOT NULL,
-            exit_price   REAL,
-            pnl          REAL,
-            rsi          REAL,
-            macd_line    REAL,
-            macd_signal  REAL,
-            markov_state TEXT,
-            confidence   REAL,
-            created_at   TEXT    NOT NULL,
-            closed_at    TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account ON hft_stats (account);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol ON hft_stats (symbol);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_account_created
-            ON hft_stats (account, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_hft_stats_symbol_created
-            ON hft_stats (symbol, created_at DESC);
         """)
 
 
@@ -352,19 +300,33 @@ def _fetchall(cur) -> list[dict]:
 # future trades
 # --------------------------------------------------------------------------
 
+def _local_to_utc(dt_obj: dt.datetime) -> dt.datetime:
+    """Interpret a naive LOCAL wall-clock datetime and convert it to UTC.
+
+    The panel's time pickers are read in the OPERATOR'S wall clock (what the
+    terminal/monitor/browser clock shows).  Schedules used to be anchored as
+    if those numbers were UTC, which silently shifted every slot by the
+    machine's tz offset (observed: UTC+3 box -> slots fired 3 h late).
+    """
+    return dt_obj.astimezone(dt.timezone.utc)
+
+
 def add_future_trade(account: int, pair: str, side: str, lot: float,
                      n_positions: int, exec_h: int, exec_m: int, exec_s: int,
                      close_h: int, close_m: int, close_s: int) -> int:
     """Insert a schedule; returns its id. next_fire = today (or tomorrow if
-    the time already passed) at exec_h:exec_m:exec_s.
+    the time already passed) at exec_h:exec_m:exec_s IN LOCAL WALL CLOCK
+    (converted to UTC for storage).
 
     `pair` is stored EXACTLY as given: MT5 symbol names are case-sensitive
     (Deriv's 'Boom 1000 Index' must never become 'BOOM 1000 INDEX' or every
     order dies with 'unknown symbol').  FX pairs arrive uppercase anyway.
     """
     import datetime as dt
+    now_local = dt.datetime.now().astimezone()
+    fire = _local_to_utc(now_local.replace(hour=exec_h, minute=exec_m,
+                                           second=exec_s, microsecond=0))
     now = dt.datetime.now(dt.timezone.utc)
-    fire = now.replace(hour=exec_h, minute=exec_m, second=exec_s, microsecond=0)
     if fire <= now:
         fire += dt.timedelta(days=1)
     
@@ -479,7 +441,10 @@ def claim_schedule(sid: int, expected_fire) -> bool:
 
 def _next_fire_from(exec_h: int, exec_m: int, exec_s: int, anchor) -> dt.datetime:
     """Next occurrence of exec_h:exec_m:exec_s strictly after `anchor`
-    (aware UTC datetime or ISO string)."""
+    (aware UTC datetime or ISO string).  The H/M/S are LOCAL wall-clock
+    (see _local_to_utc): the anchored datetime is converted from local to
+    UTC before the comparison so daily re-fires land on the operator's
+    typed second, not the tz-shifted one."""
     if isinstance(anchor, str):
         try:
             anchor = dt.datetime.fromisoformat(anchor)
@@ -487,11 +452,12 @@ def _next_fire_from(exec_h: int, exec_m: int, exec_s: int, anchor) -> dt.datetim
             anchor = dt.datetime.now(dt.timezone.utc)
     if getattr(anchor, "tzinfo", None) is None:
         anchor = anchor.replace(tzinfo=dt.timezone.utc)
-    nxt = anchor.replace(hour=int(exec_h), minute=int(exec_m),
-                         second=int(exec_s), microsecond=0)
-    if nxt <= anchor:
-        nxt += dt.timedelta(days=1)
-    return nxt
+    anchor_local = anchor.astimezone()
+    nxt_local = anchor_local.replace(hour=int(exec_h), minute=int(exec_m),
+                                     second=int(exec_s), microsecond=0)
+    if nxt_local <= anchor_local:
+        nxt_local += dt.timedelta(days=1)
+    return _local_to_utc(nxt_local)
 
 
 def _update_fire(cur, sid: int, exec_h: int, exec_m: int, exec_s: int,
@@ -512,6 +478,92 @@ def deactivate(sid: int) -> None:
             _exec(cur, "UPDATE future_trades SET active=FALSE WHERE id=%s", (sid,))
         else:
             _exec(cur, "UPDATE future_trades SET active=0 WHERE id=?", (sid,))
+
+
+def update_schedule(sid: int, *, pair: str | None = None, side: str | None = None,
+                    lot: float | None = None, n_positions: int | None = None,
+                    exec_h: int | None = None, exec_m: int | None = None,
+                    exec_s: int | None = None, close_h: int | None = None,
+                    close_m: int | None = None, close_s: int | None = None,
+                    active: bool | None = None) -> bool:
+    """Adjust an existing schedule in place (EDIT from the scheduled page).
+
+    Any field left None keeps its current value.  When the exec time (or the
+    active flag) changes, next_fire is recomputed from the NEW exec time
+    anchored at NOW: editing a schedule that already fired today must arm it
+    for its next occurrence computed from the new time - not leave a stale
+    next_fire.  Returns True when a row was updated."""
+    cur_sch = get_schedule(sid)
+    if not cur_sch:
+        return False
+    p = pair if pair is not None else cur_sch["pair"]
+    s = (side if side is not None else cur_sch["side"]).upper()
+    l = lot if lot is not None else cur_sch["lot"]
+    n = n_positions if n_positions is not None else cur_sch["n_positions"]
+    eh = exec_h if exec_h is not None else cur_sch["exec_h"]
+    em = exec_m if exec_m is not None else cur_sch["exec_m"]
+    es = exec_s if exec_s is not None else cur_sch["exec_s"]
+    ch = close_h if close_h is not None else cur_sch["close_h"]
+    cm = close_m if close_m is not None else cur_sch["close_m"]
+    cs = close_s if close_s is not None else cur_sch["close_s"]
+    act = (1 if active else 0) if active is not None else cur_sch["active"]
+    act = 1 if act in (1, True) else 0
+    # recompute next_fire from the (possibly new) exec time, anchored now,
+    # using the same LOCAL wall-clock semantics as add_future_trade
+    now_local = dt.datetime.now().astimezone()
+    fire = _local_to_utc(now_local.replace(hour=int(eh), minute=int(em),
+                                           second=int(es), microsecond=0))
+    now = dt.datetime.now(dt.timezone.utc)
+    if fire <= now:
+        fire += dt.timedelta(days=1)
+    with _conn() as c:
+        cur = c.cursor()
+        if USE_POSTGRES:
+            _exec(cur, """UPDATE future_trades SET pair=%s, side=%s, lot=%s,
+                        n_positions=%s, exec_h=%s, exec_m=%s, exec_s=%s,
+                        close_h=%s, close_m=%s, close_s=%s, active=%s,
+                        next_fire=%s WHERE id=%s""",
+                  (p, s, l, n, eh, em, es, ch, cm, cs, bool(act), fire, sid))
+        else:
+            _exec(cur, """UPDATE future_trades SET pair=?, side=?, lot=?,
+                        n_positions=?, exec_h=?, exec_m=?, exec_s=?,
+                        close_h=?, close_m=?, close_s=?, active=?,
+                        next_fire=? WHERE id=?""",
+                  (p, s, l, n, eh, em, es, ch, cm, cs, act,
+                   fire.isoformat(timespec="seconds"), sid))
+        return cur.rowcount > 0
+
+
+def delete_schedule(sid: int) -> bool:
+    """HARD delete: remove the row entirely (the scheduled page's DEL).
+    deactivate() only flips the flag; this makes it disappear for good."""
+    with _conn() as c:
+        cur = c.cursor()
+        if USE_POSTGRES:
+            _exec(cur, "DELETE FROM future_trades WHERE id=%s", (sid,))
+        else:
+            _exec(cur, "DELETE FROM future_trades WHERE id=?", (sid,))
+        return cur.rowcount > 0
+
+
+def clear_history() -> int:
+    """START AFRESH: wipe the entire fired log and remove every INACTIVE
+    schedule (active schedules are kept - they are armed trades, not
+    history).  Returns the number of rows deleted."""
+    deleted = 0
+    with _conn() as c:
+        cur = c.cursor()
+        if USE_POSTGRES:
+            _exec(cur, "DELETE FROM fired", ())
+            deleted += cur.rowcount
+            _exec(cur, "DELETE FROM future_trades WHERE active = FALSE", ())
+            deleted += max(0, cur.rowcount)
+        else:
+            _exec(cur, "DELETE FROM fired", ())
+            deleted += max(0, cur.rowcount)
+            _exec(cur, "DELETE FROM future_trades WHERE active = 0", ())
+            deleted += max(0, cur.rowcount)
+    return deleted
 
 
 def list_future_trades(active_only: bool = False) -> list[dict]:
@@ -576,7 +628,7 @@ def list_fired(limit: int = 50) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# kv blobs (equity curve, hft stats)
+# kv blobs (equity curve, metrics)
 # --------------------------------------------------------------------------
 
 def kv_set(key: str, value: Any) -> None:
@@ -606,108 +658,42 @@ def kv_get(key: str, default=None):
 
 
 # --------------------------------------------------------------------------
-# hft stats
+# retention: the UI shows only the past 24 h of fired rows
 # --------------------------------------------------------------------------
 
-def log_hft_trade(account: int, symbol: str, side: str, lot: float,
-                  entry_price: float, rsi: float, macd_line: float,
-                  macd_signal: float, markov_state: str, confidence: float) -> int:
-    """Log an HFT trade entry."""
-    with _conn() as c:
-        cur = c.cursor()
-        import datetime as dt
-        now = dt.datetime.now(dt.timezone.utc)
-        if USE_POSTGRES:
-            _exec(cur,
-                """INSERT INTO hft_stats
-                   (account, symbol, side, lot, entry_price, rsi, macd_line,
-                    macd_signal, markov_state, confidence, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   RETURNING id""",
-                (account, symbol, side, lot, entry_price, rsi, macd_line,
-                 macd_signal, markov_state, confidence, now))
-            return int(cur.fetchone()["id"])
-        else:
-            _exec(cur,
-                """INSERT INTO hft_stats
-                   (account, symbol, side, lot, entry_price, rsi, macd_line,
-                    macd_signal, markov_state, confidence, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (account, symbol, side, lot, entry_price, rsi, macd_line,
-                 macd_signal, markov_state, confidence, now.isoformat(timespec="seconds")))
-            return int(cur.lastrowid)
-
-
-def update_hft_trade(trade_id: int, exit_price: float, pnl: float) -> None:
-    """Update HFT trade with exit info."""
-    import datetime as dt
-    with _conn() as c:
-        cur = c.cursor()
-        now = dt.datetime.now(dt.timezone.utc)
-        if USE_POSTGRES:
-            _exec(cur,
-                "UPDATE hft_stats SET exit_price=%s, pnl=%s, closed_at=%s WHERE id=%s",
-                (exit_price, pnl, now, trade_id))
-        else:
-            _exec(cur,
-                "UPDATE hft_stats SET exit_price=?, pnl=?, closed_at=? WHERE id=?",
-                (exit_price, pnl, now.isoformat(timespec="seconds"), trade_id))
-
-
-def get_hft_stats(account: int | None = None, symbol: str | None = None, limit: int = 100) -> list[dict]:
-    """Get HFT trade statistics."""
-    with _conn() as c:
-        cur = c.cursor()
-        q = "SELECT * FROM hft_stats"
-        params = []
-        conditions = []
-        if account is not None:
-            conditions.append("account = %s" if USE_POSTGRES else "account = ?")
-            params.append(account)
-        if symbol is not None:
-            conditions.append("symbol = %s" if USE_POSTGRES else "symbol = ?")
-            params.append(symbol)
-        if conditions:
-            q += " WHERE " + " AND ".join(conditions)
-        q += " ORDER BY created_at DESC LIMIT %s" if USE_POSTGRES else " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-        _exec(cur, q, tuple(params))
-        return _fetchall(cur)
-
-
-def get_hft_performance(account: int) -> dict:
-    """Get HFT performance summary for an account."""
+def prune_fired(hours: int = 24) -> int:
+    """Delete fired-log rows older than `hours` (default 24) - the scheduled
+    page is a 'what happened recently' view, not an archive.  Returns the
+    count of deleted rows."""
+    cutoff = (dt.datetime.now(dt.timezone.utc)
+              - dt.timedelta(hours=hours)).isoformat(timespec="seconds")
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
-            _exec(cur, """
-                SELECT 
-                    COUNT(*) as total_trades,
-                    COUNT(CASE WHEN pnl > 0 THEN 1 END) as wins,
-                    COUNT(CASE WHEN pnl < 0 THEN 1 END) as losses,
-                    COALESCE(SUM(pnl), 0) as net_pnl,
-                    AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
-                    AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
-                    MAX(pnl) as max_win,
-                    MIN(pnl) as max_loss
-                FROM hft_stats
-                WHERE account = %s AND pnl IS NOT NULL
-            """, (account,))
+            _exec(cur, "DELETE FROM fired WHERE at < %s", (cutoff,))
         else:
-            _exec(cur, """
-                SELECT 
-                    COUNT(*) as total_trades,
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
-                    COALESCE(SUM(pnl), 0) as net_pnl,
-                    AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
-                    AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
-                    MAX(pnl) as max_win,
-                    MIN(pnl) as max_loss
-                FROM hft_stats
-                WHERE account = ? AND pnl IS NOT NULL
-            """, (account,))
-        return dict(_fetchone(cur) or {})
+            _exec(cur, "DELETE FROM fired WHERE at < ?", (cutoff,))
+        return cur.rowcount
+
+
+def prune_inactive_schedules(days: int = 1) -> int:
+    """Drop inactive schedules older than `days` (default 1) so the table
+    cannot fill up with deleted rows forever - the 24-hour afresh policy
+    applies to inactive schedules as well as the fired log.  Returns the
+    count of deleted rows."""
+    cutoff = (dt.datetime.now(dt.timezone.utc)
+              - dt.timedelta(days=days)).isoformat(timespec="seconds")
+    with _conn() as c:
+        cur = c.cursor()
+        if USE_POSTGRES:
+            _exec(cur,
+                  "DELETE FROM future_trades WHERE active = FALSE AND created_at < %s",
+                  (cutoff,))
+        else:
+            _exec(cur,
+                  "DELETE FROM future_trades WHERE active = 0 AND created_at < ?",
+                  (cutoff,))
+        return cur.rowcount
 
 
 if __name__ == "__main__":

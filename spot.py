@@ -33,12 +33,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import datetime as dt
 from pathlib import Path
@@ -47,7 +49,7 @@ import config
 import session
 from config import CONFIG, setup_logging
 
-log = setup_logging(__name__)
+log = setup_logging(__name__, level=logging.WARNING)
 
 WINEPREFIX = CONFIG.wineprefix
 MT5_DIR = CONFIG.mt5_dir
@@ -124,10 +126,15 @@ def data_roots() -> list[Path]:
 
 
 def spots_csv_paths() -> list[Path]:
-    """Spot feed paths EXCLUDING terminal2 (the spot dashboard is account-agnostic
-    and must not flip-flop between two terminals' feeds)."""
-    skip = MT5_DIR2 / "MQL5"
-    return [root / "Files" / "spots.csv" for root in data_roots() if root != skip]
+    """ALL terminal spot feeds - read_spots() MERGES them per symbol.
+
+    (This used to exclude terminal2 so the spot dashboard could not
+    flip-flop between two terminals; but excluding it made every
+    symbol that only terminal 2 has selected look like 'no live quote'
+    for account 2's orders whenever terminal 1's file was caught
+    mid-rewrite.  Merging newest-first per symbol keeps every Market
+    Watch represented and is strictly more robust.)"""
+    return [root / "Files" / "spots.csv" for root in data_roots()]
 
 
 def trades_csv_paths() -> list[Path]:
@@ -304,20 +311,31 @@ def wait_for_bridge(inst: int = 1, timeout: float = 120) -> bool:
 
 def feed_age(inst: int = 1) -> float:
     """Seconds since THIS terminal's freshest bridge file was written.
-    999 = terminal's data folder has no bridge files yet (stale/never)."""
+    999 = terminal's data folder has no bridge files yet (stale/never).
+    
+    Cached for 1 second to avoid repeated stat() calls during polling."""
+    global _FEED_AGE_CACHE
+    now = time.time()
+    cached = _FEED_AGE_CACHE.get(inst)
+    if cached and now - cached[0] < 1.0:
+        return cached[1]
     if inst == 1:
         files = spots_csv_paths() + trades_csv_paths()  # incl. legacy AppData roots
     else:
         base = MT5_DIR2 / "MQL5" / "Files"
         files = [base / "spots.csv", base / "trades.csv", base / "candles.csv"]
     newest = 0.0
-    now = time.time()
     for p in files:
         try:
             newest = max(newest, p.stat().st_mtime)
         except OSError:
             pass
-    return now - newest if newest else 999.0
+    age = now - newest if newest else 999.0
+    _FEED_AGE_CACHE[inst] = (now, age)
+    return age
+
+
+_FEED_AGE_CACHE: dict[int, tuple[float, float]] = {}  # inst -> (ts, age)
 
 
 # --------------------------------------------------------------------------
@@ -429,15 +447,19 @@ MINIMAL_CHART_XML = """<chart>
 
 
 def sanitize_charts(inst: int = 1) -> None:
-    """Force terminal `inst` to boot MINIMAL: every profile is reduced to a
-    single EURUSD H1 chart (with the SpotDump EA pre-attached).
+    """Force terminal `inst` to boot MINIMAL: every profile is pruned to ZERO
+    restored charts.  The single window comes from the start config itself
+    ([StartUp] Symbol/Period + Expert + Template=Bridge) so the boot can only
+    ever produce ONE chart with the EA attached - no matter how many windows
+    a previous session left behind.
 
     Called from launch_terminal while the terminal is stopped - MT5 saves its
     open charts into the active profile on exit and restores them on start,
-    which is how windows piled up session after session.  Pruning at launch
-    makes 'one EURUSD chart, nothing else' the permanent boot state."""
+    which is how windows piled up session after session (each restart added
+    the config chart on top of everything the last exit had saved).  Pruning
+    at launch makes 'one chart, nothing else' the permanent boot state.
+    """
     charts_root = TERMINALS[inst]["dir"] / "Profiles" / "Charts"
-    body = ("\ufeff" + MINIMAL_CHART_XML.replace("\n", "\r\n")).encode("utf-16-le")
     try:
         if not charts_root.exists():
             charts_root.mkdir(parents=True, exist_ok=True)
@@ -449,9 +471,29 @@ def sanitize_charts(inst: int = 1) -> None:
                     old.unlink()
                 except OSError:
                     pass
-            (prof / "chart01.chr").write_bytes(body)
     except OSError as exc:
         log.debug(f"terminal {inst}: chart sanitize skipped: {exc}")
+
+
+def force_profile(inst: int = 1) -> None:
+    """Pin [Charts] ProfileLast=SpotBridge{inst} in the terminal's common.ini
+    (while stopped) so the boot can never restore some other profile the
+    operator last clicked around in - the sanitized, empty SpotBridge profile
+    is the ONLY one that ever opens.  ATOMIC write."""
+    ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
+    want = f"SpotBridge{inst}"
+    text = _read_ini(ini)
+    if not text:
+        _write_ini_atomic(ini, "\ufeff[Common]\r\nAutoTrading=1\r\n"
+                                f"[Charts]\r\nProfileLast={want}\r\n")
+        return
+    new = text
+    if re.search(r"(?im)^ProfileLast\s*=", new):
+        new = re.sub(r"(?im)^ProfileLast\s*=\S*", f"ProfileLast={want}", new)
+    else:
+        new = new.rstrip("\r\n") + f"\r\n[Charts]\r\nProfileLast={want}\r\n"
+    if new != text:
+        _write_ini_atomic(ini, new)
 
 
 def _write_start_cfg(inst: int, with_login: bool = True) -> None:
@@ -515,22 +557,141 @@ def scrub_start_cfg(inst: int) -> None:
         log.debug(f"terminal {inst}: start-config scrub skipped: {exc}")
 
 
+# --------------------------------------------------------------------------
+# common.ini writers - ATOMIC + SERIALIZED
+#
+# Every terminal's common.ini is read-modify-written by several helpers
+# (autotrading force, login scrub, profile pin).  A non-atomic write here once
+# CORRUPTED terminal 2's common.ini (torn file: truncated [Charts], stray
+# fragments) because the two concurrent boot threads both wrote it - terminal
+# 2 then booted with a mangled config, MT5 failed to open its chart
+# ('open charts limit reached') and the EA never attached.  All writes now go
+# through one lock + tmp-file + atomic rename, and each helper only ever
+# touches the file of the terminal being launched.
+# --------------------------------------------------------------------------
+_INI_LOCK = threading.Lock()
+
+
+def _read_ini(path: Path) -> str:
+    """Read a UTF-16 ini (empty string when missing/unreadable)."""
+    try:
+        return path.read_text(encoding="utf-16", errors="replace")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _write_ini_atomic(path: Path, text: str) -> None:
+    """Write a UTF-16 ini atomically (tmp + os.replace) under the global lock
+    so concurrent boot threads can never tear the file."""
+    with _INI_LOCK:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".ini.tmp")
+            tmp.write_text(text, encoding="utf-16")
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.debug(f"ini write failed for {path.name}: {exc}")
+
+
+def _drop_ini_lines(text: str, prefixes: tuple[str, ...]) -> str:
+    """Remove every line whose lowercase stripped form starts with one of
+    `prefixes` (used for the credential scrubs)."""
+    return "\r\n".join(
+        l for l in text.splitlines()
+        if not l.strip().lower().startswith(prefixes)) + "\r\n"
+
+
 def scrub_terminal2_credentials() -> None:
     """Remove account1's stored auto-login from terminal2's copied common.ini.
 
     If terminal2's start config ever fails to load, without this scrub it
     would silently fall back to logging into account1 (copied settings).
-    """
+    ATOMIC write - this file used to be torn by concurrent boot threads."""
     ini = MT5_DIR2 / "Config" / "common.ini"
     if not ini.exists():
         return
-    try:
-        text = ini.read_text(encoding="utf-16", errors="replace")
-        lines = [l for l in text.splitlines()
-                 if not l.strip().lower().startswith(("login=", "server="))]
-        ini.write_text("\r\n".join(lines) + "\r\n", encoding="utf-16", newline="")
-    except (OSError, UnicodeError):
-        pass
+    text = _read_ini(ini)
+    if not text:
+        return
+    cleaned = _drop_ini_lines(text, ("login=", "server="))
+    if cleaned != text:
+        _write_ini_atomic(ini, cleaned)
+
+
+def scrub_common_ini_login(inst: int) -> None:
+    """Remove any saved login/password/server from terminal's common.ini.
+    
+    MT5 saves the last logged-in account to common.ini on exit. If we don't
+    scrub this before launch, the terminal will silently auto-login to the
+    OLD account BEFORE reading the start config, causing a race where the
+    EA briefly reports the wrong account. This must be done while terminal
+    is NOT running (it rewrites common.ini on exit)."""
+    ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
+    if not ini.exists():
+        return
+    text = _read_ini(ini)
+    if not text:
+        return
+    cleaned = _drop_ini_lines(text, ("login=", "password=", "server="))
+    if cleaned != text:
+        _write_ini_atomic(ini, cleaned)
+
+
+def repair_common_ini(inst: int) -> None:
+    """Heal a corrupted common.ini before launch.
+
+    A torn write once left terminal 2's ini with garbage (a stray 'on]'
+    fragment and keys BEFORE the first [section] header).  MT5's parser then
+    mis-reads the file: the start-config chart fails with
+    "open charts limit reached", the EA never attaches and the terminal
+    looks broken.  Every boot this keeps only well-formed lines:
+      * content before the first [section] header is dropped
+      * lines that are neither [section] nor key=value are dropped
+      * duplicate keys are collapsed (first occurrence wins)
+      * AutoTrading=1 and ProfileLast=SpotBridge{inst} are ensured
+    Runs while the terminal is stopped; write is atomic."""
+    ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
+    text = _read_ini(ini)
+    if not text:
+        _write_ini_atomic(ini, "\ufeff[Common]\r\nAutoTrading=1\r\n"
+                                f"[Charts]\r\nProfileLast=SpotBridge{inst}\r\n")
+        return
+    lines = text.splitlines()
+    out: list[str] = []
+    seen_section = False
+    seen: set[str] = set()
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            seen_section = True
+            if s.lower() not in seen:
+                seen.add(s.lower())
+                out.append(s)
+        elif re.match(r"^[A-Za-z0-9_]+\s*=", s):
+            if not seen_section:
+                continue                     # key before any [section] = garbage
+            key = s.split("=", 1)[0].strip().lower()
+            if key in seen:
+                continue                     # duplicate key - first wins
+            seen.add(key)
+            out.append(s)
+        # anything else = torn-write fragment - dropped
+    body = "\r\n".join(out)
+    if not re.search(r"(?im)^AutoTrading\s*=", body):
+        body = "[Common]\r\nAutoTrading=1\r\n" + body
+    elif not re.search(r"(?im)^\[Common\]", body):
+        body = "[Common]\r\n" + body
+    want = f"SpotBridge{inst}"
+    if re.search(r"(?im)^ProfileLast\s*=", body):
+        body = re.sub(r"(?im)^ProfileLast\s*=\S*", f"ProfileLast={want}", body)
+    else:
+        body += f"\r\n[Charts]\r\nProfileLast={want}\r\n"
+    repaired = "\ufeff" + body + "\r\n"
+    if repaired != text:
+        _write_ini_atomic(ini, repaired)
+        log.info(f"terminal {inst}: repaired corrupted {ini.name}")
 
 
 def ensure_autotrading(inst: int = 1) -> bool:
@@ -542,27 +703,134 @@ def ensure_autotrading(inst: int = 1) -> bool:
     defaults to 0, which is exactly how scheduled and manual orders used to
     die with 'retcode 10027'.  common.ini is UTF-16-LE with a BOM; the file
     is only rewritten when the flag is missing or 0 (and the terminal must
-    not be running while we touch it - it rewrites the file on exit)."""
+    not be running while we touch it - it rewrites the file on exit).
+    ATOMIC write (see _write_ini_atomic - a torn write here once killed
+    terminal 2's boot entirely)."""
     ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
-    try:
-        if not ini.exists():
-            ini.parent.mkdir(parents=True, exist_ok=True)
-            ini.write_text("\ufeff[Common]\r\nAutoTrading=1\r\n", encoding="utf-16")
-            return True
-        text = ini.read_text(encoding="utf-16", errors="replace")
-        m = re.search(r"(?im)^AutoTrading\s*=\s*(\S+)", text)
-        if m and m.group(1).strip() == "1":
-            return True
-        if m:
-            text = re.sub(r"(?im)^AutoTrading\s*=\s*\S+", "AutoTrading=1", text)
-        else:
-            text = text.rstrip("\r\n") + "\r\nAutoTrading=1\r\n"
-        ini.write_text(text, encoding="utf-16")
-        log.info(f"terminal {inst}: forced AutoTrading=1 in {ini.name}")
+    text = _read_ini(ini)
+    if not text:
+        _write_ini_atomic(ini, "\ufeff[Common]\r\nAutoTrading=1\r\n")
         return True
+    m = re.search(r"(?im)^AutoTrading\s*=\s*(\S+)", text)
+    if m and m.group(1).strip() == "1":
+        return True
+    if m:
+        text = re.sub(r"(?im)^AutoTrading\s*=\s*\S+", "AutoTrading=1", text)
+    else:
+        text = text.rstrip("\r\n") + "\r\nAutoTrading=1\r\n"
+    _write_ini_atomic(ini, text)
+    log.info(f"terminal {inst}: forced AutoTrading=1 in {ini.name}")
+    return True
+
+
+def ensure_bridge_template(inst: int) -> None:
+    """Make sure the Bridge.tpl template (expertmode=1 + SpotDump EA) exists
+    for terminal `inst` - [StartUp] Template=Bridge only works when the file
+    is there.  Idempotent + cheap (skips when already installed)."""
+    try:
+        import make_bridge_tpl            # lazy: avoids the config/spot cycle at import
+        make_bridge_tpl.install()
+    except Exception as exc:
+        log.debug(f"terminal {inst}: Bridge template ensure skipped: {exc}")
+
+
+def pin_window_geometry(inst: int) -> None:
+    """Force the main window to a SMALL rectangle in the top-left of the
+    screen by rewriting Config/terminal.ini's [Window] block BEFORE launch.
+
+    MT5 saves its window frame in terminal.ini on exit; a maximized (or
+    user-resized) session is then restored covering the whole screen on
+    every boot.  Everything here runs headless - the two terminals just
+    need to exist for the EA, not hog the operator's desktop.  Left/Top/
+    Right/Bottom are client-area coordinates in METATRADER's own logic;
+    the LSave/TSave/RSave/BSave "saved maximized" markers are pinned to
+    the same small rect so Windows' restore-from-maximized logic cannot
+    resurrect a full-screen frame."""
+    ini = TERMINALS[inst]["dir"] / "Config" / "terminal.ini"
+    L, T, R, B = 10 + (inst - 1) * 30, 10 + (inst - 1) * 24, 460, 330
+    try:
+        text = _read_ini(ini)
+        if not text:
+            return                        # no terminal.ini yet - MT5 writes defaults
+        lines = text.splitlines()
+        out: list[str] = []
+        in_win = False
+        replaced = {"Left": False, "Top": False, "Right": False,
+                    "Bottom": False, "Fullscreen": False}
+        for ln in lines:
+            if ln.strip().startswith("["):
+                in_win = ln.strip().lower() == "[window]"
+                out.append(ln)
+                continue
+            if in_win and "=" in ln:
+                key = ln.split("=", 1)[0].strip()
+                if key == "Fullscreen":
+                    out.append("Fullscreen=0")
+                    replaced["Fullscreen"] = True
+                    continue
+                if key == "LSave" or key == "TSave" or key == "RSave" or key == "BSave":
+                    out.append(ln)        # keep, then overwrite below
+                    continue
+                if key in replaced and not replaced[key]:
+                    if key == "Left":
+                        out.append(f"Left={L}")
+                    elif key == "Top":
+                        out.append(f"Top={T}")
+                    elif key == "Right":
+                        out.append(f"Right={R}")
+                    elif key == "Bottom":
+                        out.append(f"Bottom={B}")
+                    replaced[key] = True
+                    continue
+            out.append(ln)
+        # inject keys that the saved file did not contain
+        if not all(replaced.values()):
+            new_lines: list[str] = []
+            injected = False
+            for ln in out:
+                new_lines.append(ln)
+                if not injected and ln.strip().lower() == "[window]":
+                    if not replaced["Fullscreen"]:
+                        new_lines.append("Fullscreen=0")
+                    if not replaced["Left"]:
+                        new_lines.append(f"Left={L}")
+                    if not replaced["Top"]:
+                        new_lines.append(f"Top={T}")
+                    if not replaced["Right"]:
+                        new_lines.append(f"Right={R}")
+                    if not replaced["Bottom"]:
+                        new_lines.append(f"Bottom={B}")
+                    injected = True
+            out = new_lines
+        _write_ini_atomic(ini, "\r\n".join(out) + "\r\n")
+        log.debug(f"terminal {inst}: window pinned to {R - L}x{B - T} at ({L},{T})")
     except OSError as exc:
-        log.error(f"cannot enforce AutoTrading=1 for terminal {inst}: {exc}")
-        return False
+        log.debug(f"terminal {inst}: window pin skipped: {exc}")
+
+
+def purge_exec_channel(inst: int) -> None:
+    """Delete leftover exec_in/exec_next command files of terminal `inst`
+    BEFORE it boots.
+
+    When a terminal dies with queued commands (crash, pkill, wine stall), the
+    files survive on disk; the NEXT boot's EA reads the pointer file and
+    executes the STALE order - one user-visible symptom was phantom trades
+    right after a restart.  The executor's janitor sweeps these too, but only
+    after 15 s AND it used to react to a sweep by RESTARTING the just-booted
+    terminal (restart storm); purging at launch removes the problem at the
+    source while the EA cannot possibly have consumed anything yet."""
+    files_dir = TERMINALS[inst]["dir"] / "MQL5" / "Files"
+    try:
+        if not files_dir.exists():
+            return
+        for pat in ("exec_in.*.txt", "exec_next*.txt", "exec_next*.tmp"):
+            for p in files_dir.glob(pat):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except OSError as exc:
+        log.debug(f"terminal {inst}: exec purge skipped: {exc}")
 
 
 def launch_terminal(inst: int = 1, jitter: float | None = None,
@@ -579,11 +847,21 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     ANTI-DETECT launch cadence: a small randomized delay (jitter)
     de-syncs the two terminals' boot so their logins/connection bursts do
     not look machine-simultaneous to the broker.  Set MT5_NO_LAUNCH_JITTER=1
-    (or pass jitter=0) to disable - CI and tests do."""
+    (or pass jitter=0) to disable - CI and tests do.
+
+    CRITICAL: scrubs any saved login from common.ini BEFORE launch so the
+    terminal CANNOT fall back to a previous account - it MUST use the
+    start config credentials."""
+    scrub_common_ini_login(inst)        # REMOVE any saved credentials first
+    repair_common_ini(inst)             # heal torn/corrupted ini BEFORE boot
     _write_start_cfg(inst, with_login=with_login)
-    ensure_autotrading(inst)          # kill 10027 before the terminal boots
-    scrub_terminal2_credentials()     # stale auto-login out of the copied common.ini
-    sanitize_charts(inst)             # ONE EURUSD chart - never a window flood
+    ensure_autotrading(inst)            # kill 10027 before the terminal boots
+    scrub_terminal2_credentials()       # stale auto-login out of the copied common.ini
+    sanitize_charts(inst)               # ZERO restored charts - config opens the ONE window
+    force_profile(inst)                 # boot profile is ALWAYS the sanitized one
+    ensure_bridge_template(inst)        # Template=Bridge must exist (expertmode=1)
+    pin_window_geometry(inst)           # small window top-left, never fullscreen
+    purge_exec_channel(inst)            # no stale order commands can fire on boot
     if jitter is None:
         jitter = 0.0 if os.getenv("MT5_NO_LAUNCH_JITTER") else random.uniform(0.05, 0.6)
     if jitter > 0:
@@ -717,7 +995,14 @@ def install_script(inst: int = 1) -> None:
 
 
 def compile_mq5(dst_mq5: Path, inst: int = 1) -> bool:
-    """Compile via MetaEditor64.exe (works when cwd is the MT5 folder)."""
+    """Compile via MetaEditor64.exe (works when cwd is the MT5 folder).
+
+    MetaEditor is a GUI app that Wine renders as an X11 window.  To avoid
+    visible windows popping up:
+      * WINEDEBUG=-all  kills all Wine console/debug windows
+      * /skin:0         tells MetaEditor to use the minimal skinless mode
+      * start /wait      keeps cmd quiet until MetaEditor exits
+    """
     if not os.path.exists(wine_bin()):
         return False
     mt5_dir = TERMINALS[inst]["dir"]
@@ -732,23 +1017,23 @@ def compile_mq5(dst_mq5: Path, inst: int = 1) -> bool:
     try:
         subprocess.run(
             [wine_bin(), "cmd", "/c",
-             f"MetaEditor64.exe /compile:{win_path} /log"],
-            cwd=mt5_dir, env=env, timeout=120,
+             f"start /wait MetaEditor64.exe /skin:0 /portable /compile:{win_path} /log"],
+            cwd=mt5_dir, env=env, timeout=45,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception as exc:
         log.error(f"compile attempt failed: {exc}")
         return False
     # MetaEditor under Wine can exit before the .ex5 is fully written:
-    # wait until it is newer than when we started (max 60 s).
-    deadline = time.time() + 60
+    # wait until it is newer than when we started (max 15 s).
+    deadline = time.time() + 15
     while time.time() < deadline:
         try:
             if ex5.exists() and ex5.stat().st_mtime > old_mtime:
                 break
         except OSError:
             pass
-        time.sleep(1)
+        time.sleep(0.5)
     log_path = dst_mq5.with_suffix(".log")
     if log_path.exists():
         text = log_path.read_text(encoding="utf-16", errors="replace")
@@ -777,22 +1062,37 @@ def _newest_text(paths: list[Path]) -> str | None:
 
 
 def read_spots(max_age: float = 0.1) -> dict[str, tuple[str, str, str]]:
-    """Every symbol the freshest spots.csv has a quote for (v1.40+ EA dumps
-    the whole Market Watch, not just the classic trio).
+    """Every symbol ANY terminal has a quote for (v1.40+ EA dumps the whole
+    Market Watch, not just the classic trio).
 
-    Shared 100 ms TTL cache: the EA rewrites spots.csv every 50 ms, so
-    callers polling at 10-20 Hz (ms.py, hft.py, web APIs) share one file
-    read instead of each reparsing it.  Pass max_age=0 to force a refresh.
-    """
+    All terminals' spots.csv files are MERGED oldest->newest so a fresher
+    file's quote wins per symbol.  Shared 100 ms TTL cache: the EA rewrites
+    spots.csv every 50 ms, so callers polling at 10-20 Hz (ms.py, hft.py,
+    web APIs) share one read instead of each reparsing.  Pass max_age=0 to
+    force a refresh.  (Reading ONE 'newest' file used to lose every symbol
+    the other terminal had selected - and a file caught mid-rewrite turned
+    into a bogus 'no live quote' for live orders.)"""
     global _SPOTS_CACHE
     now = time.monotonic()
     if max_age > 0 and _SPOTS_CACHE and now - _SPOTS_CACHE[0] < max_age:
         return _SPOTS_CACHE[1]
     spots: dict[str, tuple[str, str, str]] = {}
-    raw = _newest_text(spots_csv_paths())
-    if raw is not None:
+    files: list[Path] = []
+    for p in spots_csv_paths():
+        try:
+            if p.exists():
+                p.stat()                  # touch mtime for the sort below
+                files.append(p)
+        except OSError:
+            continue
+    files.sort(key=lambda p: p.stat().st_mtime)   # oldest first: newest wins
+    for p in files:
+        try:
+            raw = p.read_text(encoding="cp1252", errors="replace")
+        except OSError:
+            continue
         for line in raw.splitlines():
-            parts = [p.strip() for p in line.split("\t")]
+            parts = [q.strip() for q in line.split("\t")]
             if len(parts) < 4:
                 # fallback: tab-less rows from legacy SpotDump builds
                 # (e.g. "EURUSD1.156791.156802026.09.14 08:50:49")

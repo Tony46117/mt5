@@ -13,9 +13,43 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# ---------------------------------------------------------------------------
+# OS AUTO-DETECT: on Windows (or anywhere Docker exists but this is not a
+# Linux box) hand off to the container stack.  `bash run.sh` then means the
+# same thing on every OS: start web panel + bridge + both MT5 terminals.
+# ---------------------------------------------------------------------------
+OS_UNAME="$(uname -s 2>/dev/null || echo Windows)"
+if [ "$OS_UNAME" != "Linux" ] && [ "$OS_UNAME" != "Darwin" ]; then
+  echo "detected OS: $OS_UNAME - using the Docker stack (wine/MT5 run in a Linux container)."
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: Docker Desktop is required on $OS_UNAME - install it from https://www.docker.com/products/docker-desktop"
+    exit 1
+  fi
+  docker compose version >/dev/null 2>&1 \
+    && exec docker compose up --build \
+    || exec docker build -t mt5-bridge:latest . && exec docker run --rm -it -p 8000:8000 \
+         -v mt5-data:/data -v "$(pwd)/data:/data/seed:ro" \
+         -e MT5_MACHINE_KEY="${MT5_MACHINE_KEY:-please-change-me}" \
+         mt5-bridge:latest all
+fi
+
 PY="$HOME/python312/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3.12 || command -v python3)"
 APP_LOG="app_run.log"
+
+# Everything below targets ONLY this checkout.  The previous version ran
+# `pkill -f app.py` / `pkill -f bridge.py` / `pkill -9 -f terminal64.exe`,
+# which matched any process anywhere on the machine with those strings in
+# its command line - including the sibling mt5_v2 project that shares this
+# wine prefix (see config.py), and any unrelated `app.py` (or a shell
+# whose command line merely MENTIONED those strings - it killed its own
+# invoker).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# pkill restricted to this user AND to command lines rooted in this dir
+kill_ours() {  # kill_ours <signal> <script name>
+  pkill -"$1" -u "$(id -u)" -f "$HERE/$2" 2>/dev/null
+}
 
 stop_terminals() {
   "$PY" - <<'EOF' 2>/dev/null
@@ -29,13 +63,37 @@ try:
 except Exception:
     pass
 EOF
-  pkill -9 -f "terminal64.exe" 2>/dev/null
+  # spot.stop_terminal() targets each terminal by its own install path; a
+  # blanket `pkill -9 -f terminal64.exe` would also kill MT5 terminals this
+  # stack does not own, so it is deliberately NOT done here.
+}
+
+purge_exec_files() {
+  # leftover exec_in/exec_next command files from a previous run must be gone
+  # BEFORE the terminals boot: a dying terminal leaves queued orders behind
+  # and the next boot's EA would execute them as phantom trades (the executor
+  # janitor also sweeps, but only after 15 s + a grace period).
+  "$PY" - <<'EOF' 2>/dev/null
+from pathlib import Path
+import os
+base = Path.home() / ".mt5" / "drive_c" / "Program Files"
+for term in ("MetaTrader 5", "MetaTrader 5-2"):
+    d = base / term / "MQL5" / "Files"
+    if not d.is_dir():
+        continue
+    for pat in ("exec_in.*.txt", "exec_next*.txt", "exec_next*.tmp"):
+        for p in d.glob(pat):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+EOF
 }
 
 if [ "${1:-}" = "stop" ]; then
   echo "stopping bridge / app / terminals..."
-  pkill -f "bridge.py" 2>/dev/null
-  pkill -f "app.py" 2>/dev/null
+  kill_ours TERM bridge.py
+  kill_ours TERM app.py
   stop_terminals
   echo "all stopped."
   exit 0
@@ -65,19 +123,20 @@ trap 'cleanup; exit 143' TERM
 # leftovers of a previous run must not hold :8000, double-supervise, or
 # race the boot (a terminal still exiting when the bridge launches its own
 # copy double-boots MT5 and the EA can end up detached - observed live)
-pkill -f "bridge.py" 2>/dev/null
-pkill -f "app.py" 2>/dev/null
+kill_ours TERM bridge.py
+kill_ours TERM app.py
 stop_terminals
+purge_exec_files
 sleep 1
 
 # a stack started by ANOTHER USER (e.g. `sudo bash run.sh` in some window)
 # cannot be killed from here and will silently fight this one for the port
 # and the terminals - refuse to start instead of half-working.
-for pid in $(pgrep -f "bridge.py|app.py" 2>/dev/null); do
+for pid in $(pgrep -f "$HERE/(bridge|app)\\.py" 2>/dev/null); do
   owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
   if [ -n "$owner" ] && [ "$owner" != "$(id -un)" ]; then
     echo "ERROR: an instance is already running as user '$owner' (pid $pid)."
-    echo "  Kill it first (e.g. close that terminal window or: sudo pkill -f bridge.py)."
+    echo "  Kill it first (e.g. close that terminal window, or: sudo kill $pid)."
     echo "  Running this script with sudo is NOT supported - run it as yourself."
     exit 1
   fi
@@ -93,7 +152,7 @@ fi
 
 echo "starting web app on :8000 (log: $APP_LOG)..."
 : > "$APP_LOG"
-"$PY" -u app.py >>"$APP_LOG" 2>&1 &
+"$PY" -u "$HERE/app.py" >>"$APP_LOG" 2>&1 &
 APP_PID=$!
 
 for _ in $(seq 1 30); do
@@ -113,7 +172,7 @@ fi
 
 echo "starting bridge supervisor - boots both MT5 terminals into the stored"
 echo "accounts (ALGO ON, one EURUSD chart each).  Ctrl+C stops EVERYTHING."
-"$PY" -u bridge.py &
+"$PY" -u "$HERE/bridge.py" &
 BRIDGE_PID=$!
 
 wait "$BRIDGE_PID"

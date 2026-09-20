@@ -85,11 +85,23 @@ EXEC_IN_TTL = 15.0                # s - unconsumed exec_in.<id>.txt older than
                                   # this = EA stalled past the client timeout;
                                   # sweep it so it can never fire as a phantom
 HEAL_COOLDOWN_S = 600.0           # s - min spacing between stall auto-restarts
-# weekdays (0=Mon..6=Sun) schedules are allowed to fire on; demo/weekend
-# testing can override: MT5_TRADING_DAYS=0,1,2,3,4,5,6
+HEAL_BOOT_GRACE_S = 120.0         # s - NEVER stall-heal a terminal this soon
+                                  # after the app/terminal booted: leftover exec
+                                  # files from BEFORE a boot are purged by
+                                  # spot.launch_terminal, so a sweep hit right
+                                  # after boot is stale data, not a live stall
+                                  # (the old 0 s grace restart-stormed BOTH
+                                  # terminals seconds after every app start)
+# weekdays (0=Mon..6=Sun) schedules are allowed to fire on.
+# DEFAULT = ALL SEVEN DAYS: the old Mon-Fri default silently ate every
+# weekend schedule (observed: four Sunday schedules skipped with only a
+# log line - 'skipped - not a trading day for AUDCAD' - and nothing in
+# the panel).  A schedule the operator armed must FIRE, every day; the
+# broker itself rejects orders when a market is closed.  Weekday-only
+# behaviour is now OPT-IN: MT5_TRADING_DAYS=0,1,2,3,4.
 TRADING_DAYS = tuple(int(x) for x in
-                     os.getenv("MT5_TRADING_DAYS", "0,1,2,3,4").split(",")
-                     if x.strip()) or (0, 1, 2, 3, 4)
+                     os.getenv("MT5_TRADING_DAYS", "0,1,2,3,4,5,6").split(",")
+                     if x.strip()) or (0, 1, 2, 3, 4, 5, 6)
 
 # EA Protocol constants
 EXEC_NEXT_FILE = "exec_next.txt"  # pointer file for EA protocol
@@ -323,15 +335,18 @@ class SendCommand:
 
     # convenience wrappers -------------------------------------------------
     def open_trade(self, symbol: str, side: str, lot: float,
-                   magic: int = 777001, comment: str = "py") -> tuple[bool, str]:
+                   magic: int = 777001, comment: str = "py",
+                   timeout: float | None = None) -> tuple[bool, str]:
         return self.send("OPEN", symbol.upper(), side.upper(), f"{lot:.2f}",
-                         "0", "0", str(magic), comment)
+                         "0", "0", str(magic), comment, timeout=timeout)
 
     def close_position(self, ticket: str) -> tuple[bool, str]:
         return self.send("CLOSE", str(ticket))
 
-    def close_all(self, symbol: str | None = None) -> tuple[bool, str]:
-        return self.send("CLOSEALL", symbol.upper() if symbol else "ALL")
+    def close_all(self, symbol: str | None = None,
+                  timeout: float | None = None) -> tuple[bool, str]:
+        return self.send("CLOSEALL", symbol.upper() if symbol else "ALL",
+                         timeout=timeout)
 
     def ping(self) -> tuple[bool, str]:
         return self.send("PING", timeout=1.0)
@@ -350,11 +365,16 @@ def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, st
     """One CLOSEALL with the 500 ms failed-close retry - NO database on the
     hot path (close.py parity: the command round trip is the only latency).
     A failed close (requote/price-off/10027) is retried after 500 ms, up to
-    `attempts` times, then reported for real."""
+    `attempts` times, then reported for real.
+
+    The close gets the FULL fire deadline, not the 3 s order timeout: in the
+    5 s burst cycle a close lands while the EA is still pipelining the next
+    slot's 4 opens, and its result can legitimately take longer than 3 s -
+    the old short timeout turned every such close into a 3.5 s-late retry."""
     ok, detail = False, ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            ok, detail = sender_for(acc).close_all(pair)
+            ok, detail = sender_for(acc).close_all(pair, timeout=FIRE_DEADLINE)
         except Exception as exc:
             detail = f"exception: {exc}"
         if ok:
@@ -397,7 +417,7 @@ class FutureTradeScheduler(threading.Thread):
     SQLite lock)."""
 
     __slots__ = ('stop_flag', '_closes', '_closes_lock',
-                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts')
+                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts')
 
     def __init__(self):
         super().__init__(daemon=True, name="future-trade-scheduler")
@@ -409,11 +429,13 @@ class FutureTradeScheduler(threading.Thread):
         self._closes_lock = threading.Lock()
         self._janitor_ts = 0.0     # last stray exec_in sweep (monotonic)
         self._heal_ts = {1: 0.0, 2: 0.0}   # last stall-heal per terminal
+        self._boot_ts = time.monotonic()   # scheduler start = boot grace anchor
 
     @staticmethod
     def _is_trading_day(dt_obj: dt.datetime) -> bool:
         """Check if the given datetime is a configured trading day
-        (default Mon-Fri; MT5_TRADING_DAYS env overrides)."""
+        (default: EVERY day - schedules must never be silently skipped;
+        MT5_TRADING_DAYS=0,1,2,3,4 opts back into weekday-only)."""
         return dt_obj.weekday() in TRADING_DAYS
 
     def _next_trading_day(self, dt_obj: dt.datetime) -> dt.datetime:
@@ -422,25 +444,32 @@ class FutureTradeScheduler(threading.Thread):
             dt_obj += dt.timedelta(days=1)
         return dt_obj
 
-    # register close time when a schedule fires (UTC - must match next_fire,
-    # which add_future_trade/reschedule store in UTC; local time here made
-    # auto-closes drift by the tz offset)
+    # register close time when a schedule fires.  The close H/M/S typed in
+    # the panel are LOCAL wall clock (same semantics as the exec time - see
+    # database._local_to_utc); anchoring them as UTC once shifted every
+    # auto-close by the machine's tz offset.
     def _register_close(self, sch: dict) -> None:
+        ch, cm, cs = int(sch["close_h"]), int(sch["close_m"]), int(sch["close_s"])
         now = dt.datetime.now(dt.timezone.utc)
-        close = now.replace(hour=int(sch["close_h"]), minute=int(sch["close_m"]),
-                            second=int(sch["close_s"]), microsecond=0)
         # Anchor to the schedule's fire time (not 'now'): registration runs
         # AFTER the opens complete, so a short-lifetime schedule (e.g. close
         # 5s after exec) whose opens finish past the close second must close
         # ASAP - not be pushed a full day ahead.
         fire = self._fire_dt(sch)
         if fire:
-            anchored = fire.replace(hour=int(sch["close_h"]),
-                                    minute=int(sch["close_m"]),
-                                    second=int(sch["close_s"]), microsecond=0)
-            if anchored <= fire:
+            fire_local = fire.astimezone()
+            anchored = fire_local.replace(hour=ch, minute=cm, second=cs,
+                                          microsecond=0)
+            if anchored <= fire_local:
                 anchored += dt.timedelta(days=1)
-            close = anchored
+            close = anchored.astimezone(dt.timezone.utc)
+        else:
+            now_local = dt.datetime.now().astimezone()
+            close_local = now_local.replace(hour=ch, minute=cm, second=cs,
+                                            microsecond=0)
+            if close_local <= now_local:
+                close_local += dt.timedelta(days=1)
+            close = close_local.astimezone(dt.timezone.utc)
         if close <= now:
             close = now + dt.timedelta(seconds=1)
         # 24/7 symbols (XAUUSD247, Boom/Crash, ...) must close on weekends
@@ -451,7 +480,14 @@ class FutureTradeScheduler(threading.Thread):
         key = f"{sch['account']}:{sch['pair']}"
         with self._closes_lock:
             prev = self._closes.get(key)
-            if prev is None or close > prev[0]:
+            # EARLIEST close wins: a CLOSEALL closes every position of the
+            # pair anyway, so keeping a later pending close silently DELAYED
+            # the earlier schedule's close (its positions stayed open until
+            # the other schedule's close time - observed with overlapping
+            # same-pair schedules).  Firing the earliest pending close closes
+            # the earlier batch exactly when it should and is harmless for
+            # the later one (its close fires too, then a no-op).
+            if prev is None or close < prev[0]:
                 self._closes[key] = (close, sch.get("pair", ""))
 
     def _due_closes(self) -> list[tuple[int, str]]:
@@ -472,11 +508,26 @@ class FutureTradeScheduler(threading.Thread):
         client timeout.  When a terminal's EA stalls (wine pause, etc.) its
         queued command outlives the sender's timeout and the EA can consume
         it minutes later as a phantom trade.  Sweeping turns a stall into a
-        logged failure - never a surprise order."""
+        logged failure - never a surprise order.
+
+        Files left over from BEFORE a boot are purged by launch_terminal, so
+        anything swept here while the terminal is inside its boot grace is
+        stale disk content - logged, but NEVER treated as a live stall
+        (the old code restart-stormed freshly booted terminals)."""
         now_m = time.monotonic()
         if now_m - self._janitor_ts < 5.0:
             return
         self._janitor_ts = now_m
+        # fired-log retention: the scheduled page shows the past 24 h only
+        try:
+            pruned = db.prune_fired(24)
+            if pruned:
+                log.info(f"retention: pruned {pruned} fired rows older than 24 h")
+            pruned = db.prune_inactive_schedules(1)
+            if pruned:
+                log.info(f"retention: pruned {pruned} inactive schedules older than 1 d")
+        except Exception as exc:
+            log.warning(f"retention prune failed (non-fatal): {exc}")
         cutoff = time.time() - EXEC_IN_TTL
         stalled: list[int] = []
         for inst in (1, 2):
@@ -486,22 +537,30 @@ class FutureTradeScheduler(threading.Thread):
                     try:
                         if p.stat().st_mtime < cutoff:
                             p.unlink()
-                            log.warning(f"terminal {inst}: swept stale exec "
-                                        f"command {p.name}")
-                            stalled.append(inst)
+                            if now_m - self._boot_ts < HEAL_BOOT_GRACE_S:
+                                log.info(f"terminal {inst}: purged pre-boot exec "
+                                         f"command {p.name} (boot grace - "
+                                         f"not a stall)")
+                            else:
+                                log.warning(f"terminal {inst}: swept stale exec "
+                                            f"command {p.name}")
+                                stalled.append(inst)
                     except OSError:
                         pass          # vanished or busy - next pass
             except OSError:
                 pass
         # a swept command = the EA never picked it up = the exec channel is
         # stalled even though the feed may look alive: auto-restart that
-        # terminal (cooldown keeps a broken install from restart-storming)
+        # terminal - but only OUTSIDE the boot grace and with a cooldown, so
+        # a broken install can never restart-storm
         for inst in set(stalled):
-            if now_m - self._heal_ts.get(inst, 0.0) > HEAL_COOLDOWN_S:
-                self._heal_ts[inst] = now_m
-                log.error(f"terminal {inst} exec channel stalled - "
-                          f"auto-restarting it")
-                _restart_terminal_async(inst)
+            if (now_m - self._boot_ts < HEAL_BOOT_GRACE_S
+                    or now_m - self._heal_ts.get(inst, 0.0) < HEAL_COOLDOWN_S):
+                continue
+            self._heal_ts[inst] = now_m
+            log.error(f"terminal {inst} exec channel stalled - "
+                      f"auto-restarting it")
+            _restart_terminal_async(inst)
 
     @staticmethod
     def _fire_dt(sch: dict) -> dt.datetime | None:
@@ -518,27 +577,6 @@ class FutureTradeScheduler(threading.Thread):
             nf = nf.replace(tzinfo=dt.timezone.utc)
         return nf
 
-    def _process_due(self, sch: dict) -> None:
-        """Claim one due schedule and fire it.  Safety rails:
-        * not actually due (already claimed by another scheduler) -> skip;
-        * missed by more than MAX_FIRE_LATE (app was down / EA dead) ->
-          reschedule, never burst-fire stale orders;
-        * claim via database.claim_schedule (atomic CAS on next_fire) so
-          two app instances can never double-fire the same slot."""
-        nf = self._fire_dt(sch)
-        now = dt.datetime.now(dt.timezone.utc)
-        if nf is None:
-            log.warning(f"schedule #{sch['id']} has unparsable next_fire "
-                        f"{sch.get('next_fire')!r} - skipped (delete + recreate it)")
-            return
-        if nf > now:
-            return                     # someone else already claimed it
-        late = (now - nf).total_seconds()
-        if late > MAX_FIRE_LATE:
-            log.warning(f"schedule #{sch['id']} missed its slot by {late:.0f}s "
-                        f"> {MAX_FIRE_LATE:.0f}s - rescheduled, NOT fired late")
-            db.reschedule(sch["id"])
-            return
     def _claim(self, sch: dict) -> bool:
         """Validate + atomically claim a due schedule.  True = caller fires it.
         (Split out of _process_due so the run loop can claim EVERYTHING first
@@ -570,10 +608,22 @@ class FutureTradeScheduler(threading.Thread):
         # closed market must be skipped EARLY (in every racing scheduler),
         # never claimed-and-dropped.  24/7 symbols are exempt: they trade
         # every day, so XAUUSD247/Boom/Crash fire on Saturday too.
+        # A skip is VISIBLE: it is logged to the fired table so the panel
+        # shows exactly why nothing happened (the old silent skip left the
+        # operator staring at a schedule that 'did nothing').
         if (not self._is_trading_day(dt.datetime.now(dt.timezone.utc))
                 and not is_always_on_symbol(sch.get("pair", ""))):
             log.info(f"schedule #{sch['id']} skipped - not a trading day "
                      f"for {sch.get('pair')}")
+            try:
+                db.log_fired(sch["id"], sch["account"], sch.get("pair", ""),
+                             sch.get("side", ""), sch["lot"], "skip", "",
+                             False, "skipped - not a trading day for this "
+                                    "pair (weekend guard; MT5_TRADING_DAYS "
+                                    "overrides)")
+            except Exception as exc:
+                log.warning(f"schedule #{sch['id']}: could not log the "
+                            f"trading-day skip: {exc}")
             return
         # CRASH-SAFE: the claim already advanced next_fire (daily slot
         # reservation) - an exception here must NEVER swallow the fire

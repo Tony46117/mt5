@@ -1,0 +1,19 @@
+# .dockerignore - keep the image lean and secrets out of the build context
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.pytest_cache
+*.log
+*.db
+*.db-shm
+*.db-wal
+acc.env
+acc.enc
+session.json
+session.enc
+apis.txt
+data/
+Dockerfile
+docker-compose.yml
+.dockerignore

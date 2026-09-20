@@ -35,7 +35,7 @@
 //|   and caches the proven mode per symbol.                         |                |
 //+------------------------------------------------------------------+
 #property copyright "spot bridge"
-#property version   "1.60"
+#property version   "1.70"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -43,10 +43,87 @@
 #define EXEC_IN      "exec_in.csv"
 #define EXEC_OUT     "exec_out.csv"
 #define EXEC_NEXT    "exec_next.txt"   // pointer: filename of newest queued cmd
+#define SPOT_DUMP_MS 50                // spots.csv rewrite interval (display feed)
+#define ASYNC_MAX    64                // outstanding async orders tracked
 
 int        g_interval_ms = 1; // FIXED (non-input): charts can restore stale
                            // saved inputs; a plain global guarantees the
                            // 1 ms tick + sub-5 ms order pickup everywhere
+
+// ---------------- async order pipeline (v1.70) ----------------
+// OrderSend() BLOCKS ~400-700 ms per order through this broker.  A batch
+// of n opens (or a CLOSEALL over n positions) executed serially in
+// ExecuteLine() held the timer thread n x 600 ms, so '4x every 5 s' took
+// 2.5 s of channel time and a big CLOSEALL starved every later command.
+// Orders are now sent with OrderSendAsync() - the request returns in <1 ms
+// and the broker confirms each deal through OnTradeTransaction() in
+// PARALLEL server-side.  One OPEN command = one async request, so a
+// 4-position batch lands in ~the time of one.  CLOSE/CLOSEALL build their
+// whole request list first, then fire every close back to back.
+struct AsyncReq
+  {
+   ulong      req_id;      // request id (MqlTradeResult.request_id from the send)
+   string     cmd_id;      // exec_out.csv row to complete
+   bool       is_open;     // OPEN result format (price|ticket|vol) vs CLOSE
+   string     sym;
+   double     vol;
+   int        digits;
+   long       fill;        // filling mode used (for the 10030 one-shot retry)
+   MqlTradeRequest req;    // original request (10030 retry re-sends it)
+  };
+AsyncReq  g_async[ASYNC_MAX];
+int       g_nasync = 0;
+
+void AsyncTrack(ulong req_id, string cmd_id, bool is_open,
+                string sym, double vol, int digits, long fill,
+                MqlTradeRequest &req)
+  {
+   for(int i = 0; i < g_nasync; i++)          // update on re-assert
+      if(g_async[i].req_id == req_id)
+        {
+         g_async[i].fill = fill;
+         return;
+        }
+   if(g_nasync >= ASYNC_MAX)                  // drop oldest tracking slot
+     {
+      for(int i = 1; i < ASYNC_MAX; i++) g_async[i - 1] = g_async[i];
+      g_nasync = ASYNC_MAX - 1;
+     }
+   g_async[g_nasync].req_id  = req_id;
+   g_async[g_nasync].cmd_id  = cmd_id;
+   g_async[g_nasync].is_open = is_open;
+   g_async[g_nasync].sym     = sym;
+   g_async[g_nasync].vol     = vol;
+   g_async[g_nasync].digits  = digits;
+   g_async[g_nasync].fill    = fill;
+   g_async[g_nasync].req     = req;
+   g_nasync++;
+  }
+
+void AsyncForget(ulong req_id)
+  {
+   for(int i = 0; i < g_nasync; i++)
+      if(g_async[i].req_id == req_id)
+        {
+         for(int k = i + 1; k < g_nasync; k++) g_async[k - 1] = g_async[k];
+         g_nasync--;
+         return;
+        }
+  }
+
+int AsyncIndex(ulong req_id)
+  {
+   for(int i = 0; i < g_nasync; i++)
+      if(g_async[i].req_id == req_id)
+         return(i);
+   return(-1);
+  }
+
+void AsyncReport(int i, bool ok, string detail)
+  {
+   AppendOut(g_async[i].cmd_id, ok ? "OK" : "ERR", detail);
+   AsyncForget(g_async[i].req_id);
+  }
 #define IntervalMs g_interval_ms
 
 string      g_sym_names[];    // dynamic Market Watch snapshot
@@ -95,12 +172,95 @@ ENUM_ORDER_TYPE_FILLING FillingFor(string sym)
    return(ORDER_FILLING_RETURN);
   }
 
+// async pipeline: broker-side confirmations complete the exec_out rows here
+// (runs on MT5's own event thread - AppendOut is safe, OrderSend inside a
+// transaction handler is NOT, so a 10030 retry re-queues a fresh request
+// instead of a sync resend).
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_REQUEST)
+      return;
+   // CORRELATION (MQL5 docs, OnTradeTransaction): for a
+   // TRADE_TRANSACTION_REQUEST the result.request_id field carries the
+   // request identifier that matches the MqlTradeResult.request_id returned
+   // by the original OrderSendAsync call.  Order tickets are NOT usable for
+   // this - they are assigned by the server later (and are 0 in market
+   // requests), so matching on them silently dropped every async result:
+   // python waited its full timeout and reported 'terminal not responding'
+   // while the trade had actually executed.
+   int i = AsyncIndex(result.request_id);
+   if(i < 0)
+      return;
+   if(result.retcode == TRADE_RETCODE_DONE ||
+      result.retcode == TRADE_RETCODE_PLACED ||
+      result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+     {
+      ProvenFillRemember(g_async[i].sym, (ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
+      // the callback's result mirrors the server reply: order/deal/price
+      ulong tk = result.order;
+      if(result.deal > 0 && HistoryDealSelect(result.deal))
+         tk = (ulong)HistoryDealGetInteger(result.deal, DEAL_POSITION_ID);
+      if(tk == 0)
+         tk = result.order;
+      if(g_async[i].is_open)
+         AsyncReport(i, true,
+                     DoubleToString(result.price, g_async[i].digits) + "|" +
+                     IntegerToString((long)tk) + "|" +
+                     DoubleToString(result.volume, 2));
+      else
+         AsyncReport(i, true, "closed " + g_async[i].sym);
+     }
+   else if(result.retcode == TRADE_RETCODE_INVALID_FILL)
+     {
+      // one-shot 10030 retry: next mode in the chain, new async request
+      ENUM_ORDER_TYPE_FILLING nxt = NextFilling((ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
+      if(nxt != 0)
+        {
+         MqlTradeRequest r2 = g_async[i].req;
+         MqlTradeResult  res2;
+         ZeroMemory(res2);
+         r2.type_filling = nxt;
+         if(OrderSendAsync(r2, res2) && res2.request_id != 0)
+           {
+            g_async[i].req_id = res2.request_id;  // new request id replaces the old
+            g_async[i].fill   = (long)nxt;
+            g_async[i].req    = r2;
+           }
+         else
+            AsyncReport(i, false, "retcode 10030");
+        }
+      else
+         AsyncReport(i, false, "retcode 10030");
+     }
+   else
+      AsyncReport(i, false, "retcode " + IntegerToString((long)result.retcode));
+  }
+
 // next mode in the 10030 fallback chain after `f` (0 when exhausted)
 ENUM_ORDER_TYPE_FILLING NextFilling(ENUM_ORDER_TYPE_FILLING f)
   {
    if(f == ORDER_FILLING_FOK)  return(ORDER_FILLING_IOC);
    if(f == ORDER_FILLING_IOC)  return(ORDER_FILLING_RETURN);
    return((ENUM_ORDER_TYPE_FILLING)0);
+  }
+
+// Round a requested volume onto the symbol's real volume step and clamp it
+// into [vol_min, vol_max].  A hardcoded 2-decimal round rejected or
+// mis-sized every symbol whose step is not 0.01 (many indices / crypto).
+double NormalizeVolume(string sym, double vol)
+  {
+   double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double vmax  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double vstep = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(vstep <= 0.0)
+      vstep = 0.01;
+   double v = MathRound(vol / vstep) * vstep;
+   if(vmin > 0.0 && v < vmin) v = vmin;
+   if(vmax > 0.0 && v > vmax) v = vmax;
+   // step can be 0.001 -> keep enough decimals for the server
+   return(NormalizeDouble(v, 8));
   }
 
 // send a DEAL request, falling back through filling modes on 10030.
@@ -172,7 +332,17 @@ void OnTimer()
    long now_min = (long)(TimeCurrent() / 60);
    if(now_min != g_last_rescan_min)  // rescan Market Watch each new minute
       RefreshSymbols();
-   DumpSpots();                     // quotes every tick - feeds panel prices
+   // spots.csv is a DISPLAY feed (panel prices + staleness watchdog) - it
+   // does not need the 1 ms order-channel cadence.  Rewriting a 40-symbol
+   // CSV 1000x/s through wine burned I/O and starved the exec channel;
+   // 50 ms matches what the bridge and README already document.
+   static uint s_last_spot_ms = 0;
+   uint now_ms = GetTickCount();
+   if(now_ms - s_last_spot_ms >= SPOT_DUMP_MS)
+     {
+      s_last_spot_ms = now_ms;
+      DumpSpots();                  // quotes at ~20 Hz - feeds panel prices
+     }
    DumpCandles();                   // self-throttled to a new M1 bar
    // trades.csv only when positions changed or every 20th tick (~40 ms):
    // rewriting it every tick starved the order channel on wine.
@@ -496,7 +666,12 @@ void ExecuteLine(string line)
          AppendOut(id, "ERR", "unknown symbol " + sym);
          return;
         }
-      long ptype = (StringToUpper(p[3]) == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      // NOTE: StringToUpper() returns a bool and uppercases IN PLACE.
+      // Using it inline as a value made this comparison always false,
+      // so every SELL was silently sent as a BUY.
+      string sidestr = p[3];
+      StringToUpper(sidestr);
+      long ptype = (sidestr == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
       double vol = StringToDouble(p[4]);
       double sl  = (k > 5) ? StringToDouble(p[5]) : 0.0;
       double tp  = (k > 6) ? StringToDouble(p[6]) : 0.0;
@@ -517,7 +692,7 @@ void ExecuteLine(string line)
       ZeroMemory(res);
       req.action    = TRADE_ACTION_DEAL;
       req.symbol    = sym;
-      req.volume    = NormalizeDouble(vol, 2);
+      req.volume    = NormalizeVolume(sym, vol);
       req.type      = (ENUM_ORDER_TYPE)ptype;
       req.price     = NormalizeDouble(price, digits);
       req.sl        = (sl > 0.0) ? NormalizeDouble(sl, digits) : 0.0;
@@ -525,19 +700,21 @@ void ExecuteLine(string line)
       req.magic     = (ulong)mg;
       req.comment   = cm;
       req.deviation = 20;
-      if(!SendDealWithFallback(req, res))
+      ENUM_ORDER_TYPE_FILLING f = ProvenFill(sym);
+      if(f == 0) f = FillingFor(sym);
+      req.type_filling = f;
+      MqlTradeResult ares;
+      ZeroMemory(ares);
+      if(!OrderSendAsync(req, ares) || ares.retcode == 0 ||
+         (ares.retcode != TRADE_RETCODE_PLACED &&
+          ares.retcode != TRADE_RETCODE_DONE &&
+          ares.retcode != TRADE_RETCODE_DONE_PARTIAL))
         {
-         AppendOut(id, "ERR", "retcode " + IntegerToString((long)res.retcode));
+         // immediate reject (request never reached the broker queue)
+         AppendOut(id, "ERR", "retcode " + IntegerToString((long)ares.retcode));
          return;
         }
-      // position ticket = the deal's position id, fall back to order ticket
-      ulong tk = res.order;
-      if(res.deal > 0 && HistoryDealSelect(res.deal))
-         tk = (ulong)HistoryDealGetInteger(res.deal, DEAL_POSITION_ID);
-      if(tk == 0)
-         tk = res.order;
-      AppendOut(id, "OK", DoubleToString(res.price, digits) + "|" +
-                                IntegerToString((long)tk) + "|" + DoubleToString(res.volume, 2));
+      AsyncTrack(ares.request_id, id, true, sym, req.volume, digits, (long)f, req);
       return;
      }
 
@@ -551,7 +728,7 @@ void ExecuteLine(string line)
         }
       string sym  = PositionGetString(POSITION_SYMBOL);
       long   type = PositionGetInteger(POSITION_TYPE);
-double vol  = PositionGetDouble(POSITION_VOLUME);
+      double vol  = PositionGetDouble(POSITION_VOLUME);
       int digits  = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       double price = (type == POSITION_TYPE_BUY)
                       ? SymbolInfoDouble(sym, SYMBOL_BID)   // closing a buy = sell bid
@@ -567,52 +744,95 @@ double vol  = PositionGetDouble(POSITION_VOLUME);
       req.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
       req.price        = NormalizeDouble(price, digits);
       req.deviation    = 20;
-      if(!SendDealWithFallback(req, res))
+      ENUM_ORDER_TYPE_FILLING f = ProvenFill(sym);
+      if(f == 0) f = FillingFor(sym);
+      req.type_filling = f;
+      MqlTradeResult ares;
+      ZeroMemory(ares);
+      if(!OrderSendAsync(req, ares) || ares.retcode == 0 ||
+         (ares.retcode != TRADE_RETCODE_PLACED &&
+          ares.retcode != TRADE_RETCODE_DONE &&
+          ares.retcode != TRADE_RETCODE_DONE_PARTIAL))
         {
-         AppendOut(id, "ERR", "retcode " + IntegerToString((long)res.retcode));
+         AppendOut(id, "ERR", "retcode " + IntegerToString((long)ares.retcode));
          return;
         }
-      AppendOut(id, "OK", "closed " + p[2]);
+      AsyncTrack(ares.request_id, id, false, sym, vol, digits, (long)f, req);
       return;
      }
 
    if(cmd == "CLOSEALL" && k >= 3)
      {
+      // Symbol names are CASE-SENSITIVE ("Boom 1000 Index", "XAUUSD247").
+      // Uppercasing here made every mixed-case symbol match nothing, so a
+      // CLOSEALL closed zero positions and still reported success.  Only
+      // the literal keyword ALL is matched case-insensitively.
       string sym = p[2];
-      StringToUpper(sym);
-      int closed = 0, failed = 0;
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      string symup = sym;
+      StringToUpper(symup);
+      bool all = (symup == "ALL");
+      // build EVERY close request first, then fire them all back to back:
+      // n async requests queue in <1 ms total and the broker confirms the
+      // closes in parallel (the old sync loop paid n x 600 ms in here).
+      int total = PositionsTotal();
+      if(total > 0)
         {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0 || !PositionSelectByTicket(ticket))
-            continue;
-         string psym = PositionGetString(POSITION_SYMBOL);
-         if(sym != "ALL" && psym != sym)
-            continue;
-         long   type  = PositionGetInteger(POSITION_TYPE);
-         double vol   = PositionGetDouble(POSITION_VOLUME);
-         int    dg    = (int)SymbolInfoInteger(psym, SYMBOL_DIGITS);
-         double price = (type == POSITION_TYPE_BUY)
-                        ? SymbolInfoDouble(psym, SYMBOL_BID)
-                        : SymbolInfoDouble(psym, SYMBOL_ASK);
-         MqlTradeRequest req;
-         MqlTradeResult  res;
-         ZeroMemory(req);
-         ZeroMemory(res);
-         req.action       = TRADE_ACTION_DEAL;
-         req.symbol       = psym;
-         req.position     = ticket;
-         req.volume       = vol;
-         req.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         req.price        = NormalizeDouble(price, dg);
-         req.deviation    = 20;
-         if(SendDealWithFallback(req, res))
-            closed++;
-         else
-            failed++;
+         MqlTradeRequest reqs[];
+         ArrayResize(reqs, total);
+         int nreq = 0;
+         for(int i = total - 1; i >= 0; i--)
+           {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0 || !PositionSelectByTicket(ticket))
+               continue;
+            string psym = PositionGetString(POSITION_SYMBOL);
+            if(!all && psym != sym)
+               continue;
+            long   type  = PositionGetInteger(POSITION_TYPE);
+            double vol   = PositionGetDouble(POSITION_VOLUME);
+            int    dg    = (int)SymbolInfoInteger(psym, SYMBOL_DIGITS);
+            double price = (type == POSITION_TYPE_BUY)
+                            ? SymbolInfoDouble(psym, SYMBOL_BID)
+                            : SymbolInfoDouble(psym, SYMBOL_ASK);
+            MqlTradeRequest req;
+            ZeroMemory(req);
+            req.action       = TRADE_ACTION_DEAL;
+            req.symbol       = psym;
+            req.position     = ticket;
+            req.volume       = vol;
+            req.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            req.price        = NormalizeDouble(price, dg);
+            req.deviation    = 20;
+            ENUM_ORDER_TYPE_FILLING f = ProvenFill(psym);
+            if(f == 0) f = FillingFor(psym);
+            req.type_filling = f;
+            reqs[nreq++] = req;
+           }
+         int sent = 0, failed = 0;
+         for(int i = 0; i < nreq; i++)
+           {
+            MqlTradeResult ares;
+            ZeroMemory(ares);
+            if(OrderSendAsync(reqs[i], ares) &&
+               (ares.retcode == TRADE_RETCODE_PLACED ||
+                ares.retcode == TRADE_RETCODE_DONE ||
+                ares.retcode == TRADE_RETCODE_DONE_PARTIAL))
+              {
+               AsyncTrack(ares.request_id, id, false, reqs[i].symbol, reqs[i].volume,
+                          (int)SymbolInfoInteger(reqs[i].symbol, SYMBOL_DIGITS),
+                          (long)reqs[i].type_filling, reqs[i]);
+               sent++;
+              }
+            else
+               failed++;
+           }
+         if(sent == 0)
+            AppendOut(id, "ERR", "no close sent (failed " +
+                              IntegerToString(failed) + ")");
+         // each request completes this cmd id via OnTradeTransaction
+         return;
         }
-      AppendOut(id, "OK", "closed " + IntegerToString(closed) +
-                                " failed " + IntegerToString(failed));
+      AppendOut(id, "OK", "closed 0 failed 0");   // nothing to close
       return;
      }
 

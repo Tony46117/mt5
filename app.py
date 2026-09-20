@@ -116,6 +116,11 @@ def page_panel():
     return front.render_panel()
 
 
+@app.get("/scheduled")
+def page_scheduled():
+    return front.render_scheduled()
+
+
 # --------------------------------------------------------------------------
 # Health check
 # --------------------------------------------------------------------------
@@ -171,27 +176,38 @@ def health():
 # --------------------------------------------------------------------------
 
 def _acc_panel(acc_snapshot: dict, inst: int) -> dict:
-    """Panel card for one account: account info + positions + schedules."""
+    """Panel card for one account: account info + positions."""
     out = dict(acc_snapshot)
     out["positions"] = read_positions(inst)
-    scheds = db.list_future_trades(active_only=True)
-    out["schedules"] = [s for s in scheds if s["account"] == inst]
     return out
 
 
+_sys_cache: dict = {}
+_sys_cache_ts: float = 0.0
+
 def _system() -> dict:
+    global _sys_cache, _sys_cache_ts
+    now = time.time()
+    # Cache for 1 s - avoids a DB query + two pgrep forks per panel poll (0.6 s)
+    if _sys_cache and now - _sys_cache_ts < 1.0:
+        return _sys_cache
+    sched_alive = bool(getattr(sys.modules[__name__], "_scheduler", None)
+                       and getattr(sys.modules[__name__], "_scheduler", None).is_alive())
     sys_info = {
-        "scheduler": bool(getattr(sys.modules[__name__], "_scheduler", None) and getattr(sys.modules[__name__], "_scheduler", None).is_alive()),
+        "scheduler": sched_alive,
         "metrics": bool(metrics.is_running()),
         "schedules_active": len(db.list_future_trades(active_only=True)),
         "version": "2.0.0"
     }
     for inst in (1, 2):
+        age = feed_age(inst)
         sys_info[f"t{inst}"] = {
             "running": term_running(inst),
-            "age": feed_age(inst),
-            "stale": feed_age(inst) > CONFIG.bridge_stale_seconds
+            "age": age,
+            "stale": age > CONFIG.bridge_stale_seconds
         }
+    _sys_cache = sys_info
+    _sys_cache_ts = now
     return sys_info
 
 
@@ -232,7 +248,7 @@ def api_debug():
 
 
 @app.get("/api/dashboard")
-@rate_limit(max_requests=120, window=60)
+@rate_limit(max_requests=600, window=60)
 def api_dashboard():
     try:
         snap = snapshot()
@@ -256,7 +272,7 @@ def api_dashboard():
 
 
 @app.get("/api/panel")
-@rate_limit(max_requests=120, window=60)
+@rate_limit(max_requests=600, window=60)
 def api_panel():
     try:
         snap = snapshot()
@@ -302,7 +318,9 @@ def api_trade():
         return _fail("bad account")
     if account not in (1, 2):
         return _fail("account must be 1 or 2")
-    symbol = str(d.get("symbol", "")).upper()
+    # MT5 symbol names are CASE-SENSITIVE ("Boom 1000 Index"): pass the
+    # symbol through exactly as the feed reported it.
+    symbol = str(d.get("symbol", "")).strip()
     side = str(d.get("side", "")).upper()
     if side not in ("BUY", "SELL"):
         return _fail("side must be BUY or SELL")
@@ -319,7 +337,11 @@ def api_trade():
     # path - the audit write happens in a background thread AFTER the
     # response, so the button's latency is pure terminal round trip.
     t0 = time.perf_counter()
-    ok, detail = sender_for(account).open_trade(symbol, side, lot)
+    # 8 s deadline (not the 3 s channel default): in thin Sunday liquidity
+    # the broker itself took 1.9-4.8 s to fill two async SELLs, and the
+    # default turned that into a false 'REJECTED ... not responding' while
+    # the order HAD executed (the UI would then invite a duplicate).
+    ok, detail = sender_for(account).open_trade(symbol, side, lot, timeout=8.0)
     order_ms = (time.perf_counter() - t0) * 1000.0
     ticket = detail.split("|")[1] if "|" in detail else ""
     price = detail.split("|")[0] if "|" in detail else ""
@@ -347,7 +369,7 @@ def api_close():
     if account not in (1, 2):
         return _fail("account must be 1 or 2")
     ticket = str(d.get("ticket", ""))
-    symbol = str(d.get("symbol", "")).upper()
+    symbol = str(d.get("symbol", "")).strip()
     try:
         cmd = sender_for(account)
         t0 = time.perf_counter()
@@ -400,7 +422,8 @@ def api_schedule():
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
-        pair = str(d.get("pair", "")).upper()
+        pair = str(d.get("pair", "")).strip()   # case-sensitive symbol name
+        side = str(d.get("side", "BUY")).upper()
         lot = float(d.get("lot", 0))
         n = int(d.get("n", 1))
         ex, cl = d.get("exec") or [0, 0, 0], d.get("close") or [0, 0, 0]
@@ -410,6 +433,10 @@ def api_schedule():
         return _fail("bad schedule fields")
     if account not in (1, 2):
         return _fail("account must be 1 or 2")
+    if side not in ("BUY", "SELL"):
+        return _fail("side must be BUY or SELL")
+    if not pair:
+        return _fail("pair is required")
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
     if not 1 <= n <= 50:
@@ -422,12 +449,22 @@ def api_schedule():
     for h, m, s in ((eh, em, es), (ch, cm, cs)):
         if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
             return _fail("time out of range")
-    sid = db.add_future_trade(account, pair, "BUY", lot, n, eh, em, es, ch, cm, cs)
-    return _ok({"id": sid, "next_fire": db.get_schedule(sid)["next_fire"]})
+    # H/M/S are LOCAL WALL CLOCK (the operator reads the panel clock on the
+    # same wall) - database.add_future_trade converts to UTC for storage.
+    sid = db.add_future_trade(account, pair, side, lot, n, eh, em, es, ch, cm, cs)
+    sch = db.get_schedule(sid)
+    nf = sch["next_fire"] if sch else "?"
+    # show the operator their OWN wall-clock fire time, not the UTC storage
+    try:
+        nf_local = (dt.datetime.fromisoformat(str(nf)).astimezone()
+                    .strftime("%H:%M:%S"))
+    except (ValueError, TypeError):
+        nf_local = str(nf)
+    return _ok({"id": sid, "next_fire": str(nf), "next_fire_local": nf_local})
 
 
 @app.post("/api/schedule/delete")
-@rate_limit(max_requests=20, window=60)
+@rate_limit(max_requests=30, window=60)
 def api_schedule_delete():
     d = request.get_json(silent=True) or {}
     try:
@@ -436,6 +473,9 @@ def api_schedule_delete():
         return _fail("bad id")
     if not db.get_schedule(sid):
         return _fail("no such schedule")
+    if d.get("hard"):
+        db.delete_schedule(sid)
+        return _ok({"detail": f"schedule #{sid} deleted"})
     db.deactivate(sid)
     return _ok()
 
@@ -443,51 +483,94 @@ def api_schedule_delete():
 @app.delete("/api/schedule/<int:sid>")
 @rate_limit(max_requests=20, window=60)
 def api_delete_schedule(sid: int):
-    db.deactivate(sid)
-    return _ok()
+    if not db.get_schedule(sid):
+        return _fail("no such schedule")
+    db.delete_schedule(sid)
+    return _ok({"detail": f"schedule #{sid} deleted"})
+
+
+@app.post("/api/schedule/update")
+@rate_limit(max_requests=40, window=60)
+def api_schedule_update():
+    """EDIT one schedule in place (scheduled page -> ADJUST).
+    All fields optional; missing ones keep their current value."""
+    d = request.get_json(silent=True) or {}
+    try:
+        sid = int(d.get("id", 0))
+    except (TypeError, ValueError):
+        return _fail("bad id")
+    cur = db.get_schedule(sid)
+    if not cur:
+        return _fail("no such schedule")
+    updates: dict = {}
+    try:
+        if "pair" in d:
+            pair = str(d["pair"]).strip()
+            if not pair:
+                return _fail("pair is required")
+            updates["pair"] = pair            # case-sensitive symbol
+        if "side" in d:
+            side = str(d["side"]).upper()
+            if side not in ("BUY", "SELL"):
+                return _fail("side must be BUY or SELL")
+            updates["side"] = side
+        if "lot" in d:
+            lot = float(d["lot"])
+            if lot <= 0 or lot > 100:
+                return _fail("lot out of range")
+            updates["lot"] = lot
+        if "n" in d:
+            n = int(d["n"])
+            if not 1 <= n <= 50:
+                return _fail("positions must be 1..50")
+            updates["n_positions"] = n
+        for key in ("exec", "close"):
+            if key in d and d[key] is not None:
+                h, m, s = (int(x) for x in d[key])
+                if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
+                    return _fail("time out of range")
+                if key == "exec":
+                    updates.update(exec_h=h, exec_m=m, exec_s=s)
+                else:
+                    updates.update(close_h=h, close_m=m, close_s=s)
+        if "active" in d:
+            updates["active"] = bool(d["active"])
+    except (TypeError, ValueError):
+        return _fail("bad update fields")
+    if not updates:
+        return _fail("nothing to update")
+    if not db.update_schedule(sid, **updates):
+        return _fail("update failed")
+    sch = db.get_schedule(sid)
+    nf = sch["next_fire"] if sch else "?"
+    try:
+        nf_local = (dt.datetime.fromisoformat(str(nf)).astimezone()
+                    .strftime("%H:%M:%S"))
+    except (ValueError, TypeError):
+        nf_local = str(nf)
+    return _ok({"id": sid, "next_fire": str(nf), "next_fire_local": nf_local})
+
+
+@app.post("/api/history/clear")
+@rate_limit(max_requests=6, window=60)
+def api_history_clear():
+    """START AFRESH: wipe the fired log and drop inactive schedules.
+    ACTIVE schedules are kept - they are armed trades, not history."""
+    deleted = db.clear_history()
+    return _ok({"deleted": deleted,
+                "detail": f"cleared {deleted} rows - history starts afresh"})
 
 
 @app.get("/api/fired")
-@rate_limit(max_requests=60, window=60)
+@rate_limit(max_requests=600, window=60)
 def api_fired():
     return jsonify({"ok": True, "fired": db.list_fired(80)})
 
 
 @app.get("/api/schedules")
-@rate_limit(max_requests=60, window=60)
+@rate_limit(max_requests=600, window=60)
 def api_schedules():
     return jsonify({"ok": True, "schedules": db.list_future_trades()})
-
-
-@app.get("/api/hft/stats")
-@rate_limit(max_requests=30, window=60)
-def api_hft_stats():
-    """Get HFT bot statistics for both accounts."""
-    return jsonify({
-        "ok": True,
-        "ts": dt.datetime.now().isoformat(timespec="seconds"),
-        "accounts": {
-            "1": db.get_hft_performance(1),
-            "2": db.get_hft_performance(2)
-        },
-        "recent_trades": {
-            "1": db.get_hft_stats(1, limit=20),
-            "2": db.get_hft_stats(2, limit=20)
-        }
-    })
-
-
-@app.get("/api/hft/trades")
-@rate_limit(max_requests=30, window=60)
-def api_hft_trades():
-    """Get HFT trade history."""
-    account = request.args.get("account", type=int)
-    symbol = request.args.get("symbol", type=str)
-    limit = request.args.get("limit", default=100, type=int)
-    return jsonify({
-        "ok": True,
-        "trades": db.get_hft_stats(account, symbol, limit)
-    })
 
 
 @app.get("/api/metrics/<int:acc>")
@@ -625,15 +708,6 @@ def main() -> int:
     # BROKER PROBER: probes the logged-in brokers and decides the best
     # order filling method so trades never get rejected (retcode 10030)
     broker_prober.start_prober()
-
-    # Graceful shutdown: stop the scheduler thread + metrics observer
-    def _shutdown(*_):
-        log.info("shutting down - stopping scheduler + metrics observer...")
-        if _scheduler:
-            _scheduler.stop_flag.set()
-        metrics.stop_observer()
-        broker_prober.stop_prober()
-        sys.exit(0)
 
     # Graceful shutdown: stop the scheduler thread + metrics observer
     def _shutdown(*_):

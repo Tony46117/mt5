@@ -65,6 +65,43 @@ Handles packages, the Wine prefix, the MetaTrader 5 install, the Python
 virtualenv and EA compilation, with retries and non-fatal fallbacks on
 interactive steps.
 
+## Run with Docker (any OS, including Windows)
+
+The container bundles Wine + Xvfb + the pre-compiled EA. It auto-detects the
+environment (plain Docker, WSL2, Kubernetes) and the X display (X11 forward,
+Wayland, or a private headless Xvfb) on every start - no flags needed.
+
+```bash
+docker compose up --build       # or: bash run.sh on Windows (auto-detects)
+```
+
+- Web panel: http://localhost:8000
+- Persistent state (wine prefix, MT5 installs, databases, logs) lives in the
+  `mt5-data` volume; `logs/` inside the container maps to `/data/logs`.
+- First boot installs MT5 into the volume and creates terminal 2 (~2 min),
+  later boots start in seconds.
+
+**Windows:** install Docker Desktop (WSL2 backend), then from the project
+folder run `bash run.sh` in Git Bash / WSL - it detects the OS and hands
+everything to the container stack. All the Wine/MT5 logic stays in Linux
+containers, so the stack behaves identically to a native Linux box.
+
+**Accounts:** put your `acc.env` at `./data/acc.env` on the host - the
+container copies it in and seeds the obfuscated session on first boot. Set
+`MT5_MACHINE_KEY` in the environment (any long random string) so the
+encrypted `session.json` survives container recreation. You can also log in
+live from the web panel.
+
+Useful commands:
+
+```bash
+docker compose up --build -d          # detached
+docker compose logs -f                # follow logs
+docker compose exec mt5-bridge bash   # shell inside
+docker compose down                   # stop (volume persists)
+docker compose down -v                # stop AND wipe all state
+```
+
 ## Configure accounts
 
 Seed the stored session once (prompts per terminal, password input does

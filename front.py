@@ -287,6 +287,35 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
   letter-spacing:1px;padding:7px 2px 0;flex-wrap:wrap}
 .legend i{display:inline-block;width:14px;height:3px;border-radius:2px;
   vertical-align:middle;margin-right:5px}
+
+/* rotating dial time picker (H/M/S circles) */
+.dials{display:flex;gap:16px;flex-wrap:wrap}
+.dial{position:relative;width:84px;text-align:center;cursor:grab;
+  user-select:none;-webkit-user-select:none;touch-action:none}
+.dial:active{cursor:grabbing}
+.dial svg{width:84px;height:84px;display:block;overflow:visible}
+.dial .dial-val{position:absolute;top:30px;left:0;right:0;
+  font-family:ui-monospace,Consolas,monospace;font-size:18px;font-weight:700;color:#fff;
+  pointer-events:none;text-shadow:0 0 12px rgba(77,166,255,.55)}
+.dial .dial-lbl{margin-top:3px;font-size:9px;letter-spacing:1.6px;color:var(--dim);
+  text-transform:uppercase}
+.dial .tick{stroke:var(--line3);stroke-width:1.5}
+.dial .tick.maj{stroke:var(--dim2);stroke-width:2}
+.dial .track{fill:none;stroke:var(--line);stroke-width:3.5}
+.dial .prog{fill:none;stroke:var(--blue);stroke-width:3.5;stroke-linecap:round;
+  filter:drop-shadow(0 0 4px rgba(77,166,255,.55))}
+.dial .arm{stroke:var(--blue2);stroke-width:1.5;opacity:.7}
+.dial .knob{fill:#fff;stroke:var(--blue);stroke-width:2;
+  filter:drop-shadow(0 0 6px rgba(77,166,255,.85))}
+.secthint{font-size:9px;letter-spacing:2px;color:var(--dim);margin:14px 0 6px;
+  text-transform:uppercase}
+.secthint b{color:var(--blue)}
+.cnt{margin-top:8px;font-size:11px;color:var(--blue2);font-variant-numeric:tabular-nums}
+.chip.filter{cursor:pointer;user-select:none;opacity:.55}
+.chip.filter.on{opacity:1;border-color:var(--blue);color:var(--blue);box-shadow:var(--glow)}
+.chip.filter b{color:inherit}
+.dials .btn.mini{margin:26px 0 0 6px;font-weight:700;min-width:44px;
+  background:var(--blue3);color:var(--blue);border:1px solid var(--line3)}
 """
 
 # --------------------------------------------------------------------------
@@ -319,8 +348,21 @@ function toast(msg,ok){const t=$id('toast');t.textContent=msg;
 function clockTick(){$id('clock').textContent=new Date().toLocaleTimeString('en-GB')}
 setInterval(clockTick,1000);clockTick();
 function dot(live,warn){return live?'dot':(warn?'dot warn':'dot off')}
+/* sticky link status: a single failed poll (or a 429 burst) must not flip
+   the pill OFFLINE - only N consecutive failures count as a real outage.
+   The old code flipped the pill on EVERY render error, so the UI flapped
+   online/offline every few seconds while the bridge was perfectly fine. */
+let FAILS=0;
+function linkOffline(){
+ FAILS++;
+ if(FAILS<3)return;                       // sticky: wait for 3 consecutive
+ const pill=$id('sysPill');
+ if(pill){pill.className='status-pill bad';
+  $id('sysLbl').textContent='OFFLINE'}
+ const d=$id('sysdot');if(d)d.className='dot off'}
 function liveLink(sys){
  const ok=(sys.t1&&sys.t1.running)&&(sys.t2&&sys.t2.running);
+ FAILS=0;                                 // a good response resets the streak
  const pill=$id('sysPill');
  if(pill){pill.className='status-pill'+(ok?'':' bad');
   $id('sysLbl').textContent=ok?'LINK LIVE':'LINK DEGRADED'}
@@ -335,6 +377,196 @@ function ring(pct,col){
   '<circle cx="37" cy="37" r="'+R+'" fill="none" stroke="'+(col||'#4da6ff')+
   '" stroke-width="7" stroke-linecap="round" stroke-dasharray="'+dash.toFixed(1)+' '+C.toFixed(1)+'"/>'+
   '</svg><div class="pct">'+pct.toFixed(0)+'%</div></div>'}
+/* ---------- rotating dial time picker ----------
+   H / M / S each render as a circle: drag around it (mouse or touch) and the
+   value follows the angle - 12 o'clock = 0, clockwise to max (24/60/60).
+   Also responds to wheel steps. */
+const DIALS={};   // key -> {val, steps, el}
+function dialSvg(steps){
+ let ticks='';
+ const majEvery=(steps===24)?6:5;
+ for(let i=0;i<steps;i++){
+  const a=i*2*Math.PI/steps,maj=(i%majEvery===0);
+  const r1=maj?24:28,r2=32;
+  ticks+='<line class="tick'+(maj?' maj':'')+'" x1="'+(42+r1*Math.sin(a)).toFixed(2)+
+   '" y1="'+(42-r1*Math.cos(a)).toFixed(2)+'" x2="'+(42+r2*Math.sin(a)).toFixed(2)+
+   '" y2="'+(42-r2*Math.cos(a)).toFixed(2)+'"/>'}
+ return '<svg viewBox="0 0 84 84"><circle class="track" cx="42" cy="42" r="38"/>'+
+  ticks+'<circle class="prog" cx="42" cy="42" r="38"/>'+
+  '<line class="arm" x1="42" y1="42" x2="42" y2="10"/>'+
+  '<circle class="knob" cx="42" cy="4" r="4.5"/></svg>'}
+function dialRender(k){
+ const d=DIALS[k];if(!d)return;
+ const frac=d.val/d.steps;
+ const a=frac*2*Math.PI;                     // 12 o'clock = 0, clockwise
+ const px=42+38*Math.sin(a),py=42-38*Math.cos(a);
+ const svg=d.el.querySelector('svg');
+ svg.querySelector('.prog').setAttribute('stroke-dasharray',
+  (frac*2*Math.PI*38).toFixed(2)+' '+(2*Math.PI*38).toFixed(2));
+ const arm=svg.querySelector('.arm');
+ arm.setAttribute('x2',px.toFixed(2));arm.setAttribute('y2',py.toFixed(2));
+ const knob=svg.querySelector('.knob');
+ knob.setAttribute('cx',px.toFixed(2));knob.setAttribute('cy',py.toFixed(2));
+ d.el.querySelector('.dial-val').textContent=String(d.val).padStart(2,'0')}
+function dialSet(k,v){
+ const d=DIALS[k];if(!d)return;
+ d.val=((Math.round(v)%d.steps)+d.steps)%d.steps;
+ dialRender(k);
+ if(d.el._onchange)d.el._onchange(d.val)}
+function dialFromEvent(e){
+ const d=e.currentTarget._dial;if(!d)return;
+ const svg=e.currentTarget.querySelector('svg');
+ const r=svg.getBoundingClientRect();
+ const x=e.clientX-(r.left+r.width/2),y=e.clientY-(r.top+r.height/2);
+ let a=Math.atan2(x,-y);                  // 0 at 12 o'clock, clockwise
+ if(a<0)a+=2*Math.PI;
+ dialSet(d.key,a/(2*Math.PI)*d.steps)}
+function dialWheel(e){
+ const d=e.currentTarget._dial;if(!d)return;
+ e.preventDefault();
+ dialSet(d.key,d.val+(e.deltaY>0?-1:1))}
+function makeDial(key,label,val,steps){
+ const el=document.createElement('div');
+ el.className='dial';el._dial={key:key,val:val,steps:steps};
+ el.innerHTML=dialSvg(steps)+'<div class="dial-val">'+String(val).padStart(2,'0')+
+  '</div><div class="dial-lbl">'+esc(label)+'</div>';
+ DIALS[key]={val:val,steps:steps,el:el};
+ let dragging=false;
+ el.addEventListener('pointerdown',function(e){dragging=true;
+  try{el.setPointerCapture(e.pointerId)}catch(err){}dialFromEvent(e)});
+ el.addEventListener('pointermove',function(e){if(dragging)dialFromEvent(e)});
+ el.addEventListener('pointerup',function(){dragging=false});
+ el.addEventListener('pointercancel',function(){dragging=false});
+ el.addEventListener('wheel',dialWheel,{passive:false});
+ dialRender(key);
+ return el}
+function dialGet(key){const d=DIALS[key];return d?d.val:0}
+function dialDestroyAll(){for(const k in DIALS)delete DIALS[k]}
+/* AM/PM toggle beside an hour dial: the hour dial carries a 12-hour value
+   (0-11) plus an AM/PM button.  '6:10' therefore means 06:10 in the MORNING
+   only when AM is shown - clicking PM makes it 18:10.  The full 24-hour
+   dial made '6:10 PM' silently schedule 06:10 AM (observed: two schedules
+   created at 18:09 fired the NEXT morning).  dialGet('H') returns the
+   0-23 hour; dialGet('ap') returns 0 for AM / 1 for PM. */
+function toggleAP(key){const d=DIALS[key];if(!d)return;
+ d.ap=(d.ap===1)?0:1;dialRender(key);
+ if(d.el._onchange)d.el._onchange(d.val)}
+function hour24(key){const d=DIALS[key];if(!d)return 0;
+ return (d.val%12)+(d.ap?12:0)}
+function apLabel(key){const d=DIALS[key];return d&&d.ap?'PM':'AM'}
+/* live countdown under the open dials: 'fires in 2 m 10 s (18:10:00)' */
+let AP_TIMER=null;
+function apCountdown(n){const el=$id('cnt'+n);if(!el)return;
+ const now=new Date();
+ const t=new Date(now);t.setHours(hour24('eH'+n),dialGet('eM'+n),dialGet('eS'+n),0);
+ if(t<=now)t.setTime(t.getTime()+86400000);
+ const ds=Math.round((t-now)/1000);
+ const hh=Math.floor(ds/3600),mm=Math.floor(ds%3600/60),ss=ds%60;
+ const txt=(hh?hh+' h ':'')+(mm?mm+' m ':'')+ss+' s';
+ el.textContent='fires in '+txt+' at '+t.toLocaleTimeString('en-GB')+' (machine clock)'}
+/* ---------- shared schedule modal (panel + scheduled pages) ----------
+   Open/close times are chosen on rotating dials; values are read back with
+   dialGet()/hour24().  Defaults: open = machine now + 2 min, close = open
+   + 5 min - in the SAME clock the operator sees in the top bar. */
+function schedModalHTML(n,edit){
+ edit=edit||null;
+ const d=new Date();
+ let s=d.getHours()*3600+d.getMinutes()*60+d.getSeconds()+120;
+ const eh=Math.floor(s/3600)%24,em=Math.floor(s/60)%60,es=s%60;
+ s+=300;                                   // close = open + 5 min
+ const ch=Math.floor(s/3600)%24,cm=Math.floor(s/60)%60,cs=s%60;
+ const e=edit||{};
+ return '<div class="modal-head"><h3>'+(edit?'Adjust schedule #'+edit.id:'Schedule future trades')+' · account '+n+'</h3>'+
+  '<button class="closex" onclick="closeModal()">×</button></div>'+
+  '<div class="frow">'+
+  '<div class="fgroup" style="grid-column:span 2"><label>Pair</label><select id="sp'+n+'">'+
+   (edit?'<option>'+esc(edit.pair)+'</option>':'')+'</select></div>'+
+  '<div class="fgroup"><label>Side</label><select id="sdf'+n+'">'+
+   '<option value="BUY"'+(e.side!=='SELL'?' selected':'')+'>BUY</option><option value="SELL"'+(e.side==='SELL'?' selected':'')+'>SELL</option></select></div>'+
+  '<div class="fgroup"><label>Lot size</label><input type="number" id="lotf'+n+'" step="0.01" min="0.01" value="'+(e.lot||0.01)+'"></div>'+
+  '<div class="fgroup"><label>Positions</label><input type="number" id="npf'+n+'" step="1" min="1" max="50" value="'+(e.n||1)+'"></div>'+
+  '</div>'+
+  (edit?'':'<div class="secthint">quick arm · <b>fires in seconds</b> - one click sets open +30 s and close +90 s</div>'+
+  '<div class="chiprow" style="margin:0 0 10px" id="quick'+n+'">'+
+   [5,10,30,60,300].map(sec=>'<button type="button" class="lchip" onclick="quickArm('+n+','+sec+')">+'+
+    (sec>=60?(sec/60)+' m':sec+' s')+'</button>').join('')+
+  '</div>')+
+  '<div class="secthint">open time · <b>drag the circles</b> · machine clock</div>'+
+  '<div class="dials" id="dials_e'+n+'"></div>'+
+  '<div class="cnt" id="cnt'+n+'"></div>'+
+  '<div class="secthint">close time · auto-closes the positions</div>'+
+  '<div class="dials" id="dials_c'+n+'"></div>'+
+  '<div style="margin-top:16px;display:flex;gap:10px;align-items:center">'+
+  '<button class="btn blue" onclick="'+(edit?'saveScheduleEdit('+edit.id+','+n+')':'saveSchedule('+n+')')+'">'+(edit?'SAVE CHANGES':'SAVE SCHEDULE')+'</button>'+
+  '<span class="feedback" style="margin:0" id="ffb'+n+'">fires DAILY at open time, auto-closes at close time · machine clock (AM/PM)</span>'+
+  '</div>'+
+  '<input type="hidden" id="dialinit'+n+'" value="'+(e.h!==undefined?e.h:eh)+'|'+(e.m!==undefined?e.m:em)+'|'+(e.s!==undefined?e.s:es)+'|'+(e.ch!==undefined?e.ch:ch)+'|'+(e.cm!==undefined?e.cm:cm)+'|'+(e.cs!==undefined?e.cs:cs)+'">'}
+/* quick arm: open = now + sec, close = now + sec + 60 (or +5 m for the 5 m chip) */
+function quickArm(n,sec){
+ const cl=sec>=60?sec+300:sec+60;
+ const t=new Date(Date.now()+sec*1000),c=new Date(Date.now()+cl*1000);
+ DIALS['eH'+n].val=t.getHours()%12;DIALS['eH'+n].ap=t.getHours()>=12?1:0;
+ DIALS['eM'+n].val=t.getMinutes();DIALS['eS'+n].val=t.getSeconds();
+ DIALS['cH'+n].val=c.getHours()%12;DIALS['cH'+n].ap=c.getHours()>=12?1:0;
+ DIALS['cM'+n].val=c.getMinutes();DIALS['cS'+n].val=c.getSeconds();
+ for(const k in DIALS)if(DIALS[k].el)DIALS[k].el._onchange&&0;
+ dialRender('eH'+n);dialRender('eM'+n);dialRender('eS'+n);
+ dialRender('cH'+n);dialRender('cM'+n);dialRender('cS'+n);
+ $id('ap_e'+n).textContent=apLabel('eH'+n);$id('ap_c'+n).textContent=apLabel('cH'+n);
+ apCountdown(n);
+ toast('armed: fires '+Math.round((t-new Date())/1000)+' s from now',true)}
+function makeAPHour(n,prefix,val){
+ const wrap=document.createElement('div');wrap.style.display='inline-block';
+ const h12=val%12;const ap=val>=12?1:0;
+ wrap.appendChild(makeDial(prefix+'H'+n,'hrs',h12,12));
+ const btn=document.createElement('button');btn.type='button';
+ btn.className='btn mini';btn.id='ap_'+prefix+n;
+ btn.textContent=ap?'PM':'AM';
+ btn.onclick=function(){toggleAP(prefix+'H'+n);btn.textContent=apLabel(prefix+'H'+n);
+  if(AP_TIMER)apCountdown(n)};
+ wrap.appendChild(btn);
+ DIALS[prefix+'H'+n].ap=ap;
+ return wrap}
+function openSchedModal(n,edit){
+ dialDestroyAll();
+ if(AP_TIMER){clearInterval(AP_TIMER);AP_TIMER=null}
+ MODAL_ACC=n;
+ $id('modalBody').innerHTML=schedModalHTML(n,edit||null);
+ const parts=$id('dialinit'+n).value.split('|').map(Number);
+ const de=$id('dials_e'+n),dc=$id('dials_c'+n);
+ de.appendChild(makeAPHour(n,'e',parts[0]));
+ de.appendChild(makeDial('eM'+n,'min',parts[1],60));
+ de.appendChild(makeDial('eS'+n,'sec',parts[2],60));
+ dc.appendChild(makeAPHour(n,'c',parts[3]));
+ dc.appendChild(makeDial('cM'+n,'min',parts[4],60));
+ dc.appendChild(makeDial('cS'+n,'sec',parts[5],60));
+ apCountdown(n);
+ AP_TIMER=setInterval(function(){apCountdown(n)},1000);
+ fillSymbols();
+ $id('modalBg').classList.add('open')}
+async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
+ try{const j=await post('/api/schedule',{account:+n,pair:$id('sp'+n).value,
+  side:$id('sdf'+n).value,
+  lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
+  exec:[hour24('eH'+n),dialGet('eM'+n),dialGet('eS'+n)],
+  close:[hour24('cH'+n),dialGet('cM'+n),dialGet('cS'+n)]});
+  const ft=new Date(j.next_fire);
+  const today=ft.toDateString()===new Date().toDateString();
+  const when=(j.next_fire_local||j.next_fire)+(today?'':' TOMORROW');
+  f.className='feedback ok';f.textContent='saved #'+j.id+' - fires '+when;
+  toast('schedule #'+j.id+' saved - fires '+when,today);
+  setTimeout(closeModal,1500);refresh()}catch(e){f.className='feedback err';
+  f.textContent=e.message}}
+async function saveScheduleEdit(sid,n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
+ try{const j=await post('/api/schedule/update',{id:sid,pair:$id('sp'+n).value,
+  side:$id('sdf'+n).value,
+  lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
+  exec:[hour24('eH'+n),dialGet('eM'+n),dialGet('eS'+n)],
+  close:[hour24('cH'+n),dialGet('cM'+n),dialGet('cS'+n)]});
+  f.className='feedback ok';f.textContent='updated #'+sid+' - next fire '+(j.next_fire_local||j.next_fire);
+  toast('schedule #'+sid+' adjusted - next fire '+(j.next_fire_local||j.next_fire),true);
+  setTimeout(closeModal,1200);refresh()}catch(e){f.className='feedback err';
+  f.textContent=e.message}}
 """
 
 # --------------------------------------------------------------------------
@@ -354,6 +586,7 @@ DASHBOARD_TMPL = """<!doctype html>
     <div class="sb-section">Workspace</div>
     <a class="sb-item on" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">▣</span>Trading Panel</a>
+    <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
@@ -488,9 +721,7 @@ function render(){if(!S)return;
   renderKpis(S);
   const sys=S.system||{};liveLink(sys);}
 async function refresh(){try{S=await api('/api/dashboard');render()}
- catch(e){$id('sysPill').className='status-pill bad';
-  $id('sysLbl').textContent='OFFLINE';
-  const d=$id('sysdot');if(d)d.className='dot off';
+ catch(e){linkOffline();
   // first load failed: show why - later failures keep the last good render
   const kp=$id('kpiGrid');
   if(kp&&kp.children.length===0)
@@ -521,13 +752,14 @@ PANEL_TMPL = """<!doctype html>
     <div class="sb-section">Workspace</div>
     <a class="sb-item" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item on" href="/panel"><span class="ic">▣</span>Trading Panel</a>
+    <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
     <header class="topbar">
       <div>
         <div class="page-title">TRADING PANEL</div>
-        <div class="page-sub">one-click execution · future trades · 0.6 s refresh</div>
+        <div class="page-sub">one-click execution · 0.6 s refresh</div>
       </div>
       <div class="spacer"></div>
       <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
@@ -550,7 +782,7 @@ PANEL_TMPL = """<!doctype html>
 </body></html>"""
 
 PANEL_JS = COMMON_JS + """
-let P=null,BUILT=false,MODAL_ACC=null,INFLIGHT={};
+let P=null,SCH=null,BUILT=false,MODAL_ACC=null,INFLIGHT={};
 function num(v){return (v===null||v===undefined||isNaN(+v))?0:+v}
 function setBusy(n,busy){for(const b of document.querySelectorAll('#acc'+n+' .tbtn'))
  b.disabled=busy}
@@ -590,21 +822,23 @@ function buildPanel(n){
    '<button class="tbtn tbuy" onclick="doTrade('+n+',\\'BUY\\')">BUY</button>'+
   '</div>'+
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
- '</div>'+
- '<div class="sect"><h4>Open positions</h4><div class="right">'+
+ '</div>'+ '<div class="sect"><h4>Open positions</h4><div class="right">'+
   '<span class="chip">P/L <b id="pospl'+n+'">-</b></span>'+
   '<button class="btn mini danger" onclick="closeAll('+n+')">CLOSE ALL</button></div></div>'+
- '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
- '<div class="sect"><h4>Future trades</h4><div class="right">'+
-  '<button class="btn mini blue" onclick="openModal('+n+')">+ SCHEDULE</button></div></div>'+
- '<div class="tblwrap" id="sched'+n+'"><div class="empty">nothing scheduled</div></div>'}
+  '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
+ '<div class="sect"><h4>Scheduled trades</h4><div class="right">'+
+  '<span class="chip">ACTIVE <b id="schcnt'+n+'">0</b></span>'+
+  '<button class="btn mini blue" onclick="openSchedModal('+n+')">+ SCHEDULE</button></div></div>'+
+  '<div class="body mut" style="font-size:11px">see the <a href="/scheduled" '+
+  'style="color:var(--blue)">Scheduled Trades</a> page for the list & fired log</div>'}
 function kv(k,ref){return '<div><div class="k">'+k+'</div><div class="v sm" id="'+ref.split(':')[1]+'">-</div></div>'}
-function fillSymbols(){const spots=((P.accounts['1']||{}).spreads)||{};
- const keys=Object.keys(spots);if(!keys.length)return;
+function fillSymbols(){const spots=(((P||{}).accounts||{})['1']||{}).spreads||{};
+ const keys=Object.keys(spots);
  for(const n of ['1','2']){const sel=$id('sym'+n),sp=$id('sp'+n);
   for(const el of [sel,sp]){if(!el)continue;const cur=el.value;
-   el.innerHTML=keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
-   if(cur&&keys.includes(cur))el.value=cur}}}
+   el.innerHTML=(cur&&!keys.includes(cur)?'<option>'+esc(cur)+'</option>':'')+
+    keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
+   if(cur)el.value=cur}}}
 function stepLot(n,d){const el=$id('lot'+n);
  let v=Math.max(0.01,(parseFloat(el.value)||0.01)+d);el.value=v.toFixed(2);markChip(n)}
 function setLot(n,v){$id('lot'+n).value=v.toFixed(2);markChip(n)}
@@ -650,40 +884,10 @@ async function restartTerm(n){
   toast(j.detail||('terminal '+n+' restarting'),true);refresh()}
  catch(e){toast(e.message,false)}
  finally{setTimeout(()=>{delete INFLIGHT['r'+n]},15000)}}
-/* ---------- future-trade modal ---------- */
-function openModal(n){MODAL_ACC=n;
- $id('modalBody').innerHTML=
-  '<div class="modal-head"><h3>Schedule future trades · account '+n+'</h3>'+
-  '<button class="closex" onclick="closeModal()">×</button></div>'+
-  '<div class="frow">'+
-   '<div class="fgroup" style="grid-column:span 2"><label>Pair</label><select id="sp'+n+'"></select></div>'+
-   '<div class="fgroup"><label>Lot size</label><input type="number" id="lotf'+n+'" step="0.01" min="0.01" value="0.01"></div>'+
-   '<div class="fgroup"><label>Positions</label><input type="number" id="npf'+n+'" step="1" min="1" max="50" value="1"></div>'+
-  '</div>'+
-  '<div class="frow" style="margin-top:10px">'+
-   '<div class="fgroup"><label>Exec H</label><select id="eh'+n+'">'+optRange(0,23,0)+'</select></div>'+
-   '<div class="fgroup"><label>Min</label><select id="em'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Sec</label><select id="es'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Close H</label><select id="ch'+n+'">'+optRange(0,23,0)+'</select></div>'+
-   '<div class="fgroup"><label>Min</label><select id="cm'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Sec</label><select id="cs'+n+'">'+optRange(0,59,0)+'</select></div>'+
-  '</div>'+
-  '<div style="margin-top:14px;display:flex;gap:10px;align-items:center">'+
-   '<button class="btn blue" onclick="saveSchedule('+n+')">SAVE SCHEDULE</button>'+
-   '<span class="feedback" style="margin:0" id="ffb'+n+'">fires daily at exec time, auto-closes at close time</span>'+
-  '</div>';
- fillSymbols();
- $id('modalBg').classList.add('open')}
+/* ---------- future-trade modal (shared dial-picker version in COMMON_JS) ---------- */
+function openModal(n){MODAL_ACC=n;openSchedModal(n)}
 function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
 $id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
-async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
- try{const j=await post('/api/schedule',{account:+n,pair:$id('sp'+n).value,
-  lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
-  exec:[+$id('eh'+n).value,+$id('em'+n).value,+$id('es'+n).value],
-  close:[+$id('ch'+n).value,+$id('cm'+n).value,+$id('cs'+n).value]});
-  f.className='feedback ok';f.textContent='saved #'+j.id+' - fires '+j.next_fire;
-  toast('schedule #'+j.id+' saved',true);setTimeout(closeModal,900);refresh()}catch(e){f.className='feedback err';
-  f.textContent=e.message}}
 async function delSchedule(id){try{await post('/api/schedule/delete',{id});
   toast('schedule #'+id+' removed',true);refresh()}catch(e){toast(e.message,false)}}
 function posTable(n){const a=(P.accounts||{})[n]||{};const ps=a.positions||[];
@@ -703,20 +907,6 @@ function posTable(n){const a=(P.accounts||{})[n]||{};const ps=a.positions||[];
    '<td class="num mut">'+signed(+p.swap)+'</td>'+
    '<td class="mut" style="font-size:11px">'+esc(String(p.time).slice(0,19))+'</td>'+
    '<td><button class="xbtn" onclick="closePos('+n+',\\''+esc(p.ticket)+'\\')">CLOSE</button></td></tr>').join('')+
-  '</table>'}
-function schedTable(n){const a=(P.accounts||{})[n]||{};
- const ss=(a.schedules||[]);if(!ss.length){
-  $id('sched'+n).innerHTML='<div class="empty">nothing scheduled</div>';return}
- $id('sched'+n).innerHTML='<table><tr><th>#</th><th>pair</th><th>side</th>'+
-  '<th class="num">lot</th><th class="num">x</th><th>exec at</th><th>close at</th>'+
-  '<th>next fire</th><th></th></tr>'+
-  ss.map(s=>'<tr><td class="mut">'+s.id+'</td><td class="mono">'+esc(s.pair)+'</td>'+
-   '<td><span class="side '+esc(s.side)+'">'+esc(s.side)+'</span></td>'+
-   '<td class="num">'+fmt(s.lot,2)+'</td><td class="num">'+s.n_positions+'</td>'+
-   '<td class="mono">'+hhmmss(s.exec_h,s.exec_m,s.exec_s)+'</td>'+
-   '<td class="mono">'+hhmmss(s.close_h,s.close_m,s.close_s)+'</td>'+
-   '<td class="mut" style="font-size:11px">'+esc(s.next_fire)+'</td>'+
-   '<td><button class="xbtn" onclick="delSchedule('+s.id+')">DEL</button></td></tr>').join('')+
   '</table>'}
 function updAcc(n){const a=(P.accounts||{})[n]||{};
  if(!$id('live'+n))return;                     // panel not built yet
@@ -742,7 +932,10 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
   '<span class="chip">FEED <b>'+(a.live?'LIVE':'STALE')+'</b></span>';
  const sym=$id('sym'+n).value;
  if(sym&&sp[sym]!=null){$id('tspr'+n).textContent=fmt(sp[sym],0)+' pts'}
- posTable(n);schedTable(n)}
+ posTable(n)}
+function renderSchedCount(n){const rows=(SCH||[]).filter(s=>String(s.account)===String(n));
+ const cnt=$id('schcnt'+n);
+ if(cnt)cnt.textContent=String(rows.filter(s=>s.active).length)}
 function render(){if(!P)return;
   if(!BUILT){buildPanel('1');buildPanel('2');fillSymbols();
    for(const n of ['1','2'])
@@ -751,11 +944,12 @@ function render(){if(!P)return;
       +v.toFixed(2)+'</button>').join('');
    BUILT=true}
   fillSymbols();updAcc('1');updAcc('2');
+  renderSchedCount('1');renderSchedCount('2');
   const sys=P.system||{};liveLink(sys);}
-async function refresh(){try{P=await api('/api/panel');render()}
- catch(e){$id('sysPill').className='status-pill bad';
-  $id('sysLbl').textContent='OFFLINE';
-  const d=$id('sysdot');if(d)d.className='dot off';
+async function refresh(){
+  try{const results=await Promise.all([api('/api/panel'),api('/api/schedules')]);
+   P=results[0];SCH=results[1].schedules||[];render()}
+ catch(e){linkOffline();
   for(const n of ['1','2']){const c=$id('acc'+n);
    if(c&&c.children.length===0)
     c.innerHTML='<div class="empty">waiting for data - '+esc(e.message)+'</div>'}}}
@@ -765,3 +959,200 @@ refresh();setInterval(refresh,600);
 
 def render_panel() -> str:
     return render_template_string(PANEL_TMPL, css=CSS, js=PANEL_JS)
+
+
+# --------------------------------------------------------------------------
+# scheduled trades page
+# --------------------------------------------------------------------------
+
+SCHEDULED_TMPL = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MT5 TERMINAL - SCHEDULED TRADES</title>
+<style>{{ css|safe }}</style></head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-brand"><div class="logo"></div>MT5<b>//</b>TERM</div>
+    <div class="sb-sub">trading terminal</div>
+    <div class="sb-section">Workspace</div>
+    <a class="sb-item" href="/"><span class="ic">\u25c8</span>Dashboard</a>
+    <a class="sb-item" href="/panel"><span class="ic">\u25a3</span>Trading Panel</a>
+    <a class="sb-item on" href="/scheduled"><span class="ic">\u25c7</span>Scheduled Trades</a>
+    <div class="sb-foot">SPOTDUMP EA \u00b7 v2</div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="page-title">SCHEDULED TRADES</div>
+        <div class="page-sub">future trades &amp; past-24 h fired log \u00b7 live countdown \u00b7 times are YOUR clock</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
+        <span id="sysLbl">LINK</span></div>
+      <div id="clock" class="mono"></div>
+    </header>
+    <div class="wrap">
+      <section class="kpi-grid" id="kpiGrid"></section>
+      <div class="grid" style="grid-template-columns:1fr;gap:14px">
+        <section class="panel">
+          <div class="sect"><h4>Schedules</h4>
+            <div class="right">
+              <span class="chip filter" id="fltALL" onclick="setFilter('ALL')">ALL <b id="cntALL">0</b></span>
+              <span class="chip filter on" id="fltACTIVE" onclick="setFilter('ACTIVE')">ACTIVE <b id="cntACTIVE">0</b></span>
+              <span class="chip filter" id="fltOFF" onclick="setFilter('OFF')">OFF <b id="cntOFF">0</b></span>
+              <button class="btn mini blue" onclick="openModal(1)">+ NEW SCHEDULE</button></div></div>
+          <div class="tblwrap" id="schedTbl"><div class="empty">loading...</div></div>
+        </section>
+        <section class="panel">
+          <div class="sect"><h4>Fired Log</h4>
+            <div class="right"><button class="btn mini danger" onclick="clearHistory()">CLEAR HISTORY</button>
+            <button class="btn mini" id="seeAllBtn" onclick="toggleFired()">SEE ALL</button></div></div>
+          <div class="tblwrap" id="firedTbl"><div class="empty">loading...</div></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="modal-bg" id="modalBg">
+  <div class="modal" id="modalBody"></div>
+</div>
+<div class="toast" id="toast"></div>
+<script>{{ js|safe }}</script>
+</body></html>"""
+
+SCHEDULED_JS = COMMON_JS + """
+let S=null,F=null,SYS=null,BUILT=false,MODAL_ACC=null,FIRED_EXPANDED=false,FILTER='ACTIVE';
+const FIRED_PREVIEW = 20;  // show only last 20 by default
+/* next_fire is stored UTC; show the operator their own wall clock */
+function localFire(iso){try{return new Date(iso).toLocaleTimeString('en-GB')+
+ ' \u00b7 '+new Date(iso).toLocaleDateString('en-GB')}catch(e){return String(iso||'')}}
+/* fired log = past 24 h only (the server also prunes old rows) */
+function fresh24(rows){const cut=Date.now()-86400000;
+ return (rows||[]).filter(r=>{try{return new Date(r.at).getTime()>=cut}catch(e){return true}})}
+function hhmmss(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
+function optRange(a,b,sel){let o='';for(let i=a;i<=b;i++){o+='<option value="'+i+'"'+
+ (i==sel?' selected':'')+'>'+String(i).padStart(2,'0')+'</option>'}return o}
+/* countdown: 'in 3 s' / 'in 2 m 10 s' / 'in 1 h 03 m' / 'tomorrow' */
+function countdown(iso){try{const t=new Date(iso),now=new Date();
+ let ds=Math.round((t-now)/1000);if(isNaN(ds))return '';
+ if(ds<0)return 'due';
+ if(ds>=86400)return 'tomorrow';
+ const hh=Math.floor(ds/3600),mm=Math.floor(ds%3600/60),ss=ds%60;
+ return 'in '+(hh?hh+' h '+String(mm).padStart(2,'0')+' m':(mm?mm+' m '+String(ss).padStart(2,'0')+' s':ss+' s'))}catch(e){return ''}}
+function setFilter(f){FILTER=f;
+ for(const k of ['ALL','ACTIVE','OFF']){const el=$id('flt'+k);
+  if(el)el.className='chip filter'+(k===f?' on':'')}
+ renderSched()}
+function renderKpis(){
+  const active=(S||[]).filter(s=>s.active);
+  const fired=(F||[]).length;
+  const ok=(F||[]).filter(r=>r.ok).length;
+  const cards=[
+   {k:'ACTIVE SCHEDULES',v:String(active.length),c:'',sub:'armed & counting down'},
+   {k:'FIRED TOTAL',v:String(fired),c:'',sub:'in log'},
+   {k:'FIRED OK',v:String(ok),c:'up',sub:'successful executions'},
+   {k:'FIRED ERR',v:String(fired-ok),c:fired>ok?'down':'',sub:'failed executions'},
+  ];
+  $id('kpiGrid').innerHTML=cards.map(c=>
+   '<div class="kpi"><div class="k">'+c.k+'</div>'+
+   '<div class="v '+(c.c||'')+'">'+c.v+'</div>'+
+   '<div class="sub">'+(c.sub||'')+'</div></div>').join('')}
+function renderSched(){
+  const cnt={ALL:(S||[]).length,ACTIVE:(S||[]).filter(s=>s.active).length,
+   OFF:(S||[]).filter(s=>!s.active).length};
+  for(const k in cnt){const el=$id('cnt'+k);if(el)el.textContent=String(cnt[k])}
+  let rows=S||[];
+  if(FILTER==='ACTIVE')rows=rows.filter(s=>s.active);
+  if(FILTER==='OFF')rows=rows.filter(s=>!s.active);
+  if(!rows.length){$id('schedTbl').innerHTML='<div class="empty">'+
+   (FILTER==='ACTIVE'?'no active schedules - create one with + NEW SCHEDULE (or arm one +30 s away)':'no schedules here')+'</div>';return}
+  $id('schedTbl').innerHTML='<table><tr><th>#</th><th>account</th><th>pair</th><th>side</th>'+
+   '<th class="num">lot</th><th class="num">x</th><th>open at</th><th>close at</th>'+
+   '<th>next fire</th><th>status</th><th></th></tr>'+
+   rows.map(s=>'<tr><td class="mut">'+s.id+'</td><td>acc'+s.account+'</td>'+
+    '<td class="mono">'+esc(s.pair)+'</td>'+
+    '<td><span class="side '+esc(s.side)+'">'+esc(s.side)+'</span></td>'+
+    '<td class="num">'+fmt(s.lot,2)+'</td><td class="num">'+s.n_positions+'</td>'+
+    '<td class="mono">'+hhmmss(s.exec_h,s.exec_m,s.exec_s)+'</td>'+
+    '<td class="mono">'+hhmmss(s.close_h,s.close_m,s.close_s)+'</td>'+
+    '<td class="mut" style="font-size:11px" data-fire="'+esc(String(s.next_fire||''))+'">'+(s.active?
+     '<span class="cd up"></span> \u00b7 ':'')+
+    esc(localFire(s.next_fire))+'</td>'+
+    '<td>'+(s.active?'<span class="up">ACTIVE</span>':'<span class="mut">OFF</span>')+'</td>'+
+    '<td style="white-space:nowrap">'+
+     '<button class="xbtn" onclick="editSchedule('+s.id+')">EDIT</button> '+
+     '<button class="xbtn" onclick="toggleSchedule('+s.id+','+s.active+')">'+(s.active?'PAUSE':'ARM')+'</button> '+
+     '<button class="xbtn" onclick="delSchedule('+s.id+')">DEL</button></td></tr>').join('')+
+   '</table>'}
+function renderFired(){
+  const all = fresh24(F);
+  if(!all.length){$id('firedTbl').innerHTML='<div class="empty">no fired trades in the past 24 h</div>';return}
+  const show = FIRED_EXPANDED ? all : all.slice(0, FIRED_PREVIEW);
+  const btn = $id('seeAllBtn');
+  if(btn) btn.textContent = FIRED_EXPANDED ? 'SHOW LESS'
+    : (all.length>FIRED_PREVIEW ? 'SEE ALL (' + (all.length - FIRED_PREVIEW) + ' more)' : 'SEE ALL');
+  $id('firedTbl').innerHTML='<table><tr><th>at</th><th>schedule</th><th>account</th><th>kind</th>'+
+   '<th>pair</th><th>side</th><th class="num">lot</th><th>ticket</th><th>result</th>'+
+   '<th>detail</th><th class="num">ms</th></tr>'+
+   show.map(r=>'<tr><td class="mut" style="font-size:11px">'+esc(String(r.at).slice(11,19))+'</td>'+
+    '<td class="mut">#'+r.schedule_id+'</td><td>acc'+r.account+'</td>'+
+    '<td>'+esc(r.kind)+'</td><td class="mono">'+esc(r.pair)+'</td>'+
+    '<td><span class="side '+esc(r.side)+'">'+esc(r.side)+'</span></td>'+
+    '<td class="num">'+fmt(r.lot,2)+'</td><td class="mono mut">'+esc(r.ticket||'-')+'</td>'+
+    '<td>'+(r.ok?'<span class="up">OK</span>':'<span class="down">ERR</span>')+'</td>'+
+    '<td class="mut" style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">'+esc(r.detail)+'</td>'+
+    '<td class="num">'+(r.ms?fmt(r.ms,0):'-')+'</td></tr>').join('')+
+   '</table>'}
+function toggleFired(){
+  FIRED_EXPANDED = !FIRED_EXPANDED;
+  renderFired();
+}
+async function clearHistory(){
+  if(!confirm('Wipe the fired log and remove OFF schedules? Active schedules are kept.'))return;
+  try{const j=await post('/api/history/clear',{});
+   toast(j.detail||('cleared '+j.deleted+' rows'),true);refresh()}
+  catch(e){toast(e.message,false)}}
+function editSchedule(id){const s=(S||[]).find(x=>x.id===id);if(!s)return;
+ openSchedModal(s.account,{id:s.id,pair:s.pair,side:s.side,lot:s.lot,n:s.n_positions,
+  h:s.exec_h,m:s.exec_m,s:s.exec_s,ch:s.close_h,cm:s.close_m,cs:s.close_s})}
+async function toggleSchedule(id,isActive){
+ try{const j=await post('/api/schedule/update',{id:id,active:!isActive});
+  toast('schedule #'+id+(isActive?' paused':' armed')+' - next fire '+(j.next_fire_local||''),true);
+  refresh()}catch(e){toast(e.message,false)}}
+function render(){renderKpis();renderSched();renderFired();
+ liveLink((SYS&&SYS.system)||{})}
+async function refresh(){
+  try{const [sch,fired,sys]=await Promise.all([api('/api/schedules'),api('/api/fired'),
+   api('/api/dashboard')]);
+   S=sch.schedules||[];F=fired.fired||[];SYS=sys;render()}
+  catch(e){linkOffline()}}
+/* ---------- future-trade modal (shared dial-picker version in COMMON_JS) ---------- */
+function openModal(n){openSchedModal(n,null)}
+function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
+$id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
+async function delSchedule(id){
+  if(!confirm('Delete schedule #'+id+'? This removes it for good.'))return;
+  try{await post('/api/schedule/delete',{id:id,hard:true});
+  toast('schedule #'+id+' deleted',true);refresh()}catch(e){toast(e.message,false)}}
+function fillSymbols(){
+  /* fetch spot symbols for the pair dropdown */
+  api('/api/spots').then(j=>{const spots=j.spots||{};const keys=Object.keys(spots);
+   const sel=$id('sp'+(MODAL_ACC||1));if(!sel)return;
+   const cur=sel.value;
+   sel.innerHTML=(cur?'<option>'+esc(cur)+'</option>':'')+
+    keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
+   if(cur)sel.value=cur}).catch(()=>{})}
+function renderCountdowns(){
+  const tds=document.querySelectorAll('#schedTbl td[data-fire]');
+  if(!tds.length)return;
+  for(const td of tds){
+   const sp=td.querySelector('.cd');
+   if(sp)sp.textContent=countdown(td.getAttribute('data-fire'))}}
+setInterval(renderCountdowns,1000);
+refresh();setInterval(refresh,2000);
+"""
+
+
+def render_scheduled() -> str:
+    return render_template_string(SCHEDULED_TMPL, css=CSS, js=SCHEDULED_JS)
