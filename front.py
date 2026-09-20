@@ -902,42 +902,8 @@ async function restartTerm(n){
 function openModal(n){MODAL_ACC=n;openSchedModal(n)}
 function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
 $id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
-function openModal(n){MODAL_ACC=n;
- $id('modalBody').innerHTML=
-  '<div class="modal-head"><h3>Schedule future trades · account '+n+'</h3>'+
-  '<button class="closex" onclick="closeModal()">×</button></div>'+
-  '<div class="frow">'+
-   '<div class="fgroup" style="grid-column:span 2"><label>Pair</label><select id="sp'+n+'"></select></div>'+
-   '<div class="fgroup"><label>Side</label><select id="sdf'+n+'">'+
-     '<option value="BUY" selected>BUY</option><option value="SELL">SELL</option></select></div>'+
-   '<div class="fgroup"><label>Lot size</label><input type="number" id="lotf'+n+'" step="0.01" min="0.01" value="0.01"></div>'+
-   '<div class="fgroup"><label>Positions</label><input type="number" id="npf'+n+'" step="1" min="1" max="50" value="1"></div>'+
-  '</div>'+
-  '<div class="frow" style="margin-top:10px">'+
-   '<div class="fgroup"><label>Exec H '+tzTag()+'</label><select id="eh'+n+'">'+optRange(0,23,0)+'</select></div>'+
-   '<div class="fgroup"><label>Min</label><select id="em'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Sec</label><select id="es'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Close H '+tzTag()+'</label><select id="ch'+n+'">'+optRange(0,23,0)+'</select></div>'+
-   '<div class="fgroup"><label>Min</label><select id="cm'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Sec</label><select id="cs'+n+'">'+optRange(0,59,0)+'</select></div>'+
-  '</div>'+
-  '<div style="margin-top:14px;display:flex;gap:10px;align-items:center">'+
-   '<button class="btn blue" onclick="saveSchedule('+n+')">SAVE SCHEDULE</button>'+
-   '<span class="feedback" style="margin:0" id="ffb'+n+'">'+tzHint()+'</span>'+
-  '</div>';
- fillSymbols();
- $id('modalBg').classList.add('open')}
-function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
-$id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
-async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
- try{const j=await post('/api/schedule',{account:+n,pair:$id('sp'+n).value,
-  side:$id('sdf'+n).value,
-  lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
-  exec:[+$id('eh'+n).value,+$id('em'+n).value,+$id('es'+n).value],
-  close:[+$id('ch'+n).value,+$id('cm'+n).value,+$id('cs'+n).value]});
-  f.className='feedback ok';f.textContent='saved #'+j.id+' - fires '+j.next_fire;
-  toast('schedule #'+j.id+' saved',true);setTimeout(closeModal,900);refresh()}catch(e){f.className='feedback err';
-  f.textContent=e.message}}
+
+
 async function delSchedule(id){try{await post('/api/schedule/delete',{id});
   toast('schedule #'+id+' removed',true);refresh()}catch(e){toast(e.message,false)}}
 function posTable(n){const a=(P.accounts||{})[n]||{};const ps=a.positions||[];
