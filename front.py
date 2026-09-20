@@ -555,6 +555,20 @@ function num(v){return (v===null||v===undefined||isNaN(+v))?0:+v}
 function setBusy(n,busy){for(const b of document.querySelectorAll('#acc'+n+' .tbtn'))
  b.disabled=busy}
 function hhmmss(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
+/* Schedules are stored and fired in UTC.  The panel used to render bare
+   H:M:S with no zone, so an operator in UTC+3 who scheduled 14:30 saw the
+   order fire at 17:30 local.  CLOCK is fetched once and used to label the
+   fields and show the local equivalent. */
+let CLOCK=null;
+fetch('/api/clock').then(r=>r.json()).then(j=>{if(j&&j.ok)CLOCK=j}).catch(()=>{});
+function tzTag(){return '<span class="mut" style="font-weight:400">UTC</span>'}
+function tzOff(){return CLOCK?CLOCK.utc_offset_minutes:-new Date().getTimezoneOffset()}
+function tzHint(){const m=tzOff();if(!m)return 'times are UTC · fires daily at exec time, auto-closes at close time';
+ const sg=m<0?'-':'+',a=Math.abs(m),hh=String(Math.floor(a/60)).padStart(2,'0'),mm=String(a%60).padStart(2,'0');
+ return 'times are UTC - your clock is UTC'+sg+hh+':'+mm+', so 00:00 here = '+utcToLocal(0,0,0)+' local'}
+function utcToLocal(h,m,s){const t=(h*3600+m*60+s+tzOff()*60+86400*2)%86400;
+ return String(Math.floor(t/3600)).padStart(2,'0')+':'+String(Math.floor(t%3600/60)).padStart(2,'0')+
+        ':'+String(t%60).padStart(2,'0')}
 function optRange(a,b,sel){let o='';for(let i=a;i<=b;i++){o+='<option value="'+i+'"'+
  (i==sel?' selected':'')+'>'+String(i).padStart(2,'0')+'</option>'}return o}
 function buildPanel(n){
@@ -615,7 +629,7 @@ async function doTrade(n,side){
  if(INFLIGHT['t'+n])return;                    // one click = one order
  const symEl=$id('sym'+n),lotEl=$id('lot'+n),fb=$id('fb'+n);
  if(!symEl||!lotEl||!fb)return;                // panel not built yet
- const sym=(symEl.value||'').trim().toUpperCase();
+ const sym=(symEl.value||'').trim();   // case-sensitive MT5 symbol name
  const lot=parseFloat(lotEl.value);
  if(!sym){fb.className='feedback err';fb.textContent='no symbol - waiting for the feed';return}
  if(!(lot>0)){fb.className='feedback err';fb.textContent='lot must be greater than 0';return}
@@ -657,20 +671,22 @@ function openModal(n){MODAL_ACC=n;
   '<button class="closex" onclick="closeModal()">×</button></div>'+
   '<div class="frow">'+
    '<div class="fgroup" style="grid-column:span 2"><label>Pair</label><select id="sp'+n+'"></select></div>'+
+   '<div class="fgroup"><label>Side</label><select id="sdf'+n+'">'+
+     '<option value="BUY" selected>BUY</option><option value="SELL">SELL</option></select></div>'+
    '<div class="fgroup"><label>Lot size</label><input type="number" id="lotf'+n+'" step="0.01" min="0.01" value="0.01"></div>'+
    '<div class="fgroup"><label>Positions</label><input type="number" id="npf'+n+'" step="1" min="1" max="50" value="1"></div>'+
   '</div>'+
   '<div class="frow" style="margin-top:10px">'+
-   '<div class="fgroup"><label>Exec H</label><select id="eh'+n+'">'+optRange(0,23,0)+'</select></div>'+
+   '<div class="fgroup"><label>Exec H '+tzTag()+'</label><select id="eh'+n+'">'+optRange(0,23,0)+'</select></div>'+
    '<div class="fgroup"><label>Min</label><select id="em'+n+'">'+optRange(0,59,0)+'</select></div>'+
    '<div class="fgroup"><label>Sec</label><select id="es'+n+'">'+optRange(0,59,0)+'</select></div>'+
-   '<div class="fgroup"><label>Close H</label><select id="ch'+n+'">'+optRange(0,23,0)+'</select></div>'+
+   '<div class="fgroup"><label>Close H '+tzTag()+'</label><select id="ch'+n+'">'+optRange(0,23,0)+'</select></div>'+
    '<div class="fgroup"><label>Min</label><select id="cm'+n+'">'+optRange(0,59,0)+'</select></div>'+
    '<div class="fgroup"><label>Sec</label><select id="cs'+n+'">'+optRange(0,59,0)+'</select></div>'+
   '</div>'+
   '<div style="margin-top:14px;display:flex;gap:10px;align-items:center">'+
    '<button class="btn blue" onclick="saveSchedule('+n+')">SAVE SCHEDULE</button>'+
-   '<span class="feedback" style="margin:0" id="ffb'+n+'">fires daily at exec time, auto-closes at close time</span>'+
+   '<span class="feedback" style="margin:0" id="ffb'+n+'">'+tzHint()+'</span>'+
   '</div>';
  fillSymbols();
  $id('modalBg').classList.add('open')}
@@ -678,6 +694,7 @@ function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
 $id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
 async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
  try{const j=await post('/api/schedule',{account:+n,pair:$id('sp'+n).value,
+  side:$id('sdf'+n).value,
   lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
   exec:[+$id('eh'+n).value,+$id('em'+n).value,+$id('es'+n).value],
   close:[+$id('ch'+n).value,+$id('cm'+n).value,+$id('cs'+n).value]});
@@ -708,8 +725,8 @@ function schedTable(n){const a=(P.accounts||{})[n]||{};
  const ss=(a.schedules||[]);if(!ss.length){
   $id('sched'+n).innerHTML='<div class="empty">nothing scheduled</div>';return}
  $id('sched'+n).innerHTML='<table><tr><th>#</th><th>pair</th><th>side</th>'+
-  '<th class="num">lot</th><th class="num">x</th><th>exec at</th><th>close at</th>'+
-  '<th>next fire</th><th></th></tr>'+
+  '<th class="num">lot</th><th class="num">x</th><th>exec at (UTC)</th>'+
+  '<th>close at (UTC)</th><th>next fire (UTC)</th><th></th></tr>'+
   ss.map(s=>'<tr><td class="mut">'+s.id+'</td><td class="mono">'+esc(s.pair)+'</td>'+
    '<td><span class="side '+esc(s.side)+'">'+esc(s.side)+'</span></td>'+
    '<td class="num">'+fmt(s.lot,2)+'</td><td class="num">'+s.n_positions+'</td>'+

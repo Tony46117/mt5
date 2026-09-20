@@ -10,7 +10,7 @@ bridge:
 
 LOGIN FLOW (no acc.env, NO PROMPT anymore):
   * bridge.py boots BOTH TERMINALS CONCURRENTLY straight into the stored
-    session (session.json, obfuscated) - the two HFT demo accounts are
+    session (session.json, obfuscated) - the two stored accounts are
     logged in automatically via the start configs, ALGO ON, EA attached;
   * LOGGING INTO ANY ACCOUNT ON ANY TERMINAL (MT5 UI) IS INCORPORATED
     INTO THE WHOLE SOFTWARE: the supervisor sees the EA's identity change
@@ -50,20 +50,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 import datetime as dt
 import threading
 
-import config
 from config import CONFIG, setup_logging
 
 from spot import (
     BOLD, DIM, RESET, GREEN, RED, YELLOW,
     TERMINALS, MT5_DIR2, read_accounts, read_header, scan_terminals,
     term_running, launch_terminal, restart_terminal, stop_terminal,
-    setup_terminal2, install_script, feed_age, compiled_paths, scrub_start_cfg,
+    setup_terminal2, install_script, feed_age, scrub_start_cfg,
     ensure_autotrading,
 )
 import session
@@ -248,8 +246,16 @@ def header_for(inst: int) -> dict:
 
 
 class TermState:
-    __slots__ = ('inst', 'running', 'age_bucket', 'login', 'last_start',
-                 'last_heal', 'last_check', 'ever_session')
+    __slots__ = (
+        'age_bucket',
+        'ever_session',
+        'inst',
+        'last_check',
+        'last_heal',
+        'last_start',
+        'login',
+        'running',
+    )
 
     def __init__(self, inst: int):
         self.inst = inst

@@ -27,7 +27,6 @@ import sys
 import time
 import datetime as dt
 
-import config
 from config import CONFIG, setup_logging
 
 from spot import read_spots, candles, feed_age, BOLD, DIM, RESET, BLUE, RED, YELLOW, CYAN

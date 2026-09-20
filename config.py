@@ -1,11 +1,9 @@
 #!/usr/bin/env python3.12
-"""config.py - centralized configuration for the MT5 trading system.
+"""config.py - every tunable of the MT5 trading system in one place.
 
-IMPROVEMENTS:
-- Environment variable validation with defaults
-- Type-safe dataclass config
-- Runtime validation of critical paths
-- Better logging configuration with colors
+Each setting is a module constant with an MT5_* environment override, and
+CONFIG is a frozen dataclass mirror of them for typed access.  Run this
+module directly to validate paths and print the effective settings.
 """
 
 from __future__ import annotations
@@ -15,7 +13,6 @@ import sys
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Callable
 
 # --------------------------------------------------------------------------
 # Paths
@@ -76,24 +73,6 @@ MAX_CLOSED_TRADES = int(os.getenv("MT5_MAX_CLOSED_TRADES", "2000"))
 MAX_EQUITY_SAMPLES = int(os.getenv("MT5_MAX_EQUITY_SAMPLES", "4320"))
 
 # --------------------------------------------------------------------------
-# HFT bot
-# --------------------------------------------------------------------------
-HFT_INTERVAL_SECONDS = float(os.getenv("MT5_HFT_INTERVAL", "5.0"))
-HFT_ENTRY_COOLDOWN = float(os.getenv("MT5_HFT_COOLDOWN", "15.0"))
-HFT_RSI_PERIOD = int(os.getenv("MT5_HFT_RSI", "14"))
-HFT_MACD_FAST = int(os.getenv("MT5_HFT_MACD_FAST", "12"))
-HFT_MACD_SLOW = int(os.getenv("MT5_HFT_MACD_SLOW", "26"))
-HFT_MACD_SIGNAL = int(os.getenv("MT5_HFT_MACD_SIGNAL", "9"))
-HFT_TP_USD = float(os.getenv("MT5_HFT_TP", "2.0"))
-HFT_SL_USD = float(os.getenv("MT5_HFT_SL", "-6.0"))
-HFT_LOT_SIZE = float(os.getenv("MT5_HFT_LOT", "0.1"))
-HFT_CONFIDENCE = float(os.getenv("MT5_HFT_CONFIDENCE", "0.45"))
-HFT_MAGIC = int(os.getenv("MT5_HFT_MAGIC", "777900"))
-HFT_MIN_BARS = {"M1": 20, "M5": 15, "M15": 10, "M30": 10}
-HFT_ASSIGN = {1: "EURUSD", 2: "GBPUSD"}
-HFT_CORRELATION_GUARD = os.getenv("MT5_HFT_CORR_GUARD", "1") == "1"
-
-# --------------------------------------------------------------------------
 # Chart / display
 # --------------------------------------------------------------------------
 MS_CANDLE_SECONDS = int(os.getenv("MT5_MS_CANDLE", "15"))
@@ -152,21 +131,6 @@ class Config:
     max_closed_trades: int = MAX_CLOSED_TRADES
     max_equity_samples: int = MAX_EQUITY_SAMPLES
 
-    hft_interval: float = HFT_INTERVAL_SECONDS
-    hft_entry_cooldown: float = HFT_ENTRY_COOLDOWN
-    hft_rsi_period: int = HFT_RSI_PERIOD
-    hft_macd_fast: int = HFT_MACD_FAST
-    hft_macd_slow: int = HFT_MACD_SLOW
-    hft_macd_signal: int = HFT_MACD_SIGNAL
-    hft_tp_usd: float = HFT_TP_USD
-    hft_sl_usd: float = HFT_SL_USD
-    hft_lot_size: float = HFT_LOT_SIZE
-    hft_confidence: float = HFT_CONFIDENCE
-    hft_magic: int = HFT_MAGIC
-    hft_min_bars: dict = field(default_factory=lambda: HFT_MIN_BARS.copy())
-    hft_assign: dict = field(default_factory=lambda: HFT_ASSIGN.copy())
-    hft_correlation_guard: bool = HFT_CORRELATION_GUARD
-
     ms_candle_seconds: int = MS_CANDLE_SECONDS
     ms_max_bars: int = MS_MAX_BARS
     ms_window: int = MS_WINDOW
@@ -193,8 +157,6 @@ def validate_config() -> list[str]:
         errors.append(f"No MT5 installation found at {CONFIG.mt5_dir} or {CONFIG.mt5_dir2}")
     if CONFIG.web_port < 1 or CONFIG.web_port > 65535:
         errors.append(f"Invalid web port: {CONFIG.web_port}")
-    if CONFIG.hft_lot_size <= 0 or CONFIG.hft_lot_size > 10:
-        errors.append(f"Suspicious HFT lot size: {CONFIG.hft_lot_size}")
     return errors
 
 
@@ -253,4 +215,4 @@ if __name__ == "__main__":
     print(f"  MT5_DIR:    {CONFIG.mt5_dir}")
     print(f"  DB:         {CONFIG.db_path}")
     print(f"  Web:        {CONFIG.web_host}:{CONFIG.web_port}")
-    print(f"  HFT:        interval={CONFIG.hft_interval}s lot={CONFIG.hft_lot_size}")
+    print(f"  Exec:       timeout={CONFIG.exec_timeout_seconds}s")

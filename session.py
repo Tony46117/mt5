@@ -205,7 +205,7 @@ def is_logged_in() -> bool:
 
 def set_accounts(accounts: dict[int, dict[str, str]], persist: bool = True) -> None:
     """Programmatic login (used by --seed and tests)."""
-    global _MEM
+    global _MEM, _CACHE_STAT
     clean: dict[int, dict[str, str]] = {}
     for inst in (1, 2):
         a = accounts.get(inst) or {}

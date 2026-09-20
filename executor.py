@@ -39,8 +39,9 @@ import uuid
 import datetime as dt
 import os
 
-import config
 from config import CONFIG, setup_logging
+
+from pathlib import Path
 
 from spot import exec_in_path, exec_out_path, feed_age, BOLD, DIM, RESET, GREEN, RED
 import database as db
@@ -120,7 +121,7 @@ class SendCommand:
     This pointer protocol ensures no commands are lost or duplicated.
     """
 
-    __slots__ = ('inst', 'timeout', 'lock')
+    __slots__ = ('inst', 'lock', 'timeout')
 
     def __init__(self, inst: int, timeout: float = 3.0):
         self.inst = inst
@@ -396,8 +397,15 @@ class FutureTradeScheduler(threading.Thread):
     (the old 0.5 ms hot loop did 2000/s and starved the web app of the
     SQLite lock)."""
 
-    __slots__ = ('stop_flag', '_closes', '_closes_lock',
-                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts')
+    __slots__ = (
+        '_closes',
+        '_closes_lock',
+        '_heal_ts',
+        '_hz_ts',
+        '_hz_val',
+        '_janitor_ts',
+        'stop_flag',
+    )
 
     def __init__(self):
         super().__init__(daemon=True, name="future-trade-scheduler")
@@ -458,8 +466,7 @@ class FutureTradeScheduler(threading.Thread):
         now = dt.datetime.now(dt.timezone.utc)
         due: list[tuple[int, str]] = []
         with self._closes_lock:
-            for key, entry in list(self._closes.items()):
-                when = entry[0] if isinstance(entry, tuple) else entry
+            for key, (when, _pair) in list(self._closes.items()):
                 if now >= when:
                     acc_s, pair = key.split(":", 1)
                     due.append((int(acc_s), pair))
@@ -518,31 +525,15 @@ class FutureTradeScheduler(threading.Thread):
             nf = nf.replace(tzinfo=dt.timezone.utc)
         return nf
 
-    def _process_due(self, sch: dict) -> None:
-        """Claim one due schedule and fire it.  Safety rails:
+    def _claim(self, sch: dict) -> bool:
+        """Validate + atomically claim a due schedule.  True = caller fires it.
+
+        Safety rails:
         * not actually due (already claimed by another scheduler) -> skip;
         * missed by more than MAX_FIRE_LATE (app was down / EA dead) ->
           reschedule, never burst-fire stale orders;
         * claim via database.claim_schedule (atomic CAS on next_fire) so
           two app instances can never double-fire the same slot."""
-        nf = self._fire_dt(sch)
-        now = dt.datetime.now(dt.timezone.utc)
-        if nf is None:
-            log.warning(f"schedule #{sch['id']} has unparsable next_fire "
-                        f"{sch.get('next_fire')!r} - skipped (delete + recreate it)")
-            return
-        if nf > now:
-            return                     # someone else already claimed it
-        late = (now - nf).total_seconds()
-        if late > MAX_FIRE_LATE:
-            log.warning(f"schedule #{sch['id']} missed its slot by {late:.0f}s "
-                        f"> {MAX_FIRE_LATE:.0f}s - rescheduled, NOT fired late")
-            db.reschedule(sch["id"])
-            return
-    def _claim(self, sch: dict) -> bool:
-        """Validate + atomically claim a due schedule.  True = caller fires it.
-        (Split out of _process_due so the run loop can claim EVERYTHING first
-        and then fire all claimed schedules concurrently.)"""
         nf = self._fire_dt(sch)
         now = dt.datetime.now(dt.timezone.utc)
         if nf is None:

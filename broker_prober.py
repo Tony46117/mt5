@@ -32,10 +32,8 @@ import argparse
 import threading
 import time
 
-import config
-from config import CONFIG, setup_logging
-from spot import read_accounts, BOLD, DIM, RESET, GREEN, RED, YELLOW
-import session
+from config import setup_logging
+from spot import read_accounts, BOLD, DIM, RESET, GREEN, RED
 
 log = setup_logging(__name__)
 
