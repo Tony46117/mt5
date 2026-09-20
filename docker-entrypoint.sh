@@ -18,6 +18,9 @@ DATA=/data
 PREFIX="$DATA/prefix"
 LOG=/dev/null
 export WINEPREFIX="$PREFIX" WINEDEBUG=-all DISPLAY="${DISPLAY:-:99}"
+# do not let the terminals self-update on boot - that opens a GUI dialog on
+# Xvfb and stalls the boot; MT5 is pinned to the version baked at build time
+export MT5_UPDATE_SKIP=1
 
 b="\033[1m"; g="\033[92m"; y="\033[93m"; r="\033[91m"; n="\033[0m"
 step() { echo -e "${b}==> ${n}$*"; }
@@ -34,6 +37,7 @@ fi
 # --------------------------------------------------------------------------
 detect_os_env() {
   local os_env="docker"
+  [ -e /run/.containerenv ] && os_env="podman"          # podman/shutdown marker
   if grep -qiE 'microsoft|WSL' /proc/version 2>/dev/null; then
     os_env="wsl2"
   elif [ -e /run/secrets/kubernetes.io ] || [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
@@ -81,11 +85,23 @@ init_data() {
     ok "acc.env found in ./data - will auto-seed the session"
   fi
   if [ ! -f "$PREFIX/system.reg" ]; then
-    step "first boot: initialising wineprefix (one-time, ~1 min)"
-    wineboot -i >/dev/null 2>&1 || wineboot >/dev/null 2>&1
-    wineserver -w 2>/dev/null || true
-    [ -f "$PREFIX/system.reg" ] && ok "wineprefix initialised at $PREFIX" \
-      || warn "wineprefix not fully ready - it will heal on next start"
+    if command -v wineboot >/dev/null 2>&1; then
+      step "first boot: initialising wineprefix (one-time, ~1 min)"
+      timeout 200 wineboot -i >/dev/null 2>&1 || timeout 60 wineboot >/dev/null 2>&1 || true
+      timeout 60 wineserver -w 2>/dev/null || true
+      [ -f "$PREFIX/system.reg" ] && ok "wineprefix initialised at $PREFIX" \
+        || warn "wineprefix not fully ready - it will heal on next start"
+    elif [ -d /mt5/prefix/drive_c ]; then
+      # podman/CentOS-family roots: no unprivileged userns -> wineboot cannot
+      # run inside the container.  Fall back to the prefix baked at build time.
+      step "first boot: wineboot unavailable (no userns) - using build-time prefix"
+      # tar, not cp -a: files must end up owned by the RUNNING user, and the
+      # baked prefix's wineserver socket (root 0700) must be skipped
+      (cd /mt5/prefix && tar cf - --exclude=./wineserver .) | tar xf - -C "$PREFIX/"
+      ok "wineprefix restored from image"
+    else
+      warn "no wineboot and no baked prefix - terminals cannot start"
+    fi
   fi
 
   # Terminal 1 = real install dir inside the prefix; Terminal 2 = copy.
@@ -95,12 +111,45 @@ init_data() {
   if [ ! -f "$mt1/terminal64.exe" ]; then
     step "first boot: seeding MetaTrader 5 from image"
     mkdir -p "$(dirname "$mt1")"
-    cp -a /mt5/master/. "$mt1/"
-    ok "seeded terminal 1 at $mt1"
+    (cd /mt5/master && tar cf - . 2>/dev/null) | tar xf - -C "$mt1/" 2>/dev/null || true
+  fi
+  if [ ! -f "$mt1/terminal64.exe" ]; then
+    # host-provided fallback: drop a copy of a working MetaTrader 5 program
+    # dir at ./data/mt5-master on the host (Windows users can copy theirs
+    # from C:\Program Files\MetaTrader 5) - fastest way to a running stack
+    if [ -d "$DATA/seed/mt5-master" ] && [ -f "$DATA/seed/mt5-master/terminal64.exe" ]; then
+      step "seeding MetaTrader 5 from host-provided ./data/mt5-master"
+      cp -a "$DATA/seed/mt5-master/." "$mt1/"
+    fi
+  fi
+  if [ ! -f "$mt1/terminal64.exe" ]; then
+    step "MT5 not in image - downloading + extracting at runtime (6 min cap)"
+    curl -fL --retry 3 --retry-all-errors -o "$DATA/mt5setup.exe" \
+      https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe \
+      && { 7z x -y -o"$mt1" "$DATA/mt5setup.exe" >/dev/null 2>&1 || true; }
+    if [ ! -f "$mt1/terminal64.exe" ] && command -v wine64 >/dev/null 2>&1; then
+      # stub installer: run its silent /auto mode (wine downloads the real
+      # payload itself; capped so a slow link cannot stall the boot forever)
+      timeout "${MT5_RUNTIME_INSTALL_CAP:-300}" xvfb-run -a \
+        wine64 "$DATA/mt5setup.exe" /auto >/dev/null 2>&1 || true
+      timeout 60 wineserver -w 2>/dev/null || true
+    fi
+    rm -f "$DATA/mt5setup.exe"
+  fi
+  if [ -f "$mt1/terminal64.exe" ]; then
+    # pin the version: a first-launch self-update opens a GUI dialog on the
+    # virtual display and stalls the boot forever
+    touch "$mt1/.update"
+    ok "terminal 1 ready at $mt1"
+  else
+    warn "terminal 1 has no terminal64.exe - bridge will report it unhealthy"
   fi
   if [ ! -f "$mt2/terminal64.exe" ] && [ -f "$mt1/terminal64.exe" ]; then
     step "first boot: creating terminal 2 (copy of terminal 1)"
-    cp -a "$mt1" "$mt2" 2>/dev/null || warn "terminal 2 copy failed - re-run later"
+    mkdir -p "$mt2"
+    (cd "$mt1" && tar cf - .) | tar xf - -C "$mt2/" 2>/dev/null \
+      || warn "terminal 2 copy failed - re-run later"
+    touch "$mt2/.update" 2>/dev/null
   fi
 
   # Pre-compiled EA from the build stage; spot.install_script recompiles
@@ -148,6 +197,10 @@ run_app()    { python3 -u /app/app.py --production >>"$DATA/logs/app.log" 2>&1 &
 run_bridge() { python3 -u /app/bridge.py        >>"$DATA/logs/bridge.log" 2>&1 & PIDS+=($!); }
 
 main() {
+  case "${1:-all}" in
+    bash|sh) exec bash ;;           # one-off shell: skip the whole init
+    *) ;;
+  esac
   detect_os_env
   start_display
   init_data
@@ -157,7 +210,6 @@ main() {
     app)    run_app ;;
     bridge) run_bridge ;;
     all)    run_app; sleep 2; run_bridge ;;
-    bash|sh) exec bash ;;
     *) exec "$@" ;;
   esac
   echo -e "${b}web panel: http://localhost:8000  (logs in /data/logs)${n}"

@@ -93,6 +93,24 @@ folder run `bash run.sh` in Git Bash / WSL - it detects the OS and hands
 everything to the container stack. All the Wine/MT5 logic stays in Linux
 containers, so the stack behaves identically to a native Linux box.
 
+**Podman (preferred on Fedora/RHEL Linux):** no changes needed - `run.sh`
+prefers podman when wine is absent, and rootless podman works out of the box
+(`podman run` flags used: `--ipc=host` for wine's esync, `:Z` for SELinux).
+Compose users can add the override file:
+
+```bash
+podman build -t mt5-bridge:latest .
+podman run -d --name mt5-bridge -p 8000:8000 --ipc=host \
+  -v mt5-data:/data:Z -v "$PWD/data:/data/seed:ro,Z" \
+  -e MT5_MACHINE_KEY=change-me localhost/mt5-bridge:latest all
+```
+
+On hosts without unprivileged user namespaces (CentOS/RHEL defaults) the
+container skips `wineboot` and reuses the wineprefix baked into the image.
+If MetaTrader 5 cannot be fetched at runtime (slow/quota-limited links), copy
+a working install to `./data/mt5-master/` (must contain `terminal64.exe`) and
+it is seeded on next boot.
+
 **Accounts:** put your `acc.env` at `./data/acc.env` on the host - the
 container copies it in and seeds the obfuscated session on first boot. Set
 `MT5_MACHINE_KEY` in the environment (any long random string) so the

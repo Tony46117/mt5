@@ -343,18 +343,23 @@ _FEED_AGE_CACHE: dict[int, tuple[float, float]] = {}  # inst -> (ts, age)
 # --------------------------------------------------------------------------
 
 def wine_bin() -> str:
-    if os.path.exists("/usr/bin/wine"):
-        return "/usr/bin/wine"
-    if os.path.exists("/usr/bin/wine64"):
-        return "/usr/bin/wine64"
+    # distro layouts differ: Fedora ships /usr/bin/wine64, Debian trixie
+    # keeps the loader at /usr/lib/wine/wine64 with NO /usr/bin/wine* unless
+    # the (ia32-dependent) `wine` metapackage is installed
+    for cand in ("/usr/bin/wine", "/usr/bin/wine64",
+                 shutil.which("wine"), shutil.which("wine64"),
+                 "/usr/lib/wine/wine64"):
+        if cand and os.path.exists(cand):
+            return cand
     return "wine"
 
 
 def wineserver_bin() -> str:
     """Host wineserver binary (NOT a Windows exe - never run via wine)."""
-    ws = shutil.which("wineserver")
-    if ws:
-        return ws
+    for ws in (shutil.which("wineserver"), "/usr/lib/wine/wineserver",
+               "/usr/bin/wineserver"):
+        if ws and os.path.exists(ws):
+            return ws
     return "/usr/bin/wineserver"
 
 

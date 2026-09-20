@@ -14,23 +14,45 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 # ---------------------------------------------------------------------------
-# OS AUTO-DETECT: on Windows (or anywhere Docker exists but this is not a
-# Linux box) hand off to the container stack.  `bash run.sh` then means the
-# same thing on every OS: start web panel + bridge + both MT5 terminals.
+# OS AUTO-DETECT: `bash run.sh` means the same thing on every OS - start web
+# panel + bridge + both MT5 terminals.  Non-Linux (Windows/macOS) and Linux
+# boxes without wine both go through a container runtime:
+#   * podman  - preferred on Linux (rootless, daemonless, SELinux-native)
+#   * docker  - fallback everywhere else (Docker Desktop on Windows/macOS)
 # ---------------------------------------------------------------------------
 OS_UNAME="$(uname -s 2>/dev/null || echo Windows)"
+RT=""
 if [ "$OS_UNAME" != "Linux" ] && [ "$OS_UNAME" != "Darwin" ]; then
-  echo "detected OS: $OS_UNAME - using the Docker stack (wine/MT5 run in a Linux container)."
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "ERROR: Docker Desktop is required on $OS_UNAME - install it from https://www.docker.com/products/docker-desktop"
-    exit 1
+  echo "detected OS: $OS_UNAME - the wine/MT5 stack runs in a Linux container."
+  command -v docker >/dev/null 2>&1 && RT=docker
+  [ -z "$RT" ] && command -v podman >/dev/null 2>&1 && RT=podman
+  [ -z "$RT" ] && echo "ERROR: Docker Desktop (or Podman in WSL) is required on $OS_UNAME - https://www.docker.com/products/docker-desktop" && exit 1
+else
+  # native Linux: no wine installed -> containers are the only way to run.
+  # If BOTH runtimes exist, prefer podman (rootless, no daemon holding the
+  # trading stack); MT5_RUN_ENGINE=docker overrides the pick explicitly.
+  if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1 \
+     && [ "${MT5_RUN_ENGINE:-}" != native ]; then
+    if [ -n "${MT5_RUN_ENGINE:-}" ]; then RT="$MT5_RUN_ENGINE"
+    elif command -v podman >/dev/null 2>&1; then RT=podman
+    elif command -v docker >/dev/null 2>&1; then RT=docker
+    fi
+    [ -n "$RT" ] && echo "wine not found - using the $RT container stack."
   fi
-  docker compose version >/dev/null 2>&1 \
-    && exec docker compose up --build \
-    || exec docker build -t mt5-bridge:latest . && exec docker run --rm -it -p 8000:8000 \
-         -v mt5-data:/data -v "$(pwd)/data:/data/seed:ro" \
-         -e MT5_MACHINE_KEY="${MT5_MACHINE_KEY:-please-change-me}" \
-         mt5-bridge:latest all
+fi
+
+if [ -n "$RT" ]; then
+  COMPOSE_FILE=docker-compose.yml
+  if $RT compose version >/dev/null 2>&1; then
+    echo "starting via $RT compose (web panel :8000)..."
+    exec $RT compose -f "$COMPOSE_FILE" up --build
+  fi
+  echo "building image with $RT..."
+  $RT build -t mt5-bridge:latest . || exit 1
+  exec $RT run --rm -it -p 8000:8000 \
+    -v mt5-data:/data -v "$(pwd)/data:/data/seed:ro" \
+    -e MT5_MACHINE_KEY="${MT5_MACHINE_KEY:-please-change-me}" \
+    mt5-bridge:latest all
 fi
 
 PY="$HOME/python312/bin/python"
