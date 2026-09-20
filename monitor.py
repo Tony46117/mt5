@@ -32,12 +32,10 @@ import threading
 import time
 import datetime as dt
 
-import config
-from config import CONFIG, setup_logging
+from config import setup_logging
 
 from spot import (
-    BOLD, DIM, RESET, GREEN, RED, YELLOW,
-    read_accounts, pick_terminal, read_header, scan_terminals,
+    BOLD, DIM, RESET, GREEN, RED, read_accounts, pick_terminal, read_header, scan_terminals,
     ensure_terminal, restart_terminal, install_script, setup_terminal2,
     compiled_paths, wait_for_bridge, term_running, feed_age, WINEPREFIX, MT5_DIR2,
 )
@@ -154,7 +152,7 @@ class Monitor:
         else:
             lines.append(f"{RED}[!] no terminal reports "
                          f"login {expected} yet.{RESET}")
-            lines.append(f"    (EA header is pre-v1.20 or terminal2 is not set up)")
+            lines.append("    (EA header is pre-v1.20 or terminal2 is not set up)")
         lines.append("")
         lines.append(f"{BOLD}visible terminals:{RESET}")
         terms = scan_terminals()

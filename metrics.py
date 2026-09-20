@@ -23,7 +23,6 @@ import threading
 import time
 import datetime as dt
 
-import config
 from config import CONFIG, setup_logging
 
 from spot import (read_accounts, read_header, pick_terminal, BOLD, DIM,

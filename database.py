@@ -28,7 +28,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import config
 from config import CONFIG, setup_logging
 
 log = setup_logging(__name__)
@@ -98,28 +97,49 @@ def _pg_conn():
         p.putconn(conn)
 
 
+_sqlite_conn_obj: sqlite3.Connection | None = None
+
+
 @contextmanager
 def _sqlite_conn():
-    """Get a SQLite connection - optimized for speed."""
+    """ONE autocommit connection, reused, serialised by _sqlite_lock.
+
+    Every call used to open a fresh connection and re-issue eight pragmas.
+    Three of those (journal_mode, page_size, auto_vacuum) persist in the
+    file header and were no-ops after the first run; the rest cost a round
+    trip each.  More importantly the connect() itself dominated, and the
+    scheduler re-lists due schedules up to 200x/s in the two seconds before
+    a fire WHILE HOLDING THIS LOCK - so the setup cost sat on the web app's
+    critical path as well.
+
+    Reusing one connection is safe here: the lock already serialises every
+    caller, and isolation_level=None means each statement is its own
+    transaction, so no reader ever pins a WAL snapshot.
+    """
+    global _sqlite_conn_obj
     with _sqlite_lock:
-        conn = sqlite3.connect(_sqlite_path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        # Performance pragmas
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-32768")       # 32MB cache
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA mmap_size=268435456")    # 256MB mmap
-        conn.execute("PRAGMA page_size=4096")
-        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        conn = _sqlite_conn_obj
+        if conn is None:
+            conn = sqlite3.connect(_sqlite_path, timeout=10,
+                                   isolation_level=None,
+                                   check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32768")     # 32 MB
+            _sqlite_conn_obj = conn
         try:
             yield conn
         except Exception:
-            conn.rollback()
+            # autocommit: only an explicitly opened transaction can be
+            # pending, but never leave one behind on a shared connection.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             raise
-        finally:
-            conn.close()
 
 
 @contextmanager

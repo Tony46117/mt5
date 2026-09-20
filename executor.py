@@ -39,8 +39,9 @@ import uuid
 import datetime as dt
 import os
 
-import config
 from config import CONFIG, setup_logging
+
+from pathlib import Path
 
 from spot import exec_in_path, exec_out_path, feed_age, BOLD, DIM, RESET, GREEN, RED
 import database as db
@@ -132,7 +133,7 @@ class SendCommand:
     This pointer protocol ensures no commands are lost or duplicated.
     """
 
-    __slots__ = ('inst', 'timeout', 'lock')
+    __slots__ = ('inst', 'lock', 'timeout')
 
     def __init__(self, inst: int, timeout: float = 3.0):
         self.inst = inst
@@ -494,8 +495,7 @@ class FutureTradeScheduler(threading.Thread):
         now = dt.datetime.now(dt.timezone.utc)
         due: list[tuple[int, str]] = []
         with self._closes_lock:
-            for key, entry in list(self._closes.items()):
-                when = entry[0] if isinstance(entry, tuple) else entry
+            for key, (when, _pair) in list(self._closes.items()):
                 if now >= when:
                     acc_s, pair = key.split(":", 1)
                     due.append((int(acc_s), pair))

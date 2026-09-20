@@ -26,9 +26,12 @@ One command starts everything; Ctrl+C stops everything.
   open-then-close lifetimes.
 - Web trading panel on port 8000: buy/sell buttons execute directly
   through the exec channel with no database work on the hot path.
-- Antidetect hygiene: start-config login blocks are scrubbed after
-  every boot consumed them, launch jitter de-syncs the two terminals'
-  logins, the session file is obfuscated with 0600 permissions.
+- Credential hygiene: start-config login blocks are written 0600 and
+  scrubbed once the boot has consumed them, and the session file is
+  obfuscated with 0600 permissions. Terminal launches carry a small
+  random jitter so the two logins are not machine-simultaneous. (This is
+  housekeeping, not anonymity - MT5 itself stores the account in its own
+  config, and your broker sees both logins regardless.)
 
 ## Architecture
 
@@ -47,6 +50,10 @@ One command starts everything; Ctrl+C stops everything.
 | `metrics.py`    | Closed-trade and equity observation. |
 | `run.sh`        | One-command launcher for the whole stack with full teardown on Ctrl+C. |
 | `install.sh`    | System bootstrap: packages, Wine prefix, MT5 install, venv, EA compilation. |
+| `front.py`      | Server-rendered HTML/CSS/JS for the dashboard and the trading panel. |
+| `info.py`       | One-shot account/spread report for the logged-in accounts. |
+| `ms.py`         | Standalone terminal candlestick chart (not used by the stack). |
+| `make_bridge_tpl.py` | Installs the `Bridge.tpl` chart template into both terminals (run by `install.sh`). |
 
 ## Requirements
 
@@ -108,12 +115,19 @@ Seed the stored session once (prompts per terminal, password input does
 not echo):
 
 ```bash
-python session.py --seed
+python session.py
 ```
 
-`acc.env` is supported as the credential source; `session.json` (obfuscated,
-0600) is what the bridge actually boots from. Credentials are never left
-in plaintext start configs while terminals run.
+`session.json` (obfuscated, 0600) is what the bridge actually boots from.
+`python session.py --status` shows who is stored, `--logout` forgets it.
+(`--seed` is a different thing: it imports credentials from a legacy
+`acc.env` and does nothing if you do not have one.)
+
+The obfuscation is XOR against a machine-derived key - it keeps passwords
+out of plaintext files and backups, it is **not** encryption against
+anyone with read access to your account. During boot the password is also
+written into the terminal's start config (0600) and scrubbed once the feed
+is live.
 
 ## Run
 
@@ -140,13 +154,18 @@ paths and file ownership stay consistent.
 
 - Web panel: `http://127.0.0.1:8000` - buy/sell buttons, schedules,
   account overview.
-- Scheduled trades are stored with an execution time and a close time;
-  the executor fires opens to the planned second (commands are queued
+- Scheduled trades are stored with an execution time and a close time.
+  **Those times are UTC**, not your local clock - the panel labels the
+  fields and shows your offset, and `/api/clock` reports both. The
+  executor fires opens to the planned second (commands are queued
   slightly ahead so fills land on the second), then closes them
   automatically. 24/7 symbols (anything with `247`, Boom/Crash, Deriv
   synthetics) fire on weekends without extra configuration; other
   symbols default to Monday-Friday and can be overridden with
   `MT5_TRADING_DAYS=0,1,2,3,4,5,6`.
+- Both BUY and SELL can be scheduled. Symbol names are passed through
+  case-sensitively, so brokers whose symbols are not upper-case
+  (`Boom 1000 Index`) work as typed.
 - CLI:
 
 ```bash
@@ -166,6 +185,25 @@ python monitor.py                                  # live dual-account book
 | `MT5_TRADING_DAYS` | `0,1,2,3,4` | Weekdays (0=Mon) schedules may fire on |
 | `MT5_NO_LAUNCH_JITTER` | unset | Set to `1` to disable anti-detect launch jitter |
 | `MT5_RUN_KEEP_TERMINALS` | unset | Set to `1` so `run.sh` Ctrl+C keeps terminals running |
+| `MT5_WARMUP` | `1` | Set to `0` to skip the real open+close trade fired on each terminal at startup |
+| `MT5_WARMUP_SYMBOL` | `XAUUSD247` | Symbol used for that warm-up trade |
+| `MT5_WARMUP_LOT` | `0.01` | Lot used for that warm-up trade |
+| `MT5_CORS_ORIGIN` | unset | Exact origin allowed to call the API cross-origin (see Security) |
+| `MT5_WEB_HOST` / `MT5_WEB_PORT` | `127.0.0.1` / `8000` | Web panel bind address |
+| `DATABASE_URL` | unset | PostgreSQL DSN; SQLite (`trades.db`) is used when unset |
+
+## Security
+
+The web panel has **no authentication**. Every `/api/trade`, `/api/close`
+and `/api/schedule` call moves real money, so:
+
+- keep it bound to `127.0.0.1` (the default) and do not port-forward it;
+- anyone with a shell on the machine can trade your accounts;
+- cross-origin requests are refused. Set `MT5_CORS_ORIGIN` to one exact
+  origin only if an external dashboard genuinely needs it - never `*`.
+
+Starting `app.py` also places and closes one real warm-up trade per
+terminal (see `MT5_WARMUP`).
 
 ## Troubleshooting
 

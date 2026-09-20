@@ -327,8 +327,8 @@ void OnTick()
 
 void OnTimer()
   {
-   ProcessExecIn();                 // FIRST - order pickup runs 500x/s for
-                                    // sub-5 ms command latency
+   ProcessExecIn();                 // FIRST - order pickup runs every tick
+                                    // for sub-5 ms command latency
    long now_min = (long)(TimeCurrent() / 60);
    if(now_min != g_last_rescan_min)  // rescan Market Watch each new minute
       RefreshSymbols();
@@ -838,8 +838,7 @@ void ExecuteLine(string line)
 
    if(cmd == "PROBE" && k >= 3)
      {
-      string sym = p[2];
-      StringToUpper(sym);
+      string sym = p[2];          // case-sensitive: do NOT uppercase
       if(!SymbolSelect(sym, true))
         {
          AppendOut(id, "ERR", "unknown symbol " + sym);
