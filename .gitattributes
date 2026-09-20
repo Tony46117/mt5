@@ -1,0 +1,7 @@
+# Force LF in the repo so Windows checkouts never corrupt the shell
+# scripts / Dockerfile with CRLF (bash inside containers chokes on \r).
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary
+*.exe binary

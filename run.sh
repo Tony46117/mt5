@@ -49,8 +49,16 @@ if [ -n "$RT" ]; then
   fi
   echo "building image with $RT..."
   $RT build -t mt5-bridge:latest . || exit 1
+  RUN_IPC=""; RUN_SELINUX=""
+  if [ "$RT" = podman ]; then
+    # wine's esync needs host IPC; :Z relabels the volume for SELinux hosts
+    RUN_IPC="--ipc=host"
+    RUN_SELINUX=":Z"
+  fi
   exec $RT run --rm -it -p 8000:8000 \
-    -v mt5-data:/data -v "$(pwd)/data:/data/seed:ro" \
+    $RUN_IPC \
+    -v "mt5-data:/data${RUN_SELINUX}" \
+    -v "$(pwd)/data:/data/seed:ro${RUN_SELINUX}" \
     -e MT5_MACHINE_KEY="${MT5_MACHINE_KEY:-please-change-me}" \
     mt5-bridge:latest all
 fi
