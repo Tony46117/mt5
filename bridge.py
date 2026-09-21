@@ -65,6 +65,7 @@ from spot import (
     ensure_autotrading, pick_terminal,
 )
 import session
+import accounts as known_accounts
 
 log = setup_logging(__name__)
 
@@ -536,8 +537,17 @@ class Supervisor:
                     a["login"] = login
                     if h.get("server"):
                         a["server"] = h["server"]
+                    known = known_accounts.get(login)
+                    if known:
+                        # a KNOWN account (used before): restore its real
+                        # credentials so auto-relogin keeps working
+                        a["password"] = known["password"]
+                        if known.get("server"):
+                            a["server"] = known["server"]
                     accs[inst] = a
                     session.set_accounts(accs, persist=True)
+                    known_accounts.remember(login, a.get("password", ""),
+                                            a.get("server", ""))
                     self.log(f"{YELLOW}terminal {inst} live in account {login} - "
                              f"session adopted (was unset), whole software follows{RESET}")
                     log.warning(f"terminal {inst}: adopted account {login} "
@@ -569,7 +579,15 @@ class Supervisor:
                             # if auto-relogin into this account is needed)
                             if h.get("server"):
                                 a["server"] = h["server"]
+                            known = known_accounts.get(login)
+                            if known:
+                                # KNOWN account: restore its real credentials
+                                a["password"] = known["password"]
+                                if known.get("server"):
+                                    a["server"] = known["server"]
                             session.set_accounts(accs, persist=True)
+                            known_accounts.remember(login, a.get("password", ""),
+                                                    a.get("server", ""))
                             self.log(f"{YELLOW}terminal {inst} switched to "
                                      f"account {login} - session adopted, "
                                      f"whole software follows{RESET}")
@@ -581,12 +599,16 @@ class Supervisor:
                             st.ever_session = False
                             self._fast_frame = True
                     elif (expected not in ("", "?")
+                          and known_accounts.has_credentials(expected)
                           and time.monotonic() - st.last_start > GRACE_S
                           and time.monotonic() - st.last_heal > COOLDOWN_S):
-                        # B) failed boot / external switch-in: reconnect.
-                        # NEVER for a credless slot (expected '?'): there is
-                        # nothing to reconnect INTO - restarting the terminal
-                        # would just loop logged-out boots forever.
+                        # B) external switch-in (session rewritten by another
+                        # process: web login form, --seed, PANEL SWITCH):
+                        # reconnect the terminal INTO the session account.
+                        # Only when the session account HAS stored
+                        # credentials - a passwordless slot can never be
+                        # reconnected into, and trying forever fought the
+                        # operator's own switch ("WRONG (want ...)" forever).
                         self.log(f"{YELLOW}terminal {inst} is in {login} - "
                                  f"reconnecting into session account "
                                  f"{expected}{RESET}")

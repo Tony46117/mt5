@@ -916,7 +916,6 @@ $id('modalBg').addEventListener('click',function(e){
     was lost - so they opened the modal and saved AGAIN (duplicate). */
  if(e.target===this&&!SCHED_SAVING)closeModal()});
 
-
 async function delSchedule(id){try{await post('/api/schedule/delete',{id});
   toast('schedule #'+id+' removed',true);refresh()}catch(e){toast(e.message,false)}}
 function posTable(n){const a=(P.accounts||{})[n]||{};const ps=a.positions||[];

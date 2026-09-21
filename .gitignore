@@ -13,3 +13,4 @@ __pycache__/
 *.pyc
 nohup.out
 data/
+known_accounts.json

@@ -907,6 +907,15 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     start config credentials."""
     scrub_common_ini_login(inst)        # REMOVE any saved credentials first
     repair_common_ini(inst)             # heal torn/corrupted ini BEFORE boot
+    if with_login and not read_accounts().get(inst, {}).get("password"):
+        # Session has NO password for this slot (the operator logged in
+        # through the TERMINAL UI - MT5 never exposes that password).
+        # Writing a login block with an empty password would only force a
+        # failed login on every boot; booting WITHOUT the login block lets
+        # MT5 reconnect its own wallet-remembered account instead.
+        log.info(f"terminal {inst}: no stored password - booting without "
+                 f"login block (MT5 wallet reconnects the UI account)")
+        with_login = False
     _write_start_cfg(inst, with_login=with_login)
     ensure_autotrading(inst)            # kill 10027 before the terminal boots
     scrub_terminal2_credentials()       # stale auto-login out of the copied common.ini
