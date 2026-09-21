@@ -498,6 +498,11 @@ class Supervisor:
                 st.header = h
                 st.header_ts = time.monotonic()
                 login = h.get("login", "")
+                # "0" is MT5's LOGGED-OUT marker, not an account - treating
+                # it as a login once poisoned the session with login="0"
+                # (and every later header parse with a bogus adoption).
+                if login == "0":
+                    login = ""
                 if login and login != st.login:
                     if st.login:
                         col = GREEN if login == expected else RED
