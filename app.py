@@ -454,6 +454,20 @@ def api_schedule():
     # whole future-trades feature) fail whenever the pair was dormant or a
     # terminal was still booting.  A bad pair is caught at fire time and
     # logged to the fired table instead.
+    # Symbol-tradability check from the broker prober's last probe: a
+    # symbol the broker reports as SYMBOL_TRADE_MODE_DISABLED (0) can NEVER
+    # be traded - scheduling it used to look fine and then die at fire time
+    # with retcode 10017 'Trade disabled' (observed: every FX pair
+    # trade_mode=0 on HFM demo while XAUUSD* is FULL).  Advisory only:
+    # unprobed symbols / offline terminals still pass through.
+    try:
+        _sym = broker_prober.get_prober().report()["terminals"].get(str(account), {}).get(pair)
+        if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
+            return _fail(f"{pair} is DISABLED for trading by the broker on "
+                         f"account {account} (trade_mode=0, retcode 10017) - "
+                         f"pick a tradeable symbol (e.g. XAUUSD)")
+    except Exception:
+        pass
     for h, m, s in ((eh, em, es), (ch, cm, cs)):
         if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
             return _fail("time out of range")
@@ -547,6 +561,18 @@ def api_schedule_update():
         return _fail("bad update fields")
     if not updates:
         return _fail("nothing to update")
+    # Advisory tradability check on a NEW pair (same rationale as POST
+    # /api/schedule; skipping when the pair is unchanged or unknown).
+    if "pair" in updates and updates["pair"] != cur["pair"]:
+        try:
+            _sym = broker_prober.get_prober().report()["terminals"] \
+                .get(str(cur["account"]), {}).get(updates["pair"])
+            if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
+                return _fail(f"{updates['pair']} is DISABLED for trading by "
+                             f"the broker on account {cur['account']} "
+                             f"(trade_mode=0, retcode 10017)")
+        except Exception:
+            pass
     if not db.update_schedule(sid, **updates):
         return _fail("update failed")
     sch = db.get_schedule(sid)

@@ -78,6 +78,27 @@ RETRY_MAX = 3
 # no-quotes (10020/10021), and 'not responding' timeouts handled elsewhere.
 HARD_REJECT_MARKERS = ("10017", "10018", "10019", "10027",
                        "unknown symbol", "invalid volume", "bad volume")
+# Plain-language hints for broker retcodes, appended to fired-log rows so
+# the panel explains WHY an order died instead of a bare 'retcode 10017'.
+RETCODE_HINTS = {
+    "10004": "requote", "10006": "rejected by broker", "10013": "invalid request",
+    "10014": "invalid volume", "10015": "invalid price", "10016": "invalid stops",
+    "10017": "trade disabled by broker (symbol/account)",
+    "10018": "market closed", "10019": "not enough money",
+    "10020": "price changed", "10021": "no quotes",
+    "10026": "autotrading disabled by SERVER", "10027": "autotrading disabled by TERMINAL",
+    "10028": "position locked", "10030": "unsupported filling mode",
+    "10031": "no connection to broker",
+}
+
+
+def _explain(detail: str) -> str:
+    """'retcode 10017' -> 'retcode 10017 - trade disabled by broker
+    (symbol/account)' (only when a hint exists and isn't already there)."""
+    for code, hint in RETCODE_HINTS.items():
+        if code in detail and hint not in detail:
+            return f"{detail} - {hint}"
+    return detail
 # 24/7 instruments (Deriv synthetics, HFM's XAUUSD247, ...) trade on
 # weekends too - the Mon-Fri guard must never eat their schedules.
 ALWAYS_ON_MARKERS = ("247", "BOOM", "CRASH", "JUMP", "RANGE BREAK", "STEP INDEX",
@@ -693,7 +714,7 @@ class FutureTradeScheduler(threading.Thread):
         for ok, detail in results:
             ticket = detail.split("|")[1] if ok and "|" in detail else ""
             db.log_fired(sch["id"], acc, pair, side, lot, "open",
-                         ticket, ok, detail, ms=fire_ms)
+                         ticket, ok, _explain(detail), ms=fire_ms)
             if ok:
                 _count_open()
             elif "10027" in detail:
@@ -725,7 +746,7 @@ class FutureTradeScheduler(threading.Thread):
                 results[i] = (ok, detail)
                 ticket = detail.split("|")[1] if ok and "|" in detail else ""
                 db.log_fired(sch["id"], acc, pair, side, lot, "open", ticket,
-                             ok, f"retry{attempt}: {detail}",
+                             ok, f"retry{attempt}: {_explain(detail)}",
                              ms=(time.perf_counter() - t0) * 1000.0)
                 if ok:
                     _count_open()
