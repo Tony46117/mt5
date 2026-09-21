@@ -659,7 +659,15 @@ def scrub_terminal2_credentials() -> None:
 
     If terminal2's start config ever fails to load, without this scrub it
     would silently fall back to logging into account1 (copied settings).
-    ATOMIC write - this file used to be torn by concurrent boot threads."""
+    ATOMIC write - this file used to be torn by concurrent boot threads.
+
+    SKIPPED when slot 2 is TERMINAL-MANAGED (login but no stored password):
+    the wallet lines in common.ini ARE that account's reconnect path, and
+    wiping them would leave terminal 2 booting logged-out forever."""
+    slot2 = read_accounts().get(2, {})
+    if slot2.get("login") and not slot2.get("password"):
+        log.debug("terminal 2: wallet-managed login - keeping saved credentials")
+        return
     ini = MT5_DIR2 / "Config" / "common.ini"
     if not ini.exists():
         return
