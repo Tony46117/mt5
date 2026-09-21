@@ -905,17 +905,25 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     CRITICAL: scrubs any saved login from common.ini BEFORE launch so the
     terminal CANNOT fall back to a previous account - it MUST use the
     start config credentials."""
-    scrub_common_ini_login(inst)        # REMOVE any saved credentials first
-    repair_common_ini(inst)             # heal torn/corrupted ini BEFORE boot
-    if with_login and not read_accounts().get(inst, {}).get("password"):
-        # Session has NO password for this slot (the operator logged in
-        # through the TERMINAL UI - MT5 never exposes that password).
-        # Writing a login block with an empty password would only force a
-        # failed login on every boot; booting WITHOUT the login block lets
-        # MT5 reconnect its own wallet-remembered account instead.
+    # TERMINAL-MANAGED LOGINS: a session slot WITHOUT a password means the
+    # operator logged in through the TERMINAL UI (MT5 never exposes that
+    # password to us).  Such a slot boots WITHOUT our login block and the
+    # terminal's own remembered-credentials wallet reconnects the UI
+    # account - so the scrub must be SKIPPED for it (scrubbing would erase
+    # the wallet and the account could never come back on its own).
+    # Slots WITH a password (known book / bridge prompt) keep the antidetect
+    # scrub: our start-config login block is authoritative for them.
+    slot = read_accounts().get(inst, {})
+    wallet_reconnect = bool(with_login and slot.get("login")
+                            and not slot.get("password"))
+    if wallet_reconnect:
         log.info(f"terminal {inst}: no stored password - booting without "
-                 f"login block (MT5 wallet reconnects the UI account)")
+                 f"login block (terminal wallet reconnects account "
+                 f"{slot.get('login')})")
         with_login = False
+    if not wallet_reconnect:
+        scrub_common_ini_login(inst)    # REMOVE any saved credentials first
+    repair_common_ini(inst)             # heal torn/corrupted ini BEFORE boot
     _write_start_cfg(inst, with_login=with_login)
     ensure_autotrading(inst)            # kill 10027 before the terminal boots
     scrub_terminal2_credentials()       # stale auto-login out of the copied common.ini
