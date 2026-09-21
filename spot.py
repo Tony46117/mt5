@@ -279,8 +279,17 @@ def pick_terminal(login: str) -> dict | None:
     terminal.  Only the legacy no-login lookup keeps the any-terminal
     fallback."""
     terms = scan_terminals()
-    for t in terms:
-        if t["header"].get("login") == login:
+    # Prefer the FRESHEST proving root: stale install copies (e.g. a
+    # '-broken-*' backup folder) can carry the same login in a days-old
+    # header - matching them first served days-old balances to the web
+    # panel while the live terminal's data sat in a fresher root.
+    # Proof also requires a REASONABLY FRESH file: a login proven only by
+    # a days-old feed is not live identity (the terminal moved on) - it
+    # falls through to the session-order hint or None.
+    now = time.time()
+    for t in sorted(terms, key=lambda t: t["mtime"], reverse=True):
+        if (t["header"].get("login") == login
+                and now - t["mtime"] < HEADER_PROOF_MAX_AGE_S):
             return t
     if login:
         for inst in (1, 2):
@@ -352,6 +361,12 @@ def feed_age(inst: int = 1) -> float:
 
 
 _FEED_AGE_CACHE: dict[int, tuple[float, float]] = {}  # inst -> (ts, age)
+
+# A trades.csv header older than this does not PROVE a login (the EA
+# rewrites the file every 50 ms while a terminal is alive; a matching
+# days-old header belongs to a dead/copy root - e.g. '-broken-*' archive
+# folders - and must never be treated as the live identity).
+HEADER_PROOF_MAX_AGE_S = 10.0
 
 
 # --------------------------------------------------------------------------
@@ -480,20 +495,29 @@ def sanitize_charts(inst: int = 1) -> None:
     the config chart on top of everything the last exit had saved).  Pruning
     at launch makes 'one chart, nothing else' the permanent boot state.
     """
-    charts_root = TERMINALS[inst]["dir"] / "Profiles" / "Charts"
-    try:
-        if not charts_root.exists():
-            charts_root.mkdir(parents=True, exist_ok=True)
-        for prof in charts_root.iterdir():
-            if not prof.is_dir():
-                continue
-            for old in prof.glob("chart*.chr"):
-                try:
-                    old.unlink()
-                except OSError:
-                    pass
-    except OSError as exc:
-        log.debug(f"terminal {inst}: chart sanitize skipped: {exc}")
+    # MT5 portable keeps profiles under BOTH layouts depending on build:
+    # <install>/Profiles/Charts (legacy) and <install>/MQL5/Profiles/Charts
+    # (current).  Pruning only the legacy path let the MQL5 one grow
+    # unchecked (117+ chart files) until the terminal hit 'open charts
+    # limit reached' and could no longer open the chart the EA
+    # auto-attaches to (journal: "open chart 'EURUSD' failed for
+    # 'SpotDump.ex5'" on every boot -> terminal 2 boot-looped, no feed).
+    charts_roots = [TERMINALS[inst]["dir"] / "Profiles" / "Charts",
+                    TERMINALS[inst]["dir"] / "MQL5" / "Profiles" / "Charts"]
+    for charts_root in charts_roots:
+        try:
+            if not charts_root.exists():
+                charts_root.mkdir(parents=True, exist_ok=True)
+            for prof in charts_root.iterdir():
+                if not prof.is_dir():
+                    continue
+                for old in prof.glob("chart*.chr"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+        except OSError as exc:
+            log.debug(f"terminal {inst}: chart sanitize skipped ({charts_root}): {exc}")
 
 
 def force_profile(inst: int = 1) -> None:

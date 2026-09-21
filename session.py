@@ -48,6 +48,14 @@ from config import setup_logging
 log = setup_logging(__name__)
 
 SESSION_FILE = Path(__file__).resolve().parent / "session.json"
+
+# MT5_SESSION_FILE: redirect the persisted session to a PRIVATE path.
+# Sandbox tests set this (they must NEVER touch the live session.json -
+# a 2026-09-21 test overwrote the production passwords with placeholders
+# and both terminals lost their auto-login until acc.env restored them).
+_env_session = os.environ.get("MT5_SESSION_FILE")
+if _env_session:
+    SESSION_FILE = Path(_env_session)
 _SALT = b"mt5-bridge-session-v1"
 _MAGIC = "MT5SESSION"
 

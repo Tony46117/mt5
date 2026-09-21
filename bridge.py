@@ -87,6 +87,7 @@ now_ts = lambda: dt.datetime.now().strftime("%H:%M:%S")
 # at least one trades.csv header - it carries the EA-reported login)
 LOGIN_VERIFY_TIMEOUT_S = 90.0
 SCRUB_AFTER_LIVE_S = 8.0        # feed must be live this long before scrubbing
+SYNC_DEAD_S = 45.0              # live feed with EMPTY account data this long = sync-dead, heal
 
 
 def wait_for_login_feed(inst: int, timeout: float) -> bool:
@@ -270,8 +271,9 @@ def header_for(inst: int) -> dict:
 
 class TermState:
     __slots__ = ('inst', 'running', 'age_bucket', 'login', 'last_start',
-                 'last_heal', 'last_check', 'ever_session', 'header', 'header_ts',
-                 'launch_fails', 'heal_fails')
+                 'last_heal', 'last_check', 'ever_session', 'header',
+                 'header_ts', 'launch_fails', 'heal_fails',
+                 'sync_dead_since')
 
     def __init__(self, inst: int):
         self.inst = inst
@@ -286,6 +288,7 @@ class TermState:
         self.header_ts = 0.0
         self.launch_fails = 0       # consecutive launches that never came up
         self.heal_fails = 0         # consecutive heals that did not restore the feed
+        self.sync_dead_since = 0.0  # feed live but account data empty since (0 = ok)
 
     def bucket(self) -> str:
         if not self.running:
@@ -460,6 +463,29 @@ class Supervisor:
                     else:
                         self.log(f"{RED}heal of terminal {inst} failed{RESET}")
                     st.heal_fails += 1
+
+            # SYNCHRONIZATION-DEAD detection: the feed is live but the EA
+            # header has NO account data (currency/balance empty) - the
+            # terminal never synchronized with the broker (rejected or
+            # absent credentials, server unreachable).  Feed-age-only
+            # healing called this state 'healthy' forever and the account
+            # card showed all zeros.  Heal exactly like a stale feed.
+            if b == "live" and st.header and not st.header.get("currency"):
+                if st.sync_dead_since == 0.0:
+                    st.sync_dead_since = time.monotonic()
+                if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
+                        and time.monotonic() - st.last_start > GRACE_S
+                        and time.monotonic() - st.last_heal > COOLDOWN_S):
+                    self.log(f"{YELLOW}terminal {inst} feed live but account never "
+                             f"synchronized - restarting into session credentials{RESET}")
+                    st.last_heal = time.monotonic()
+                    if restart_terminal(inst):
+                        st.last_start = time.monotonic()
+                        st.running = True
+                    st.heal_fails += 1
+                    st.sync_dead_since = 0.0
+            else:
+                st.sync_dead_since = 0.0
 
             # account identity check - ADAPTIVE cadence: ~1 s while the
             # header login is unknown or mismatches the session (fresh boot,
