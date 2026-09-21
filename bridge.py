@@ -62,7 +62,7 @@ from spot import (
     TERMINALS, MT5_DIR2, read_accounts, read_header, scan_terminals,
     term_running, launch_terminal, restart_terminal, stop_terminal,
     setup_terminal2, install_script, feed_age, scrub_start_cfg,
-    ensure_autotrading,
+    ensure_autotrading, pick_terminal,
 )
 import session
 
@@ -76,8 +76,9 @@ RELAUNCH_COOLDOWN_S = 10.0   # never spawn a terminal more often than this
 
 # Adaptive polling - state machine (no bouncing multipliers)
 POLL_FAST = 1.0     # a terminal is down/stale
-POLL_NORMAL = 5.0   # something is laggy (default)
-POLL_SLOW = 15.0    # both feeds live and stable
+POLL_NORMAL = 3.0   # something is laggy
+POLL_SLOW = 5.0     # both feeds live and stable (was 15 s: an account
+#                     switch then took up to 25 s to be adopted and shown)
 
 now_ts = lambda: dt.datetime.now().strftime("%H:%M:%S")
 
@@ -99,9 +100,14 @@ def wait_for_login_feed(inst: int, timeout: float) -> bool:
 
 
 def verify_login(inst: int) -> tuple[bool, str, str]:
-    """(ok, ea_reported_login, expected_login) for terminal `inst`."""
+    """(ok, ea_reported_login, expected_login) for terminal `inst`.
+
+    Uses header_for() (session-login-aware, ALL data roots) - the old
+    install-dir-only read never saw the login of a terminal whose data
+    folder lives in AppData, so every boot 'failed' verification after a
+    90 s wait and triggered a pointless remedial relaunch."""
     expected = session.expected_login(inst)
-    got = read_header(TERMINALS[inst]["dir"] / "MQL5" / "Files" / "trades.csv").get("login", "")
+    got = header_for(inst).get("login", "")
     return (bool(got) and got == expected, got, expected)
 
 
@@ -237,9 +243,19 @@ def login_and_boot() -> tuple[bool, list[int]]:
 def header_for(inst: int) -> dict:
     """EA header of terminal `inst`'s trades.csv ('' fields when no data).
 
-    read_header() is mtime-cached in spot.py, so this is cheap to call
-    every poll; the legacy fallback scan is throttled to once per 30 s.
+    Resolves the terminal by its SESSION LOGIN first (pick_terminal scans
+    every data root - install dir AND AppData instances), so an account
+    whose terminal keeps its data outside the install dir is still seen
+    (the old install-dir-only lookup made such accounts invisible to the
+    supervisor forever -> 'account refusing to show').  read_header() is
+    mtime-cached in spot.py, so this is cheap to call every poll; the
+    legacy fallback scan is throttled to once per 30 s.
     """
+    login = session.expected_login(inst)
+    if login:
+        term = pick_terminal(login)
+        if term:
+            return read_header(term["trades_path"])
     if inst == 1:
         path = TERMINALS[1]["dir"] / "MQL5" / "Files" / "trades.csv"
         h = read_header(path)
@@ -379,9 +395,17 @@ class Supervisor:
             if not running:
                 # relaunch with an EXPONENTIAL cooldown so a broken install
                 # can never spawn-storm wine processes: 10 s -> 20 -> 40 -> 80
-                # -> 160 s, reset the moment the terminal is up + live again
+                # -> 160 s, reset the moment the terminal is up + live again.
+                # A terminal with NO session credentials is launched ONCE
+                # (so the operator can log into it via the MT5 UI - the
+                # login is then adopted); after that it is never
+                # relaunch-spammed: each boot would just pop another
+                # logged-out MT5 window every cooldown (the old
+                # relaunch-loop that made accounts 'refuse to show').
+                credless = expected in ("", "?")
+                may_launch = exe_ok and (not credless or st.last_start == 0.0)
                 cooldown = min(RELAUNCH_COOLDOWN_S * (2 ** min(st.launch_fails, 5)), 300.0)
-                if exe_ok and now - st.last_start > cooldown:
+                if may_launch and now - st.last_start > cooldown:
                     self.log(f"terminal {inst} not running - {DIM}starting{RESET}")
                     install_script(inst)         # EA ready BEFORE the launch
                     launch_terminal(inst)
@@ -437,8 +461,11 @@ class Supervisor:
                         self.log(f"{RED}heal of terminal {inst} failed{RESET}")
                     st.heal_fails += 1
 
-            # account identity check (less frequent)
-            if time.monotonic() - st.last_check > 10:
+            # account identity check - ADAPTIVE cadence: ~1 s while the
+            # header login is unknown or mismatches the session (fresh boot,
+            # UI switch, external session rewrite) so a new account is
+            # adopted/shown within a second or two; 5 s once verified.
+            if time.monotonic() - st.last_check > (1.0 if (not st.login or st.login != expected) else 5.0):
                 st.last_check = time.monotonic()
                 h = header_for(inst)
                 st.header = h
@@ -471,6 +498,29 @@ class Supervisor:
                 #     account; relaunch the terminal INTO it.
                 if login == expected:
                     st.ever_session = True      # EA reached the session account
+                elif not expected and login:
+                    # C) session has NO credentials for this slot but the
+                    # terminal IS live in some account: adopt it so the
+                    # operator's UI login is incorporated everywhere
+                    # (previously this state ran the B-branch below with
+                    # expected '?' and 'reconnected' forever - the
+                    # account kept flip-flopping and never showed).
+                    accs = read_accounts()
+                    a = accs.get(inst, {})
+                    a["login"] = login
+                    if h.get("server"):
+                        a["server"] = h["server"]
+                    accs[inst] = a
+                    session.set_accounts(accs, persist=True)
+                    self.log(f"{YELLOW}terminal {inst} live in account {login} - "
+                             f"session adopted (was unset), whole software follows{RESET}")
+                    log.warning(f"terminal {inst}: adopted account {login} "
+                                f"(server {a.get('server')}) - password unknown; "
+                                f"run 'python session.py --seed' if auto-relogin "
+                                f"into it is ever needed")
+                    st.login = login
+                    st.ever_session = True
+                    self._fast_frame = True
                 elif expected and login:
                     # Only a terminal that WAS on the session account and
                     # then moved is a real user switch (adopt).  A boot that
@@ -504,9 +554,13 @@ class Supervisor:
                             st.login = login
                             st.ever_session = False
                             self._fast_frame = True
-                    elif (time.monotonic() - st.last_start > GRACE_S
+                    elif (expected not in ("", "?")
+                          and time.monotonic() - st.last_start > GRACE_S
                           and time.monotonic() - st.last_heal > COOLDOWN_S):
-                        # B) failed boot / external switch-in: reconnect
+                        # B) failed boot / external switch-in: reconnect.
+                        # NEVER for a credless slot (expected '?'): there is
+                        # nothing to reconnect INTO - restarting the terminal
+                        # would just loop logged-out boots forever.
                         self.log(f"{YELLOW}terminal {inst} is in {login} - "
                                  f"reconnecting into session account "
                                  f"{expected}{RESET}")

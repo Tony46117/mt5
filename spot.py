@@ -266,11 +266,18 @@ def scan_terminals() -> list[dict]:
 
 
 def pick_terminal(login: str) -> dict | None:
-    """Data root whose trades.csv header login matches; fallback: any.
+    """Data root whose trades.csv header login matches; session-order hint.
 
     When no live header proves the login yet, the runtime session's
     terminal order acts as the hint (terminal 1 = account 1, etc.) so the
-    exec channel lands in the right terminal while the bridge warms up."""
+    exec channel lands in the right terminal while the bridge warms up.
+
+    A KNOWN login that no terminal proves (and whose hinted root has no
+    feed) returns None - never some OTHER account's terminal.  The old
+    terms[0] fallback made account cards show the other account's
+    balance during boot and could route order files into the wrong
+    terminal.  Only the legacy no-login lookup keeps the any-terminal
+    fallback."""
     terms = scan_terminals()
     for t in terms:
         if t["header"].get("login") == login:
@@ -283,6 +290,7 @@ def pick_terminal(login: str) -> dict | None:
                     if t["root"] == hint:
                         return t
                 break
+        return None
     return terms[0] if terms else None
 
 
@@ -312,18 +320,26 @@ def wait_for_bridge(inst: int = 1, timeout: float = 120) -> bool:
 def feed_age(inst: int = 1) -> float:
     """Seconds since THIS terminal's freshest bridge file was written.
     999 = terminal's data folder has no bridge files yet (stale/never).
-    
+
+    Per-terminal OWNERSHIP: terminal 2's install dir never counts toward
+    terminal 1's age and vice versa.  The old code counted terminal 2's
+    files into terminal 1's age (a dead terminal 1 looked LIVE while
+    terminal 2 wrote - so it was never healed and its account never
+    showed) and missed roots for terminal 2 (a healthy terminal 2 looked
+    stale forever -> heal-restart loop -> account 2 refused to show).
+    Shared legacy AppData roots are best-effort attributed to both.
+
     Cached for 1 second to avoid repeated stat() calls during polling."""
-    global _FEED_AGE_CACHE
     now = time.time()
     cached = _FEED_AGE_CACHE.get(inst)
     if cached and now - cached[0] < 1.0:
         return cached[1]
-    if inst == 1:
-        files = spots_csv_paths() + trades_csv_paths()  # incl. legacy AppData roots
-    else:
-        base = MT5_DIR2 / "MQL5" / "Files"
-        files = [base / "spots.csv", base / "trades.csv", base / "candles.csv"]
+    other_root = (TERMINALS[2] if inst == 1 else TERMINALS[1])["dir"] / "MQL5"
+    roots = [r for r in data_roots() if r != other_root]
+    files: list[Path] = []
+    for root in roots:
+        files += [root / "Files" / "spots.csv", root / "Files" / "trades.csv",
+                  root / "Files" / "candles.csv"]
     newest = 0.0
     for p in files:
         try:

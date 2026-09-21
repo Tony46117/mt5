@@ -89,11 +89,17 @@ def read_positions(inst: int) -> list[dict]:
 
 
 def account_info(inst: int) -> dict:
-    """Account snapshot of terminal `inst` from its EA header."""
+    """Account snapshot of terminal `inst` from its EA header.
+
+    Strict identity, same as read_positions(): the card reports the
+    session account only when the EA header PROVES that login - the old
+    unchecked version displayed whichever terminal wrote freshest
+    (typically the OTHER account's balance during boot), which read as
+    'account refusing to show / showing wrong data'."""
     login = read_accounts().get(inst, {}).get("login", "")
     term = pick_terminal(login) if login else None
-    if not term:
-        return {"login": "", "server": "", "balance": 0.0, "equity": 0.0,
+    if not term or read_header(term["trades_path"]).get("login") != login:
+        return {"login": login or "", "server": "", "balance": 0.0, "equity": 0.0,
                 "profit": 0.0, "margin": 0.0, "margin_free": 0.0,
                 "margin_level": 0.0, "positions": 0}
     head = read_header(term["trades_path"])
