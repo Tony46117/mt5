@@ -70,6 +70,14 @@ RETRY_DELAY_S = 0.5               # HARDENING: an open/close that FAILED (bad
                                   # is automatically retried after 500 ms -
                                   # 3 attempts max, then it reports for real
 RETRY_MAX = 3
+# Hard rejects a retry can NEVER fix - re-sending them just burned the
+# scheduler for a second (or doubled a later recovery) and tripled every
+# row in the fired log (one failure showed up as 3 identical-looking rows,
+# which read as 'duplicate trades' in the panel).  Transient rejects that
+# DO benefit from a retry: requotes (10004/10006/10008), price-off (10015),
+# no-quotes (10020/10021), and 'not responding' timeouts handled elsewhere.
+HARD_REJECT_MARKERS = ("10017", "10018", "10019", "10027",
+                       "unknown symbol", "invalid volume", "bad volume")
 # 24/7 instruments (Deriv synthetics, HFM's XAUUSD247, ...) trade on
 # weekends too - the Mon-Fri guard must never eat their schedules.
 ALWAYS_ON_MARKERS = ("247", "BOOM", "CRASH", "JUMP", "RANGE BREAK", "STEP INDEX",
@@ -639,6 +647,12 @@ class FutureTradeScheduler(threading.Thread):
                 log.error(f"schedule #{sch['id']} fire crashed AFTER "
                           f"{opened['ok']} opens ({exc}) - slot consumed, "
                           f"NOT retrying (duplicates)")
+                # the opened positions must not dangle without an auto-close
+                try:
+                    self._register_close(sch)
+                except Exception:
+                    log.error(f"schedule #{sch['id']}: could not arm the "
+                              f"auto-close after the crash")
             else:
                 log.error(f"schedule #{sch['id']} fire CRASHED before any "
                           f"open ({exc}) - retrying slot in 2 s")
@@ -688,13 +702,18 @@ class FutureTradeScheduler(threading.Thread):
         # HARDENING - 500 ms auto-retry on positions that FAILED to open:
         # a transient reject (freshly selected symbol without a quote yet,
         # requote, price-off) is retried after 500 ms instead of leaving
-        # the schedule short of its positions.  'not responding' is NOT
-        # retried: a timed-out command may still have executed server-side,
-        # and re-sending it would duplicate the position (a stalled terminal
-        # is the janitor's + supervisor's job to restart).
+        # the schedule short of its positions.  Hard rejects (trade
+        # disabled, market closed, unknown symbol, bad volume) are NOT
+        # retried: the broker will answer the same a second later, and the
+        # extra attempts only wrote 2 more failed rows per open into the
+        # fired log.  'not responding' is NOT retried either: a timed-out
+        # command may still have executed server-side, and re-sending it
+        # would duplicate the position (a stalled terminal is the janitor's
+        # + supervisor's job to restart).
         for attempt in range(1, RETRY_MAX):
             retry_idx = [i for i, (ok, det) in enumerate(results)
-                         if not ok and "not responding" not in det]
+                         if not ok and "not responding" not in det
+                         and not any(m in det for m in HARD_REJECT_MARKERS)]
             if not retry_idx:
                 break
             time.sleep(RETRY_DELAY_S)
@@ -718,7 +737,19 @@ class FutureTradeScheduler(threading.Thread):
                       f"ALGO TRADING OFF (10027) - restarting it")
             _restart_terminal_async(acc)
 
-        self._register_close(sch)
+        # Register the auto-close only when a position may actually exist:
+        # every open answered with a DEFINITE broker reject (retcode /
+        # unknown symbol) means nothing was placed - registering a close
+        # here used to fire a CLOSEALL at close time that could close
+        # ANOTHER schedule's positions early (earliest close wins).
+        # Indeterminate results ('not responding') still register: the
+        # order may have executed server-side and must not dangle.
+        if ok_cnt > 0 or any(not ok and "not responding" in det
+                             for ok, det in results):
+            self._register_close(sch)
+        else:
+            log.info(f"schedule #{sch['id']} acc{acc} {pair}: no position "
+                     f"opened - auto-close not armed")
         log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
                  f"{ok_cnt}/{n} opened in {fire_ms:.1f} ms")
 

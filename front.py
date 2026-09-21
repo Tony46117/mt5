@@ -497,7 +497,7 @@ function schedModalHTML(n,edit){
   '<div class="secthint">close time · auto-closes the positions</div>'+
   '<div class="dials" id="dials_c'+n+'"></div>'+
   '<div style="margin-top:16px;display:flex;gap:10px;align-items:center">'+
-  '<button class="btn blue" onclick="'+(edit?'saveScheduleEdit('+edit.id+','+n+')':'saveSchedule('+n+')')+'">'+(edit?'SAVE CHANGES':'SAVE SCHEDULE')+'</button>'+
+  '<button class="btn blue" id="schedSaveBtn" onclick="'+(edit?'saveScheduleEdit('+edit.id+','+n+')':'saveSchedule('+n+')')+'">'+(edit?'SAVE CHANGES':'SAVE SCHEDULE')+'</button>'+
   '<span class="feedback" style="margin:0" id="ffb'+n+'">fires DAILY at open time, auto-closes at close time · machine clock (AM/PM)</span>'+
   '</div>'+
   '<input type="hidden" id="dialinit'+n+'" value="'+(e.h!==undefined?e.h:eh)+'|'+(e.m!==undefined?e.m:em)+'|'+(e.s!==undefined?e.s:es)+'|'+(e.ch!==undefined?e.ch:ch)+'|'+(e.cm!==undefined?e.cm:cm)+'|'+(e.cs!==undefined?e.cs:cs)+'">'}
@@ -530,6 +530,7 @@ function makeAPHour(n,prefix,val){
 function openSchedModal(n,edit){
  dialDestroyAll();
  if(AP_TIMER){clearInterval(AP_TIMER);AP_TIMER=null}
+ SCHED_SAVING=false;                       // fresh modal = fresh save
  MODAL_ACC=n;
  $id('modalBody').innerHTML=schedModalHTML(n,edit||null);
  const parts=$id('dialinit'+n).value.split('|').map(Number);
@@ -544,7 +545,14 @@ function openSchedModal(n,edit){
  AP_TIMER=setInterval(function(){apCountdown(n)},1000);
  fillSymbols();
  $id('modalBg').classList.add('open')}
-async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
+/* ONE save at a time: a double-click on SAVE (or Enter-then-click) used to
+   fire two POSTs back to back and create two identical schedules.  The
+   guard also keeps the SAVE button disabled until the request settles. */
+let SCHED_SAVING=false;
+function setSaveBusy(busy){const b=$id('schedSaveBtn');
+ if(b){b.disabled=busy;b.style.opacity=busy?'0.6':''}}
+async function saveSchedule(n){if(SCHED_SAVING)return;SCHED_SAVING=true;
+ const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';setSaveBusy(true);
  try{const j=await post('/api/schedule',{account:+n,pair:$id('sp'+n).value,
   side:$id('sdf'+n).value,
   lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
@@ -555,9 +563,10 @@ async function saveSchedule(n){const f=$id('ffb'+n);f.className='feedback';f.tex
   const when=(j.next_fire_local||j.next_fire)+(today?'':' TOMORROW');
   f.className='feedback ok';f.textContent='saved #'+j.id+' - fires '+when;
   toast('schedule #'+j.id+' saved - fires '+when,today);
-  setTimeout(closeModal,1500);refresh()}catch(e){f.className='feedback err';
-  f.textContent=e.message}}
-async function saveScheduleEdit(sid,n){const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';
+  setTimeout(closeModal,1500);refresh()}catch(e){SCHED_SAVING=false;setSaveBusy(false);
+  f.className='feedback err';f.textContent=e.message}}
+async function saveScheduleEdit(sid,n){if(SCHED_SAVING)return;SCHED_SAVING=true;
+ const f=$id('ffb'+n);f.className='feedback';f.textContent='saving...';setSaveBusy(true);
  try{const j=await post('/api/schedule/update',{id:sid,pair:$id('sp'+n).value,
   side:$id('sdf'+n).value,
   lot:parseFloat($id('lotf'+n).value),n:+$id('npf'+n).value,
@@ -565,8 +574,8 @@ async function saveScheduleEdit(sid,n){const f=$id('ffb'+n);f.className='feedbac
   close:[hour24('cH'+n),dialGet('cM'+n),dialGet('cS'+n)]});
   f.className='feedback ok';f.textContent='updated #'+sid+' - next fire '+(j.next_fire_local||j.next_fire);
   toast('schedule #'+sid+' adjusted - next fire '+(j.next_fire_local||j.next_fire),true);
-  setTimeout(closeModal,1200);refresh()}catch(e){f.className='feedback err';
-  f.textContent=e.message}}
+  setTimeout(closeModal,1200);refresh()}catch(e){SCHED_SAVING=false;setSaveBusy(false);
+  f.className='feedback err';f.textContent=e.message}}
 """
 
 # --------------------------------------------------------------------------
@@ -901,7 +910,11 @@ async function restartTerm(n){
 /* ---------- future-trade modal (shared dial-picker version in COMMON_JS) ---------- */
 function openModal(n){MODAL_ACC=n;openSchedModal(n)}
 function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
-$id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
+$id('modalBg').addEventListener('click',function(e){
+ /* a click-through while a save is in flight used to close the modal and
+    leave the operator staring at the schedule page - looking like the save
+    was lost - so they opened the modal and saved AGAIN (duplicate). */
+ if(e.target===this&&!SCHED_SAVING)closeModal()});
 
 
 async function delSchedule(id){try{await post('/api/schedule/delete',{id});
@@ -1146,7 +1159,11 @@ async function refresh(){
 /* ---------- future-trade modal (shared dial-picker version in COMMON_JS) ---------- */
 function openModal(n){openSchedModal(n,null)}
 function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
-$id('modalBg').addEventListener('click',function(e){if(e.target===this)closeModal()});
+$id('modalBg').addEventListener('click',function(e){
+ /* a click-through while a save is in flight used to close the modal and
+    leave the operator staring at the schedule page - looking like the save
+    was lost - so they opened the modal and saved AGAIN (duplicate). */
+ if(e.target===this&&!SCHED_SAVING)closeModal()});
 async function delSchedule(id){
   if(!confirm('Delete schedule #'+id+'? This removes it for good.'))return;
   try{await post('/api/schedule/delete',{id:id,hard:true});
@@ -1155,10 +1172,12 @@ function fillSymbols(){
   /* fetch spot symbols for the pair dropdown */
   api('/api/spots').then(j=>{const spots=j.spots||{};const keys=Object.keys(spots);
    const sel=$id('sp'+(MODAL_ACC||1));if(!sel)return;
+   /* rebuild from scratch: appending to the existing options duplicated
+      the whole list every time the modal was reopened */
    const cur=sel.value;
-   sel.innerHTML=(cur?'<option>'+esc(cur)+'</option>':'')+
-    keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
-   if(cur)sel.value=cur}).catch(()=>{})}
+   sel.innerHTML=keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
+   if(cur&&keys.includes(cur))sel.value=cur;
+   else if(cur)sel.innerHTML='<option>'+esc(cur)+'</option>'+sel.innerHTML}).catch(()=>{})}
 function renderCountdowns(){
   const tds=document.querySelectorAll('#schedTbl td[data-fire]');
   if(!tds.length)return;

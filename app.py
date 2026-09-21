@@ -580,10 +580,11 @@ def api_fired():
 def api_clock():
     """Which clock schedule times are interpreted in.
 
-    Schedules are stored and fired in UTC (database.add_future_trade), but
-    the panel used to render a bare "14:30:00" with no zone, so an operator
-    in UTC+3 scheduled 14:30 and the order fired at 17:30 their time.  The
-    panel now labels the zone and shows the local equivalent.
+    Schedule H/M/S are typed in the MACHINE's wall clock and stored as that
+    instant converted to UTC (database._local_to_utc); the executor fires
+    them at the same wall-clock second each day.  The panel labels the
+    fields with the machine's zone and offset so an operator on a different
+    screen timezone can convert before typing.
     """
     now_local = dt.datetime.now().astimezone()
     return _ok({
