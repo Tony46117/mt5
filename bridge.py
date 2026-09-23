@@ -8,10 +8,11 @@ bridge:
     python monitor.py     # account1 + account2 positions/balance/equity
     python info.py        # full info about the LOGGED-IN accounts + spreads
 
-LOGIN FLOW (no acc.env, NO PROMPT anymore):
+LOGIN FLOW (no acc.env, no prompts by default):
   * bridge.py boots BOTH TERMINALS CONCURRENTLY straight into the stored
     session (session.json, obfuscated) - the two stored accounts are
-    logged in automatically via the start configs, ALGO ON, EA attached;
+    logged in automatically via the start configs, ALGO ON, EA attached
+    (MT5_NO_LOGIN_PROMPT=1, set by docker-entrypoint / default flow);
   * LOGGING INTO ANY ACCOUNT ON ANY TERMINAL (MT5 UI) IS INCORPORATED
     INTO THE WHOLE SOFTWARE: the supervisor sees the EA's identity change
     and ADOPTS the new account into the session - executor, info,
@@ -82,6 +83,22 @@ POLL_SLOW = 5.0     # both feeds live and stable (was 15 s: an account
 #                     switch then took up to 25 s to be adopted and shown)
 
 now_ts = lambda: dt.datetime.now().strftime("%H:%M:%S")
+
+
+def _session_accounts() -> dict[int, dict[str, str]]:
+    """Session accounts with GARBAGE logins sanitized away.
+
+    A poisoned slot (MT5's logged-out marker "0", the TEST-ONLY "LOGIN"
+    placeholder) must never be treated as a boot identity: with_login boot
+    configs would literally send Login=0/LOGIN to the terminal (the exact
+    'boots logged-out' bug).  Sanitized slots look like unset slots - the
+    supervisor then adopts whatever live account it finds on them."""
+    accs = read_accounts()
+    for inst, a in list(accs.items()):
+        lg = str(a.get("login", "")).strip()
+        if lg in ("", "0", "?", "LOGIN"):
+            accs[inst] = {k: v for k, v in a.items() if k != "login"}
+    return accs
 
 # how long a terminal has to produce a live feed after boot before the
 # login is verified / the start-config scrubbed (the EA must have written
@@ -364,7 +381,7 @@ class Supervisor:
             log.error(f"supervisor poll error: {exc}")
 
     def _poll(self) -> None:
-        accs = read_accounts()
+        accs = _session_accounts()
         
         # Check terminal 2 setup once
         if not self._terminal2_ready and not (MT5_DIR2 / "terminal64.exe").exists():
@@ -537,7 +554,7 @@ class Supervisor:
                     # (previously this state ran the B-branch below with
                     # expected '?' and 'reconnected' forever - the
                     # account kept flip-flopping and never showed).
-                    accs = read_accounts()
+                    accs = _session_accounts()
                     a = accs.get(inst, {})
                     a["login"] = login
                     if h.get("server"):
@@ -549,10 +566,22 @@ class Supervisor:
                         a["password"] = known["password"]
                         if known.get("server"):
                             a["server"] = known["server"]
+                    else:
+                        # BRAND-NEW account (never seen): remember it so the
+                        # reconnect path (B) has something to reconnect INTO
+                        # and one-click switching can target it.  Passwordless:
+                        # a later UI login with the password refreshes the book.
+                        try:
+                            known_accounts.remember(login, "", a.get("server", ""))
+                        except ValueError:
+                            pass
                     accs[inst] = a
                     session.set_accounts(accs, persist=True)
-                    known_accounts.remember(login, a.get("password", ""),
-                                            a.get("server", ""))
+                    try:
+                        known_accounts.remember(login, a.get("password", ""),
+                                                a.get("server", ""))
+                    except ValueError:
+                        pass          # garbage identity: never enters the book
                     self.log(f"{YELLOW}terminal {inst} live in account {login} - "
                              f"session adopted (was unset), whole software follows{RESET}")
                     log.warning(f"terminal {inst}: adopted account {login} "
@@ -573,7 +602,7 @@ class Supervisor:
                     fresh_session = session.file_stamp() != self._sess_stamp
                     if st.ever_session and not fresh_session:
                         # A) user switch: adopt the new account
-                        accs = read_accounts()
+                        accs = _session_accounts()
                         a = accs.get(inst, {})
                         if a.get("login") and a["login"] != login:
                             a["login"] = login
@@ -591,8 +620,11 @@ class Supervisor:
                                 if known.get("server"):
                                     a["server"] = known["server"]
                             session.set_accounts(accs, persist=True)
-                            known_accounts.remember(login, a.get("password", ""),
-                                                    a.get("server", ""))
+                            try:
+                                known_accounts.remember(login, a.get("password", ""),
+                                                        a.get("server", ""))
+                            except ValueError:
+                                pass      # garbage identity: never enters the book
                             self.log(f"{YELLOW}terminal {inst} switched to "
                                      f"account {login} - session adopted, "
                                      f"whole software follows{RESET}")
@@ -628,7 +660,7 @@ class Supervisor:
 
     # ------------------------------------------------------------------
     def frame(self) -> str:
-        accs = read_accounts()
+        accs = _session_accounts()
         out = [f"{BOLD}MT5 BRIDGE SUPERVISOR{RESET}  {DIM}2 terminals, "
                f"SpotDump EA feeds, auto-heal{RESET}  "
                f"{DIM}{now_ts()}{RESET}  poll={self._poll_interval:.1f}s{RESET}", ""]
@@ -686,6 +718,15 @@ def main() -> int:
           f"maintain the EA bridges...{RESET}")
 
     sup = Supervisor()
+    # One-time book hygiene: drop legacy TEST-ONLY placeholder entries
+    # (login "LOGIN" / "0") so auto-switch can never target them.
+    for ghost in ("LOGIN", "0", "?"):
+        try:
+            if known_accounts.forget(ghost):
+                log.warning(f"removed invalid known-account entry {ghost!r} "
+                            f"(placeholder garbage)")
+        except Exception:
+            pass
     ok_boot, launched_boot = login_and_boot()
     # give the boot's launches their grace + down-state (Popen is async:
     # pgrep will not see the wine process for a few seconds)

@@ -564,6 +564,20 @@ def _write_start_cfg(inst: int, with_login: bool = True) -> None:
         common = ""
         if with_login:
             a = read_accounts().get(inst, {})
+            # CHOKE POINT: never write a garbage login into a start config.
+            # Every relaunch/heal path (supervisor restart, sync-dead heal,
+            # prober rotation) funnels through here, including ones that
+            # never saw bridge.py's sanitizing - so the validation lives
+            # HERE, at the only place credentials reach the terminal.
+            # MT5's logged-out marker "0" or the TEST-ONLY "LOGIN" sent as
+            # Login= boots the terminal into a dead login prompt (the exact
+            # 'boots logged-out' bug).
+            lg = str(a.get("login", "")).strip()
+            if lg in ("", "0", "?", "LOGIN") or not lg.isdigit():
+                log.warning(f"terminal {inst}: session login {lg!r} is not a "
+                            f"plausible account - booting WITHOUT the login block")
+                with_login = False
+        if with_login:
             common = ("[Common]\r\n"
                       f"Login={a.get('login', '')}\r\n"
                       f"Password={a.get('password', '')}\r\n"
@@ -922,6 +936,12 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     # Slots WITH a password (known book / bridge prompt) keep the antidetect
     # scrub: our start-config login block is authoritative for them.
     slot = read_accounts().get(inst, {})
+    # A garbage login ("0", "LOGIN", non-numeric) is not a wallet account:
+    # treating it as one would boot WITHOUT the login block and then wait
+    # forever for a remembered credential that does not exist.
+    slot_login = str(slot.get("login", "")).strip()
+    if slot_login in ("", "0", "?", "LOGIN") or not slot_login.isdigit():
+        slot = {}
     wallet_reconnect = bool(with_login and slot.get("login")
                             and not slot.get("password"))
     if wallet_reconnect:

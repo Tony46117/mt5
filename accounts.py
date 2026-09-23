@@ -29,6 +29,17 @@ BOOK_FILE = Path(__file__).resolve().parent / "known_accounts.json"
 
 _LOCK = threading.RLock()
 
+# Identities that must NEVER enter the book: MT5's logged-out marker ("0",
+# which once poisoned both the session and this book - see session.py), the
+# supervisor's "unknown" placeholder, and the TEST-ONLY placeholder login
+# written into start-config login blocks when a slot has no credentials.
+_INVALID_LOGINS = frozenset({"0", "?", "LOGIN"})
+
+
+def _valid_login(login: str) -> bool:
+    """True when `login` is a plausible account number (digits only)."""
+    return bool(login) and login not in _INVALID_LOGINS and login.isdigit()
+
 
 def _load() -> dict:
     """Raw book {'accounts': [account, ...]} ({} when missing/corrupt)."""
@@ -60,13 +71,23 @@ def _save(doc: dict) -> None:
 
 def remember(login: str, password: str = "", server: str = "",
              label: str = "") -> dict:
-    """Add/update a known account (matched by login).  Returns the entry."""
+    """Add/update a known account (matched by login).  Returns the entry.
+
+    Garbage identities (MT5's logged-out marker "0", "?", placeholder
+    logins) are refused - they once polluted the book.  Updating the LEGACY
+    'LOGIN' placeholder entry with real credentials REPLACES it instead of
+    leaving a stale book entry that auto-switch could reconnect terminals
+    into."""
     login = str(login).strip()
-    if not login:
-        raise ValueError("login required")
+    if not _valid_login(login):
+        raise ValueError(f"invalid login {login!r} - not a plausible account")
     with _LOCK:
         doc = _load()
         accs = doc.get("accounts", [])
+        # A legacy TEST-ONLY placeholder entry ('LOGIN') is never updated -
+        # it is REPLACED by the real account so no stale entry lingers.
+        accs = [a for a in accs
+                if not (a.get("login") in _INVALID_LOGINS and login != a.get("login"))]
         for a in accs:
             if a.get("login") == login:
                 if password:
@@ -121,6 +142,8 @@ def all_known() -> list[dict]:
         accs = _load().get("accounts", [])
     out = []
     for a in sorted(accs, key=lambda x: x.get("added", "")):
+        if not _valid_login(a.get("login", "")):
+            continue          # never surface garbage identities to the panel
         out.append({"login": a.get("login", ""),
                     "server": a.get("server", ""),
                     "label": a.get("label", ""),

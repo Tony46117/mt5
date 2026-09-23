@@ -66,6 +66,18 @@ _CACHE_STAT: tuple[int, int] | None = None         # (mtime_ns, size) of session
 
 _OVERRIDE = None                                    # test-only replacement
 
+# Identities that must never become a session login: MT5's logged-out
+# marker "0" (it once poisoned the session and made every terminal boot
+# 'logged out'), the supervisor's "unknown" placeholder "?", and the
+# TEST-ONLY "LOGIN" placeholder written into start configs when a slot
+# has no credentials.
+_INVALID_LOGINS = frozenset({"0", "?", "LOGIN"})
+
+
+def _valid_login(login: str) -> bool:
+    """True when `login` is a plausible account number (digits only)."""
+    return bool(login) and login not in _INVALID_LOGINS and login.isdigit()
+
 
 # --------------------------------------------------------------------------
 # machine key + stream-cipher obfuscation
@@ -229,15 +241,27 @@ def is_logged_in() -> bool:
 
 
 def set_accounts(accounts: dict[int, dict[str, str]], persist: bool = True) -> None:
-    """Programmatic login (used by --seed and tests)."""
+    """Programmatic login (used by --seed, the supervisor's hot adoption
+    and the web login form).
+
+    The WRITE-side validation twin of _session_accounts() in bridge.py:
+    a garbage identity ("0"/"?"/"LOGIN", non-numeric) is dropped instead
+    of persisted, so the session can never be re-poisoned after it was
+    cleaned - every reader (boot configs, adopt/reconnect paths, web)
+    sees a sanitized store."""
     global _MEM, _CACHE_STAT
     clean: dict[int, dict[str, str]] = {}
     for inst in (1, 2):
         a = accounts.get(inst) or {}
-        if a.get("login"):
-            clean[inst] = {"login": str(a["login"]),
-                           "password": str(a.get("password", "")),
-                           "server": str(a.get("server", "MetaQuotes-Demo"))}
+        lg = str(a.get("login", "")).strip()
+        if not _valid_login(lg):
+            if a.get("login"):
+                log.warning(f"session: refusing to store invalid login "
+                            f"{a.get('login')!r} for terminal {inst}")
+            continue
+        clean[inst] = {"login": lg,
+                       "password": str(a.get("password", "")),
+                       "server": str(a.get("server", "MetaQuotes-Demo"))}
     with _LOCK:
         _MEM = clean
         _CACHE_STAT = None          # force re-stat on next load

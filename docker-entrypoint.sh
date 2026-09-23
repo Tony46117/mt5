@@ -171,6 +171,17 @@ seed_session() {
   else
     warn "no session: log in via the web panel, or exec the container and run: python session.py --seed"
   fi
+  # MT5_AUTO_LOGIN=1 (default): the bridge boots STRAIGHT into the stored
+  # session - both terminals auto-logged into exactly those accounts, no
+  # interactive login prompts.  MT5_AUTO_LOGIN=0 restores the old ask-on-boot
+  # behaviour.  Hot switching still works: any new login made on a terminal
+  # (UI or panel) is adopted into the session live.
+  if [ "${MT5_AUTO_LOGIN:-1}" = "1" ]; then
+    export MT5_NO_LOGIN_PROMPT=1
+    ok "auto-login enabled - booting into the stored accounts"
+  else
+    warn "auto-login disabled (MT5_AUTO_LOGIN=0) - the bridge will ask for logins"
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -195,6 +206,10 @@ trap 'cleanup; exit 143' INT TERM
 
 run_app()    { python3 -u /app/app.py --production >>"$DATA/logs/app.log" 2>&1 & PIDS+=($!); }
 run_bridge() { python3 -u /app/bridge.py        >>"$DATA/logs/bridge.log" 2>&1 & PIDS+=($!); }
+# all/app modes ALSO run the supervisor (in the background): it is what
+# auto-logs the terminals into the stored accounts and keeps them there -
+# without it the web panel trades against dead terminals.
+run_bridges() { run_bridge; }
 
 main() {
   case "${1:-all}" in
@@ -207,9 +222,9 @@ main() {
   cd /app
   seed_session
   case "${1:-all}" in
-    app)    run_app ;;
+    app)    run_app; sleep 2; run_bridges ;;
     bridge) run_bridge ;;
-    all)    run_app; sleep 2; run_bridge ;;
+    all)    run_app; sleep 2; run_bridges ;;
     *) exec "$@" ;;
   esac
   echo -e "${b}web panel: http://localhost:8000  (logs in /data/logs)${n}"
