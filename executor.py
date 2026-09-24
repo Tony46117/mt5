@@ -76,8 +76,31 @@ RETRY_MAX = 3
 # which read as 'duplicate trades' in the panel).  Transient rejects that
 # DO benefit from a retry: requotes (10004/10006/10008), price-off (10015),
 # no-quotes (10020/10021), and 'not responding' timeouts handled elsewhere.
-HARD_REJECT_MARKERS = ("10017", "10018", "10019", "10027",
-                       "unknown symbol", "invalid volume", "bad volume")
+HARD_REJECT_MARKERS = ("10017", "10019", "10027",
+                       "unknown symbol", "invalid volume")
+# TRANSIENT MARKERS: broker-side conditions that clear on their own, so a
+# failed slot must RETRY in-epoch instead of skipping silently to tomorrow.
+#   10018 market closed = the broker's DAILY BREAK (gold: ~23:00-01:00 UTC,
+#   observed live 2026-09-24: XAUUSD feed froze at 22:59:59.961, opens got
+#   'bad volume or no quote' at 23:23 and retcode 10018 at 23:26/23:28 while
+#   AUDCAD filled at 23:25) - it ends within the hour, so retry THROUGH it.
+#   'bad volume or no quote' = no quote at the fire second (also 10020/10021
+#   no-quotes, 10004/10006/10008 requotes, 10015 price-off).  NOTE: this
+#   string CONTAINS 'bad volume', so it must never match HARD_REJECT_MARKERS
+#   or no-quote failures are written off as permanent (that collision is
+#   exactly what left schedules #586/#588/#589 unfired).
+TRANSIENT_RETRY_MARKERS = ("10018", "bad volume or no quote", "10020", "10021",
+                           "10004", "10006", "10008", "10015", "10031",
+                           "requote", "price changed", "no quotes",
+                           "market closed", "no connection")
+# failed-slot retry cadence: first retries are quick (catch a brief pause),
+# then back off toward the epoch deadline (1 h) - gold's break is ~2 h at
+# most, and a slot that truly cannot fill must stop before the next epoch
+# would make the retry pointless (a retry AT the next exec second just
+# doubles that day's trade when the broker accepts it).
+RETRY_SCHED_FIRST_DELAY_S = 30.0
+RETRY_SCHED_MAX_RETRY_S = 300.0    # cap per-retry delay at 5 min
+RETRY_SCHED_EPOCH_S = 3600.0       # give up 1 h after the fire second
 # Plain-language hints for broker retcodes, appended to fired-log rows so
 # the panel explains WHY an order died instead of a bare 'retcode 10017'.
 RETCODE_HINTS = {
@@ -662,7 +685,7 @@ class FutureTradeScheduler(threading.Thread):
         # (retrying would duplicate positions).
         opened = {"ok": 0}
         try:
-            self._fire_inner(sch, opened)
+            results = self._fire_inner(sch, opened)
         except Exception as exc:
             if opened["ok"] > 0:
                 log.error(f"schedule #{sch['id']} fire crashed AFTER "
@@ -684,6 +707,55 @@ class FutureTradeScheduler(threading.Thread):
                 except Exception:
                     log.error(f"schedule #{sch['id']} could not be "
                               f"rescheduled after crash: {exc}")
+        else:
+            # ZERO-OPEN TRANSIENT FAILURE (market closed / no quote / requote):
+            # hand the claimed slot back for an in-epoch retry instead of
+            # letting the schedule silently skip to tomorrow - that silent
+            # skip is what showed up in the panel as a 'duplicate' scheduled
+            # a day ahead (observed: XAUUSD slots failed inside gold's daily
+            # break with retcode 10018 and 'bad volume or no quote').
+            # Any open that landed, and any 'not responding' timeout (the
+            # command may have executed server-side), still consume the slot.
+            if (opened["ok"] == 0 and results is not None
+                    and self._failed_open_transient(results)):
+                self._retry_failed_slot(sch, dt.datetime.now(dt.timezone.utc))
+
+    @staticmethod
+    def _failed_open_transient(results: list[tuple[bool, str]]) -> bool:
+        """True when a 0-open fire hit a TRANSIENT broker condition (market
+        closed / no quote / requote / no connection).  Those clear on their
+        own, so the claimed slot is handed back for a retry instead of the
+        schedule silently skipping to tomorrow (which the panel shows as a
+        'duplicate' suddenly scheduled a day ahead)."""
+        return any(not ok and any(m in det for m in TRANSIENT_RETRY_MARKERS)
+                   for ok, det in results)
+
+    def _retry_failed_slot(self, sch: dict, now_utc: dt.datetime) -> None:
+        """Re-arm a fully-failed slot for an in-epoch retry.  next_fire was
+        already advanced to TOMORROW by the claim, so the panel's next-fire
+        countdown stays honest - a failed slot's retry runs invisibly at
+        exec_h:exec_m:exec_s and only ever writes fired rows; if the retry
+        opens a position its auto-close is armed normally.  Retries stop at
+        the 1 h epoch deadline (a later success would just double the day's
+        trade against the next epoch)."""
+        fire = self._fire_dt(sch)
+        anchor = fire if (fire and fire <= now_utc) else now_utc
+        elapsed = (now_utc - anchor).total_seconds()
+        if elapsed > RETRY_SCHED_EPOCH_S:
+            log.warning(f"schedule #{sch['id']}: slot given up after "
+                        f"{elapsed:.0f}s of transient failures - will fire "
+                        f"next epoch")
+            return
+        delay = min(RETRY_SCHED_MAX_RETRY_S,
+                    RETRY_SCHED_FIRST_DELAY_S * (1 + elapsed / 120.0))
+        nxt = now_utc + dt.timedelta(seconds=delay)
+        try:
+            db.reschedule_at(sch["id"], nxt)
+            log.warning(f"schedule #{sch['id']}: slot failed transiently "
+                        f"({sch.get('pair')}) - retrying at "
+                        f"{nxt.astimezone().strftime('%H:%M:%S')}")
+        except Exception as exc:
+            log.error(f"schedule #{sch['id']}: could not arm slot retry: {exc}")
 
     def _fire_inner(self, sch: dict, opened: dict | None = None) -> None:
         acc = sch["account"]
@@ -773,6 +845,7 @@ class FutureTradeScheduler(threading.Thread):
                      f"opened - auto-close not armed")
         log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
                  f"{ok_cnt}/{n} opened in {fire_ms:.1f} ms")
+        return results
 
     # concurrent fan-out -----------------------------------------------------
     def _fire_concurrently(self, schedules: list[dict]) -> None:
