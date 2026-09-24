@@ -1100,12 +1100,16 @@ function renderSched(){
   if(FILTER==='ACTIVE')rows=rows.filter(s=>s.active);
   if(FILTER==='OFF')rows=rows.filter(s=>!s.active);
   rows=rows.slice().sort((a,b)=>String(a.next_fire||'').localeCompare(String(b.next_fire||'')));
+  window.__retryState={};
+  for(const s of rows)if(s.slot_retry)window.__retryState[s.id]=s.slot_retry;
   if(!rows.length){$id('schedTbl').innerHTML='<div class="empty">'+
    (FILTER==='ACTIVE'?'no active schedules - create one with + NEW SCHEDULE (or arm one +30 s away)':'no schedules here')+'</div>';return}
   $id('schedTbl').innerHTML='<table><tr><th>#</th><th>account</th><th>pair</th><th>side</th>'+
    '<th class="num">lot</th><th class="num">x</th><th>open at</th><th>close at</th>'+
    '<th>next fire</th><th>status</th><th></th></tr>'+
-   rows.map(s=>'<tr><td class="mut">'+s.id+'</td><td>acc'+s.account+'</td>'+
+   rows.map(s=>'<tr><td class="mut">'+s.id+
+    (s.slot_retry?'<div style="color:#eab308;font-weight:600">RETRYING x'+s.slot_retry.tries+
+     ' <span class="cd" data-retry="'+s.id+'"></span></div>':'')+'</td><td>acc'+s.account+'</td>'+
     '<td class="mono">'+esc(s.pair)+'</td>'+
     '<td><span class="side '+esc(s.side)+'">'+esc(s.side)+'</span></td>'+
     '<td class="num">'+fmt(s.lot,2)+'</td><td class="num">'+s.n_positions+'</td>'+
@@ -1206,10 +1210,13 @@ function fillSymbols(){
    else if(cur)sel.innerHTML='<option>'+esc(cur)+'</option>'+sel.innerHTML}).catch(()=>{})}
 function renderCountdowns(){
   const tds=document.querySelectorAll('#schedTbl td[data-fire]');
-  if(!tds.length)return;
-  for(const td of tds){
+  if(tds.length)for(const td of tds){
    const sp=td.querySelector('.cd');
-   if(sp)sp.textContent=countdown(td.getAttribute('data-fire'))}}
+   if(sp)sp.textContent=countdown(td.getAttribute('data-fire'))}
+  const rst=window.__retryState||{};
+  for(const el of document.querySelectorAll('#schedTbl .cd[data-retry]')){
+   const st=rst[el.getAttribute('data-retry')];
+   if(st&&st.next_in!=null)el.textContent='\u00b7 next try '+st.next_in+'s'}}
 setInterval(renderCountdowns,1000);
 refresh();setInterval(refresh,2000);
 """

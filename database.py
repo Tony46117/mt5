@@ -773,6 +773,21 @@ def list_fired(limit: int = 50) -> list[dict]:
         return _fetchall(cur)
 
 
+def fired_since(iso_utc: str) -> list[dict]:
+    """Fired rows logged at or after `iso_utc` (ascending) - the executor's
+    boot catch-up uses this to re-arm retries for slots that transiently
+    failed while the process was down."""
+    with _conn() as c:
+        cur = c.cursor()
+        if USE_POSTGRES:
+            _exec(cur, "SELECT * FROM fired WHERE at >= %s ORDER BY id ASC",
+                  (iso_utc,))
+        else:
+            _exec(cur, "SELECT * FROM fired WHERE at >= ? ORDER BY id ASC",
+                  (iso_utc,))
+        return _fetchall(cur)
+
+
 # --------------------------------------------------------------------------
 # kv blobs (equity curve, metrics)
 # --------------------------------------------------------------------------

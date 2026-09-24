@@ -637,7 +637,23 @@ def api_clock():
 @app.get("/api/schedules")
 @rate_limit(max_requests=600, window=60)
 def api_schedules():
-    return jsonify({"ok": True, "schedules": db.list_future_trades()})
+    scheds = db.list_future_trades()
+    # expose live slot-retry state (attempts + seconds to next attempt) so
+    # the panel can show 'RETRYING x N' without the schedule's next_fire
+    # ever being moved (that bounce read as a duplicate countdown)
+    try:
+        retries = getattr(sys.modules[__name__], "_scheduler", None)
+        snap = retries.retry_snapshot() if retries else {}
+    except Exception:
+        snap = {}
+    out = []
+    for s in scheds:
+        r = dict(s)
+        st = snap.get(s["id"])
+        if st:
+            r["slot_retry"] = st
+        out.append(r)
+    return jsonify({"ok": True, "schedules": out})
 
 
 @app.get("/api/metrics/<int:acc>")

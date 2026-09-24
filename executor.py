@@ -93,14 +93,13 @@ TRANSIENT_RETRY_MARKERS = ("10018", "bad volume or no quote", "10020", "10021",
                            "10004", "10006", "10008", "10015", "10031",
                            "requote", "price changed", "no quotes",
                            "market closed", "no connection")
-# failed-slot retry cadence: first retries are quick (catch a brief pause),
-# then back off toward the epoch deadline (1 h) - gold's break is ~2 h at
-# most, and a slot that truly cannot fill must stop before the next epoch
-# would make the retry pointless (a retry AT the next exec second just
-# doubles that day's trade when the broker accepts it).
-RETRY_SCHED_FIRST_DELAY_S = 30.0
+# failed-slot retry cadence (IN-MEMORY ONLY - see _retry_failed_slot):
+# the operator's next_fire countdown is NEVER touched, so the panel cannot
+# show a 'retry countdown duplicate'.  Attempts start 45 s after a transient
+# failure and back off to one attempt per 5 min, giving up after 2 h.
+RETRY_SCHED_FIRST_DELAY_S = 45.0
 RETRY_SCHED_MAX_RETRY_S = 300.0    # cap per-retry delay at 5 min
-RETRY_SCHED_EPOCH_S = 3600.0       # give up 1 h after the fire second
+RETRY_SCHED_EPOCH_S = 7200.0       # abandon the slot after 2 h of failures
 # Plain-language hints for broker retcodes, appended to fired-log rows so
 # the panel explains WHY an order died instead of a bare 'retcode 10017'.
 RETCODE_HINTS = {
@@ -470,7 +469,8 @@ class FutureTradeScheduler(threading.Thread):
     SQLite lock)."""
 
     __slots__ = ('stop_flag', '_closes', '_closes_lock',
-                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts')
+                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts',
+                 '_slot_attempts', '_slot_next_try', '_catchup_done')
 
     def __init__(self):
         super().__init__(daemon=True, name="future-trade-scheduler")
@@ -483,6 +483,14 @@ class FutureTradeScheduler(threading.Thread):
         self._janitor_ts = 0.0     # last stray exec_in sweep (monotonic)
         self._heal_ts = {1: 0.0, 2: 0.0}   # last stall-heal per terminal
         self._boot_ts = time.monotonic()   # scheduler start = boot grace anchor
+        # failed-slot retries: {schedule_id: [first_attempt_monotonic, tries]}
+        # and {schedule_id: next_try_monotonic}.  Deliberately IN MEMORY:
+        # next_fire belongs to the operator's daily countdown and must never
+        # be hijacked as a retry timer (bouncing it 30 s ahead every 31 s is
+        # exactly the 'retry countdown duplicate' the panel showed).
+        self._slot_attempts: dict[int, list] = {}
+        self._slot_next_try: dict[int, float] = {}
+        self._catchup_done = False
 
     @staticmethod
     def _is_trading_day(dt_obj: dt.datetime) -> bool:
@@ -509,7 +517,12 @@ class FutureTradeScheduler(threading.Thread):
         # 5s after exec) whose opens finish past the close second must close
         # ASAP - not be pushed a full day ahead.
         fire = self._fire_dt(sch)
-        if fire:
+        # Anchor to the slot's fire time ONLY when it already passed (the
+        # normal case - registration runs after the opens).  A slot retry
+        # that lands AFTER a broker break has next_fire pointing at TOMORROW
+        # (the untouched daily countdown) - anchoring the close to that
+        # future value would schedule the auto-close a full day late.
+        if fire and fire <= now:
             fire_local = fire.astimezone()
             anchored = fire_local.replace(hour=ch, minute=cm, second=cs,
                                           microsecond=0)
@@ -709,13 +722,11 @@ class FutureTradeScheduler(threading.Thread):
                               f"rescheduled after crash: {exc}")
         else:
             # ZERO-OPEN TRANSIENT FAILURE (market closed / no quote / requote):
-            # hand the claimed slot back for an in-epoch retry instead of
-            # letting the schedule silently skip to tomorrow - that silent
-            # skip is what showed up in the panel as a 'duplicate' scheduled
-            # a day ahead (observed: XAUUSD slots failed inside gold's daily
-            # break with retcode 10018 and 'bad volume or no quote').
-            # Any open that landed, and any 'not responding' timeout (the
-            # command may have executed server-side), still consume the slot.
+            # retry the slot on the in-memory cadence WITHOUT touching
+            # next_fire - bouncing the operator's countdown was shown in the
+            # panel as a 'retry countdown duplicate'.  Any open that landed,
+            # and any 'not responding' timeout (the command may have
+            # executed server-side), still consume the slot.
             if (opened["ok"] == 0 and results is not None
                     and self._failed_open_transient(results)):
                 self._retry_failed_slot(sch, dt.datetime.now(dt.timezone.utc))
@@ -724,38 +735,102 @@ class FutureTradeScheduler(threading.Thread):
     def _failed_open_transient(results: list[tuple[bool, str]]) -> bool:
         """True when a 0-open fire hit a TRANSIENT broker condition (market
         closed / no quote / requote / no connection).  Those clear on their
-        own, so the claimed slot is handed back for a retry instead of the
-        schedule silently skipping to tomorrow (which the panel shows as a
+        own, so the slot is retried at the in-memory cadence instead of the
+        schedule silently skipping to tomorrow (which the panel showed as a
         'duplicate' suddenly scheduled a day ahead)."""
         return any(not ok and any(m in det for m in TRANSIENT_RETRY_MARKERS)
                    for ok, det in results)
 
     def _retry_failed_slot(self, sch: dict, now_utc: dt.datetime) -> None:
-        """Re-arm a fully-failed slot for an in-epoch retry.  next_fire was
-        already advanced to TOMORROW by the claim, so the panel's next-fire
-        countdown stays honest - a failed slot's retry runs invisibly at
-        exec_h:exec_m:exec_s and only ever writes fired rows; if the retry
-        opens a position its auto-close is armed normally.  Retries stop at
-        the 1 h epoch deadline (a later success would just double the day's
-        trade against the next epoch)."""
-        fire = self._fire_dt(sch)
-        anchor = fire if (fire and fire <= now_utc) else now_utc
-        elapsed = (now_utc - anchor).total_seconds()
+        """Schedule an in-memory retry for a fully-failed slot.  next_fire is
+        NOT touched - it keeps counting down to tomorrow's daily slot, so the
+        panel shows one stable schedule.  The retry itself is driven by the
+        run loop off _slot_next_try and writes only fired-log summary rows;
+        if a retry opens a position its auto-close is armed normally.  The
+        slot is abandoned after RETRY_SCHED_EPOCH_S (2 h) of failures - a
+        later success would just double the day's trade against the next
+        daily fire."""
+        sid = sch["id"]
+        st = self._slot_attempts.get(sid)
+        if st is None:
+            st = [time.monotonic(), 0]
+            self._slot_attempts[sid] = st
+        st[1] += 1
+        elapsed = time.monotonic() - st[0]
         if elapsed > RETRY_SCHED_EPOCH_S:
-            log.warning(f"schedule #{sch['id']}: slot given up after "
-                        f"{elapsed:.0f}s of transient failures - will fire "
-                        f"next epoch")
+            self._slot_attempts.pop(sid, None)
+            self._slot_next_try.pop(sid, None)
+            try:
+                db.log_fired(sid, sch["account"], sch.get("pair", ""),
+                             sch.get("side", ""), sch["lot"], "giveup", "",
+                             False,
+                             f"slot abandoned after {st[1]} attempts in "
+                             f"{elapsed / 60:.0f} min - broker kept rejecting "
+                             f"(market closed / no quote); will try again at "
+                             f"the next daily fire")
+            except Exception:
+                pass
+            log.warning(f"schedule #{sid}: slot given up after {st[1]} "
+                        f"attempts / {elapsed / 60:.0f} min - next daily fire")
             return
         delay = min(RETRY_SCHED_MAX_RETRY_S,
-                    RETRY_SCHED_FIRST_DELAY_S * (1 + elapsed / 120.0))
-        nxt = now_utc + dt.timedelta(seconds=delay)
+                    max(RETRY_SCHED_FIRST_DELAY_S, 45.0 * st[1]))
+        self._slot_next_try[sid] = time.monotonic() + delay
+        log.warning(f"schedule #{sid} {sch.get('pair')}: broker rejected the "
+                    f"opens (market closed / no quote) - retry #{st[1]} in "
+                    f"{delay:.0f} s")
+
+    def retry_snapshot(self) -> dict[int, dict]:
+        """Retry state for the panel (/api/schedules): attempts so far and
+        seconds until the next attempt (0/absent when not retrying)."""
+        now_m = time.monotonic()
+        out: dict[int, dict] = {}
+        for sid, (_t0, tries) in self._slot_attempts.items():
+            nxt = self._slot_next_try.get(sid)
+            out[sid] = {"tries": tries,
+                        "next_in": (max(0.0, round(nxt - now_m))
+                                    if nxt is not None else None)}
+        return out
+
+    def _recover_pending_slots(self) -> None:
+        """Boot catch-up: a slot that was fired-and-failed while this process
+        was DOWN has no in-memory retry state (and next_fire already points
+        at tomorrow), so it used to be lost until the next daily fire - and
+        a RESTART during the retry window silently killed the retries.  Scan
+        the fired log since the previous boot: any active schedule whose
+        latest rows are transient failures AND whose daily slot was consumed
+        (next_fire > now) gets its retry re-armed here.  Runs once, just
+        after thread start, BEFORE the first poll."""
         try:
-            db.reschedule_at(sch["id"], nxt)
-            log.warning(f"schedule #{sch['id']}: slot failed transiently "
-                        f"({sch.get('pair')}) - retrying at "
-                        f"{nxt.astimezone().strftime('%H:%M:%S')}")
+            boot_iso = (dt.datetime.now(dt.timezone.utc)
+                        - dt.timedelta(seconds=time.monotonic()))
+            since = (boot_iso - dt.timedelta(minutes=10)).isoformat(
+                timespec="seconds")
+            rows = db.fired_since(since)
         except Exception as exc:
-            log.error(f"schedule #{sch['id']}: could not arm slot retry: {exc}")
+            log.warning(f"boot catch-up scan failed (non-fatal): {exc}")
+            return
+        if not rows:
+            return
+        last_by_sched: dict[int, dict] = {}
+        for r in rows:
+            last_by_sched[r["schedule_id"]] = r
+        now = dt.datetime.now(dt.timezone.utc)
+        for sid, r in last_by_sched.items():
+            if r["ok"] or r["kind"] not in ("open", "retry-open"):
+                continue
+            if not any(m in (r["detail"] or "")
+                       for m in TRANSIENT_RETRY_MARKERS):
+                continue
+            sch = db.get_schedule(sid)
+            if not sch or not sch.get("active"):
+                continue
+            nf = self._fire_dt(sch)
+            if nf is None or nf <= now:
+                continue      # slot not consumed yet - normal path handles it
+            log.info(f"boot catch-up: schedule #{sid} had a transiently "
+                     f"failed slot before the restart - re-arming retries")
+            self._retry_failed_slot(sch, now)
 
     def _fire_inner(self, sch: dict, opened: dict | None = None) -> None:
         acc = sch["account"]
@@ -783,6 +858,26 @@ class FutureTradeScheduler(threading.Thread):
             if opened is not None:
                 opened["ok"] = ok_cnt
 
+        # SUMMARY MODE: when the WHOLE batch died to one transient broker
+        # condition (market closed / no quote), n identical failed rows per
+        # attempt are pure noise - one summary row per attempt instead, and
+        # the 500 ms in-batch retry is skipped entirely (the slot-retry
+        # cadence owns this case).
+        summary_mode = (ok_cnt == 0 and bool(results)
+                        and self._failed_open_transient(results))
+        if summary_mode:
+            try:
+                db.log_fired(sch["id"], acc, pair, side, lot, "retry-open",
+                             "", False,
+                             f"x{n} rejected - {_explain(results[0][1])} "
+                             f"(auto-retrying until the market reopens)")
+            except Exception:
+                pass
+            log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
+                     f"0/{n} opened in {fire_ms:.1f} ms (transient - slot "
+                     f"retry scheduled)")
+            return results
+
         for ok, detail in results:
             ticket = detail.split("|")[1] if ok and "|" in detail else ""
             db.log_fired(sch["id"], acc, pair, side, lot, "open",
@@ -795,14 +890,19 @@ class FutureTradeScheduler(threading.Thread):
         # HARDENING - 500 ms auto-retry on positions that FAILED to open:
         # a transient reject (freshly selected symbol without a quote yet,
         # requote, price-off) is retried after 500 ms instead of leaving
-        # the schedule short of its positions.  Hard rejects (trade
-        # disabled, market closed, unknown symbol, bad volume) are NOT
-        # retried: the broker will answer the same a second later, and the
-        # extra attempts only wrote 2 more failed rows per open into the
-        # fired log.  'not responding' is NOT retried either: a timed-out
-        # command may still have executed server-side, and re-sending it
-        # would duplicate the position (a stalled terminal is the janitor's
-        # + supervisor's job to restart).
+        # the schedule short of its positions.  BUT a broker break rejects
+        # everything in the batch with the same transient marker (10018 /
+        # no quote): retrying those 500 ms apart is pure noise - the SLOT
+        # retry cadence (45 s..5 min) owns that case, so when the whole
+        # batch failed transiently only ONE summary row is written here.
+        # Hard rejects (trade disabled, unknown symbol, invalid volume) are
+        # NEVER retried: the broker will answer the same a second later.
+        # 'not responding' is NOT retried either: a timed-out command may
+        # still have executed server-side, and re-sending it would
+        # duplicate the position (a stalled terminal is the janitor's +
+        # supervisor's job to restart).
+        first_attempt_all_transient = (
+            ok_cnt == 0 and bool(results) and self._failed_open_transient(results))
         for attempt in range(1, RETRY_MAX):
             retry_idx = [i for i, (ok, det) in enumerate(results)
                          if not ok and "not responding" not in det
@@ -840,9 +940,15 @@ class FutureTradeScheduler(threading.Thread):
         if ok_cnt > 0 or any(not ok and "not responding" in det
                              for ok, det in results):
             self._register_close(sch)
+            self._slot_attempts.pop(sch["id"], None)
+            self._slot_next_try.pop(sch["id"], None)
         else:
             log.info(f"schedule #{sch['id']} acc{acc} {pair}: no position "
                      f"opened - auto-close not armed")
+            # non-transient 0-open result (hard rejects): any pending slot
+            # retry state is obsolete - the outer layer decides what's next
+            self._slot_attempts.pop(sch["id"], None)
+            self._slot_next_try.pop(sch["id"], None)
         log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
                  f"{ok_cnt}/{n} opened in {fire_ms:.1f} ms")
         return results
@@ -939,6 +1045,53 @@ class FutureTradeScheduler(threading.Thread):
                         claimed.append(sch)
                 if claimed:
                     self._fire_concurrently(claimed)
+
+                # FAILED-SLOT RETRIES: run on their own cadence (45 s..5 min)
+                # WITHOUT touching the schedules' next_fire - a transient
+                # failure (market closed / no quote) gets re-sent here until
+                # it fills or the 2 h epoch expires.  One attempt per wake.
+                if self._slot_next_try:
+                    now_m = time.monotonic()
+                    for sid in [s for s, t in self._slot_next_try.items()
+                                if now_m >= t]:
+                        self._slot_next_try.pop(sid, None)
+                        st = self._slot_attempts.get(sid)
+                        if st is None:
+                            continue
+                        sch = next((r for r in db.list_future_trades()
+                                    if r["id"] == sid and r["active"]), None)
+                        if sch is None:
+                            self._slot_attempts.pop(sid, None)
+                            continue
+                        fired = {"ok": 0}
+                        try:
+                            results = self._fire_inner(sch, fired)
+                        except Exception as exc:
+                            log.error(f"schedule #{sid} slot retry crashed "
+                                      f"({exc}) - retry continues")
+                            self._slot_next_try[sid] = (now_m +
+                                                        RETRY_SCHED_FIRST_DELAY_S)
+                            continue
+                        if fired["ok"] > 0:
+                            log.info(f"schedule #{sid}: slot retry FILLED "
+                                     f"{fired['ok']} position(s)")
+                            self._slot_attempts.pop(sid, None)
+                        elif self._failed_open_transient(results):
+                            self._retry_failed_slot(sch,
+                                                    dt.datetime.now(dt.timezone.utc))
+                        else:
+                            log.warning(f"schedule #{sid}: slot retry hit a "
+                                        f"hard reject - abandoning retries")
+                            self._slot_attempts.pop(sid, None)
+                            self._slot_next_try.pop(sid, None)
+
+                # Boot catch-up runs once, shortly after the first poll, so
+                # slots that transiently failed before a restart resume
+                # retrying instead of being lost until the next daily fire.
+                if not self._catchup_done and (time.monotonic()
+                                               - self._boot_ts) > 5.0:
+                    self._catchup_done = True
+                    self._recover_pending_slots()
 
                 # Sweep stray exec_in commands (EA stalled past its timeout)
                 self._sweep_stale_exec_in()
