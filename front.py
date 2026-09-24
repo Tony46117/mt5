@@ -505,7 +505,7 @@ function schedModalHTML(n,edit){
   '<div class="dials" id="dials_c'+n+'"></div>'+
   '<div style="margin-top:16px;display:flex;gap:10px;align-items:center">'+
   '<button class="btn blue" id="schedSaveBtn" onclick="'+(edit?'saveScheduleEdit('+edit.id+','+n+')':'saveSchedule('+n+')')+'">'+(edit?'SAVE CHANGES':'SAVE SCHEDULE')+'</button>'+
-  '<span class="feedback" style="margin:0" id="ffb'+n+'">fires DAILY at open time, auto-closes at close time · machine clock (AM/PM)</span>'+
+  '<span class="feedback" style="margin:0" id="ffb'+n+'">fires ONCE at open time, auto-closes at close time · machine clock (AM/PM)</span>'+
   '</div>'+
   '<input type="hidden" id="dialinit'+n+'" value="'+(e.h!==undefined?e.h:eh)+'|'+(e.m!==undefined?e.m:em)+'|'+(e.s!==undefined?e.s:es)+'|'+(e.ch!==undefined?e.ch:ch)+'|'+(e.cm!==undefined?e.cm:cm)+'|'+(e.cs!==undefined?e.cs:cs)+'">'}
 /* quick arm: open = now + sec, close = now + sec + 60 (or +5 m for the 5 m chip) */
@@ -819,7 +819,7 @@ let CLOCK=null;
 fetch('/api/clock').then(r=>r.json()).then(j=>{if(j&&j.ok)CLOCK=j}).catch(()=>{});
 function tzTag(){return '<span class="mut" style="font-weight:400">UTC</span>'}
 function tzOff(){return CLOCK?CLOCK.utc_offset_minutes:-new Date().getTimezoneOffset()}
-function tzHint(){const m=tzOff();if(!m)return 'times are UTC · fires daily at exec time, auto-closes at close time';
+function tzHint(){const m=tzOff();if(!m)return 'times are UTC · fires ONCE at exec time, auto-closes at close time';
  const sg=m<0?'-':'+',a=Math.abs(m),hh=String(Math.floor(a/60)).padStart(2,'0'),mm=String(a%60).padStart(2,'0');
  return 'times are UTC - your clock is UTC'+sg+hh+':'+mm+', so 00:00 here = '+utcToLocal(0,0,0)+' local'}
 function utcToLocal(h,m,s){const t=(h*3600+m*60+s+tzOff()*60+86400*2)%86400;

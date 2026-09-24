@@ -657,8 +657,14 @@ class FutureTradeScheduler(threading.Thread):
         late = (now - nf).total_seconds()
         if late > MAX_FIRE_LATE:
             log.warning(f"schedule #{sch['id']} missed its slot by {late:.0f}s "
-                        f"> {MAX_FIRE_LATE:.0f}s - rescheduled, NOT fired late")
-            db.reschedule(sch["id"])
+                        f"> {MAX_FIRE_LATE:.0f}s - one-shot schedule done, "
+                        f"NOT fired late")
+            # ONE-SHOT: the operator scheduled THIS time only.  A missed slot
+            # used to be re-armed for tomorrow (reading as a 'duplicate' "23 h
+            # away"); now the schedule is simply done.
+            db.deactivate(sch["id"])
+            self._slot_attempts.pop(sch["id"], None)
+            self._slot_next_try.pop(sch["id"], None)
             return False
         return db.claim_schedule(sch["id"], sch["next_fire"])
 
@@ -690,12 +696,15 @@ class FutureTradeScheduler(threading.Thread):
                 log.warning(f"schedule #{sch['id']}: could not log the "
                             f"trading-day skip: {exc}")
             return
-        # CRASH-SAFE: the claim already advanced next_fire (daily slot
-        # reservation) - an exception here must NEVER swallow the fire
-        # silently (a dead fire thread once made schedules vanish: claimed,
-        # never fired, no log anywhere).  Before any open succeeded the
-        # slot is retried in 2 s; AFTER opens landed the slot is consumed
-        # (retrying would duplicate positions).
+        # CRASH-SAFE: the claim already consumed the slot - an exception here
+        # must NEVER swallow the fire silently (a dead fire thread once made
+        # schedules vanish: claimed, never fired, no log anywhere).  Before
+        # any open succeeded the slot is retried in 2 s; AFTER opens landed
+        # the slot is consumed (retrying would duplicate positions).
+        # ONE-SHOT SEMANTICS: every schedule fires ONCE, at the time the
+        # operator typed - the claim's 're-arm for tomorrow' dance (which
+        # read as a duplicate scheduled 23 h ahead) is undone the moment the
+        # slot is consumed, wherever that consumption leads.
         opened = {"ok": 0}
         try:
             results = self._fire_inner(sch, opened)
@@ -730,6 +739,12 @@ class FutureTradeScheduler(threading.Thread):
             if (opened["ok"] == 0 and results is not None
                     and self._failed_open_transient(results)):
                 self._retry_failed_slot(sch, dt.datetime.now(dt.timezone.utc))
+            else:
+                # fired-and-consumed (filled, hard-rejected or timed out):
+                # one-shot schedule is DONE - never re-arms for tomorrow
+                db.deactivate(sch["id"])
+                self._slot_attempts.pop(sch["id"], None)
+                self._slot_next_try.pop(sch["id"], None)
 
     @staticmethod
     def _failed_open_transient(results: list[tuple[bool, str]]) -> bool:
@@ -766,12 +781,13 @@ class FutureTradeScheduler(threading.Thread):
                              False,
                              f"slot abandoned after {st[1]} attempts in "
                              f"{elapsed / 60:.0f} min - broker kept rejecting "
-                             f"(market closed / no quote); will try again at "
-                             f"the next daily fire")
+                             f"(market closed / no quote)")
             except Exception:
                 pass
             log.warning(f"schedule #{sid}: slot given up after {st[1]} "
-                        f"attempts / {elapsed / 60:.0f} min - next daily fire")
+                        f"attempts / {elapsed / 60:.0f} min - one-shot done")
+            # ONE-SHOT: abandoned slot = schedule finished (nothing re-arms)
+            db.deactivate(sid)
             return
         delay = min(RETRY_SCHED_MAX_RETRY_S,
                     max(RETRY_SCHED_FIRST_DELAY_S, 45.0 * st[1]))
@@ -1076,6 +1092,8 @@ class FutureTradeScheduler(threading.Thread):
                             log.info(f"schedule #{sid}: slot retry FILLED "
                                      f"{fired['ok']} position(s)")
                             self._slot_attempts.pop(sid, None)
+                            self._slot_next_try.pop(sid, None)
+                            db.deactivate(sid)   # one-shot: done
                         elif self._failed_open_transient(results):
                             self._retry_failed_slot(sch,
                                                     dt.datetime.now(dt.timezone.utc))
@@ -1084,10 +1102,11 @@ class FutureTradeScheduler(threading.Thread):
                                         f"hard reject - abandoning retries")
                             self._slot_attempts.pop(sid, None)
                             self._slot_next_try.pop(sid, None)
+                            db.deactivate(sid)   # one-shot: done
 
                 # Boot catch-up runs once, shortly after the first poll, so
                 # slots that transiently failed before a restart resume
-                # retrying instead of being lost until the next daily fire.
+                # retrying instead of being lost.
                 if not self._catchup_done and (time.monotonic()
                                                - self._boot_ts) > 5.0:
                     self._catchup_done = True
