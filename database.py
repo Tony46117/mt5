@@ -182,6 +182,32 @@ def _migrate() -> None:
             if "ms" not in cols:
                 cur.execute("ALTER TABLE fired ADD COLUMN ms REAL")
 
+        # CLONE PROTECTION: an exact duplicate of an ACTIVE schedule (same
+        # account/pair/side/lot/positions/exec/close) must be IMPOSSIBLE,
+        # whatever path tries to create one (double POST from a stale page,
+        # two browsers, a race between the check and the write).  First
+        # demote any clones that already exist (keep the oldest id), then
+        # enforce it at the engine level with a unique partial index.
+        # Paused schedules are exempt: they can never fire, and ARMing one
+        # goes through the duplicate check in the update endpoint.
+        # NOTE: plain cur.execute here - _exec/_fetchone are defined further
+        # down and this runs at import time.
+        ph = "%s" if USE_POSTGRES else "?"
+        act = "TRUE" if USE_POSTGRES else "1"
+        grp = ("account, pair, side, lot, n_positions, "
+               "exec_h, exec_m, exec_s, close_h, close_m, close_s")
+        cur.execute(f"""UPDATE future_trades SET active={act if USE_POSTGRES else '0'}
+                     WHERE active={act} AND id NOT IN
+                     (SELECT MIN(id) FROM future_trades WHERE active={act}
+                      GROUP BY {grp})""")
+        deduped = cur.rowcount
+        where = "WHERE active" if USE_POSTGRES else "WHERE active=1"
+        cur.execute(f"""CREATE UNIQUE INDEX IF NOT EXISTS uq_future_trades_active
+                     ON future_trades ({grp}) {where}""")
+        if deduped and deduped > 0:
+            log.warning(f"schedule dedupe: demoted {deduped} clone row(s) - "
+                        f"identical active schedules are no longer allowed")
+
 
 def _init_pg() -> None:
     with _conn() as c:
@@ -320,6 +346,12 @@ def _fetchall(cur) -> list[dict]:
 # future trades
 # --------------------------------------------------------------------------
 
+class DuplicateScheduleError(Exception):
+    """Raised when a create/update would produce an exact clone of an
+    already-ACTIVE schedule.  The panel turns this into a clear 409 so the
+    operator sees WHY nothing was saved instead of finding a clone row."""
+
+
 def _local_to_utc(dt_obj: dt.datetime) -> dt.datetime:
     """Interpret a naive LOCAL wall-clock datetime and convert it to UTC.
 
@@ -349,32 +381,83 @@ def add_future_trade(account: int, pair: str, side: str, lot: float,
     now = dt.datetime.now(dt.timezone.utc)
     if fire <= now:
         fire += dt.timedelta(days=1)
-    
+
+    # CLONE GUARD: refuse to write an exact copy of a schedule that is
+    # already armed.  uq_future_trades_active (see _migrate) is the
+    # engine-level backstop for a race between this check and the INSERT.
+    dup = find_duplicate(account, pair, side, lot, n_positions,
+                         exec_h, exec_m, exec_s, close_h, close_m, close_s)
+    if dup:
+        raise DuplicateScheduleError(
+            f"schedule #{dup['id']} already does this - acc{account} {pair} "
+            f"{side.upper()} {lot} x{n_positions} at {exec_h:02d}:{exec_m:02d}:"
+            f"{exec_s:02d} (edit or PAUSE that one instead of creating a clone)")
+
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            if USE_POSTGRES:
+                _exec(cur,
+                    """INSERT INTO future_trades
+                       (account, pair, side, lot, n_positions,
+                        exec_h, exec_m, exec_s, close_h, close_m, close_s,
+                        created_at, active, next_fire)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s)
+                       RETURNING id""",
+                    (account, pair, side.upper(), lot, n_positions,
+                     exec_h, exec_m, exec_s, close_h, close_m, close_s,
+                     now, fire))
+                return int(cur.fetchone()["id"])
+            else:
+                _exec(cur,
+                    """INSERT INTO future_trades
+                       (account, pair, side, lot, n_positions,
+                        exec_h, exec_m, exec_s, close_h, close_m, close_s,
+                        created_at, active, next_fire)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+                    (account, pair, side.upper(), lot, n_positions,
+                     exec_h, exec_m, exec_s, close_h, close_m, close_s,
+                     now.isoformat(timespec="seconds"),
+                     fire.isoformat(timespec="seconds")))
+                return int(cur.lastrowid)
+    except Exception as exc:
+        if _is_unique_violation(exc):
+            raise DuplicateScheduleError(
+                "an identical active schedule already exists - none created") from exc
+        raise
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    """True for a unique-constraint failure on either backend."""
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    return "duplicate key" in str(exc) or "UNIQUE constraint" in str(exc)
+
+
+def find_duplicate(account: int, pair: str, side: str, lot: float,
+                   n_positions: int, exec_h: int, exec_m: int, exec_s: int,
+                   close_h: int, close_m: int, close_s: int,
+                   exclude_id: int | None = None) -> dict | None:
+    """An ACTIVE schedule identical in every trade-relevant field, or None.
+    Used by add_future_trade and by the create/update endpoints so a clone
+    can never be written through any path; the unique partial index
+    uq_future_trades_active is the engine-level backstop."""
+    ph = "%s" if USE_POSTGRES else "?"
+    act = "TRUE" if USE_POSTGRES else "1"
+    q = (f"SELECT * FROM future_trades WHERE active={act} "
+         f"AND account={ph} AND pair={ph} AND side={ph} AND lot={ph} "
+         f"AND n_positions={ph} AND exec_h={ph} AND exec_m={ph} "
+         f"AND exec_s={ph} AND close_h={ph} AND close_m={ph} AND close_s={ph}")
+    params: list = [account, pair, side.upper(), lot, n_positions,
+                    exec_h, exec_m, exec_s, close_h, close_m, close_s]
+    if exclude_id is not None:
+        q += f" AND id<>{ph}"
+        params.append(exclude_id)
+    q += " ORDER BY id LIMIT 1"
     with _conn() as c:
         cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, 
-                """INSERT INTO future_trades
-                   (account, pair, side, lot, n_positions,
-                    exec_h, exec_m, exec_s, close_h, close_m, close_s,
-                    created_at, active, next_fire)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s)
-                   RETURNING id""",
-                (account, pair, side.upper(), lot, n_positions,
-                 exec_h, exec_m, exec_s, close_h, close_m, close_s,
-                 now, fire))
-            return int(cur.fetchone()["id"])
-        else:
-            _exec(cur,
-                """INSERT INTO future_trades
-                   (account, pair, side, lot, n_positions,
-                    exec_h, exec_m, exec_s, close_h, close_m, close_s,
-                    created_at, active, next_fire)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
-                (account, pair, side.upper(), lot, n_positions,
-                 exec_h, exec_m, exec_s, close_h, close_m, close_s,
-                 now.isoformat(timespec="seconds"), fire.isoformat(timespec="seconds")))
-            return int(cur.lastrowid)
+        _exec(cur, q, tuple(params))
+        return _fetchone(cur)
 
 
 def due_schedules(now: float | None = None) -> list[dict]:
@@ -528,30 +611,73 @@ def update_schedule(sid: int, *, pair: str | None = None, side: str | None = Non
     cs = close_s if close_s is not None else cur_sch["close_s"]
     act = (1 if active else 0) if active is not None else cur_sch["active"]
     act = 1 if act in (1, True) else 0
-    # recompute next_fire from the (possibly new) exec time, anchored now,
-    # using the same LOCAL wall-clock semantics as add_future_trade
-    now_local = dt.datetime.now().astimezone()
-    fire = _local_to_utc(now_local.replace(hour=int(eh), minute=int(em),
-                                           second=int(es), microsecond=0))
     now = dt.datetime.now(dt.timezone.utc)
-    if fire <= now:
-        fire += dt.timedelta(days=1)
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, """UPDATE future_trades SET pair=%s, side=%s, lot=%s,
-                        n_positions=%s, exec_h=%s, exec_m=%s, exec_s=%s,
-                        close_h=%s, close_m=%s, close_s=%s, active=%s,
-                        next_fire=%s WHERE id=%s""",
-                  (p, s, l, n, eh, em, es, ch, cm, cs, bool(act), fire, sid))
-        else:
-            _exec(cur, """UPDATE future_trades SET pair=?, side=?, lot=?,
-                        n_positions=?, exec_h=?, exec_m=?, exec_s=?,
-                        close_h=?, close_m=?, close_s=?, active=?,
-                        next_fire=? WHERE id=?""",
-                  (p, s, l, n, eh, em, es, ch, cm, cs, act,
-                   fire.isoformat(timespec="seconds"), sid))
-        return cur.rowcount > 0
+
+    # CLONE GUARD: an edit that would make this schedule identical to
+    # ANOTHER active one is refused (e.g. re-arming a paused row whose
+    # identity an armed twin already holds).  The unique partial index is
+    # the engine-level backstop for a race between this check and the
+    # UPDATE.
+    if act:
+        dup = find_duplicate(account=cur_sch["account"], pair=p, side=s,
+                             lot=l, n_positions=n, exec_h=eh, exec_m=em,
+                             exec_s=es, close_h=ch, close_m=cm, close_s=cs,
+                             exclude_id=sid)
+        if dup:
+            raise DuplicateScheduleError(
+                f"schedule #{dup['id']} already does this - acc"
+                f"{cur_sch['account']} {p} {s} {l} x{n} at "
+                f"{eh:02d}:{em:02d}:{es:02d} (edit or PAUSE that one instead)")
+
+    # NEXT_FIRE POLICY: only re-anchor when the exec time actually changed.
+    # Every save used to recompute next_fire anchored at NOW, so touching an
+    # UNFIRED schedule (e.g. a lot tweak minutes before the slot) silently
+    # jumped 'in 2 m' to 'tomorrow' - the panel then showed two slots for the
+    # same daily trade and read like a clone had been created.
+    same_exec = (int(eh) == int(cur_sch["exec_h"])
+                 and int(em) == int(cur_sch["exec_m"])
+                 and int(es) == int(cur_sch["exec_s"]))
+    cur_fire = cur_sch.get("next_fire")
+    if isinstance(cur_fire, str):
+        try:
+            cur_fire = dt.datetime.fromisoformat(cur_fire)
+        except ValueError:
+            cur_fire = None
+    if cur_fire is not None and getattr(cur_fire, "tzinfo", None) is None:
+        cur_fire = cur_fire.replace(tzinfo=dt.timezone.utc)
+    if same_exec and cur_fire is not None and cur_fire > now:
+        fire = cur_fire               # pre-fire edit: keep the armed countdown
+    else:
+        # exec time changed, or the slot already fired/passed: re-arm from
+        # the (possibly new) exec time anchored now, using the same LOCAL
+        # wall-clock semantics as add_future_trade
+        now_local = dt.datetime.now().astimezone()
+        fire = _local_to_utc(now_local.replace(hour=int(eh), minute=int(em),
+                                               second=int(es), microsecond=0))
+        if fire <= now:
+            fire += dt.timedelta(days=1)
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            if USE_POSTGRES:
+                _exec(cur, """UPDATE future_trades SET pair=%s, side=%s, lot=%s,
+                            n_positions=%s, exec_h=%s, exec_m=%s, exec_s=%s,
+                            close_h=%s, close_m=%s, close_s=%s, active=%s,
+                            next_fire=%s WHERE id=%s""",
+                      (p, s, l, n, eh, em, es, ch, cm, cs, bool(act), fire, sid))
+            else:
+                _exec(cur, """UPDATE future_trades SET pair=?, side=?, lot=?,
+                            n_positions=?, exec_h=?, exec_m=?, exec_s=?,
+                            close_h=?, close_m=?, close_s=?, active=?,
+                            next_fire=? WHERE id=?""",
+                      (p, s, l, n, eh, em, es, ch, cm, cs, act,
+                       fire.isoformat(timespec="seconds"), sid))
+            return cur.rowcount > 0
+    except Exception as exc:
+        if _is_unique_violation(exc):
+            raise DuplicateScheduleError(
+                "another active schedule already does this - none changed") from exc
+        raise
 
 
 def delete_schedule(sid: int) -> bool:

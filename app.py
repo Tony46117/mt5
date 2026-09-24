@@ -473,7 +473,14 @@ def api_schedule():
             return _fail("time out of range")
     # H/M/S are LOCAL WALL CLOCK (the operator reads the panel clock on the
     # same wall) - database.add_future_trade converts to UTC for storage.
-    sid = db.add_future_trade(account, pair, side, lot, n, eh, em, es, ch, cm, cs)
+    # A request that would create an exact clone of an armed schedule is
+    # refused (double POST from a stale page, two browsers, ...): the panel
+    # says WHY instead of the operator later finding two identical rows.
+    try:
+        sid = db.add_future_trade(account, pair, side, lot, n, eh, em, es,
+                                  ch, cm, cs)
+    except db.DuplicateScheduleError as exc:
+        return _fail(str(exc), code=409)
     sch = db.get_schedule(sid)
     nf = sch["next_fire"] if sch else "?"
     # show the operator their OWN wall-clock fire time, not the UTC storage
@@ -573,7 +580,12 @@ def api_schedule_update():
                              f"(trade_mode=0, retcode 10017)")
         except Exception:
             pass
-    if not db.update_schedule(sid, **updates):
+    try:
+        changed = db.update_schedule(sid, **updates)
+    except db.DuplicateScheduleError as exc:
+        # e.g. ARMing a paused schedule that is an exact clone of an armed one
+        return _fail(str(exc), code=409)
+    if not changed:
         return _fail("update failed")
     sch = db.get_schedule(sid)
     nf = sch["next_fire"] if sch else "?"

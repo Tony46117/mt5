@@ -563,6 +563,11 @@ async function saveSchedule(n){if(SCHED_SAVING)return;SCHED_SAVING=true;
   const when=(j.next_fire_local||j.next_fire)+(today?'':' TOMORROW');
   f.className='feedback ok';f.textContent='saved #'+j.id+' - fires '+when;
   toast('schedule #'+j.id+' saved - fires '+when,today);
+  // release the guard BEFORE the 1.5 s close delay: a user clicking SAVE
+  // again in that window must get the server's 409 'already exists' (and
+  // the button enabled), not a silently swallowed click (old code reset
+  // the flag only in catch, so the second click did literally nothing).
+  SCHED_SAVING=false;setSaveBusy(false);
   setTimeout(closeModal,1500);refresh()}catch(e){SCHED_SAVING=false;setSaveBusy(false);
   f.className='feedback err';f.textContent=e.message}}
 async function saveScheduleEdit(sid,n){if(SCHED_SAVING)return;SCHED_SAVING=true;
@@ -574,6 +579,7 @@ async function saveScheduleEdit(sid,n){if(SCHED_SAVING)return;SCHED_SAVING=true;
   close:[hour24('cH'+n),dialGet('cM'+n),dialGet('cS'+n)]});
   f.className='feedback ok';f.textContent='updated #'+sid+' - next fire '+(j.next_fire_local||j.next_fire);
   toast('schedule #'+sid+' adjusted - next fire '+(j.next_fire_local||j.next_fire),true);
+  SCHED_SAVING=false;setSaveBusy(false);   // see saveSchedule
   setTimeout(closeModal,1200);refresh()}catch(e){SCHED_SAVING=false;setSaveBusy(false);
   f.className='feedback err';f.textContent=e.message}}
 """
@@ -1074,11 +1080,11 @@ function setFilter(f){FILTER=f;
  renderSched()}
 function renderKpis(){
   const active=(S||[]).filter(s=>s.active);
-  const fired=(F||[]).length;
-  const ok=(F||[]).filter(r=>r.ok).length;
+  const fired=fresh24(F).length;
+  const ok=fresh24(F).filter(r=>r.ok).length;
   const cards=[
    {k:'ACTIVE SCHEDULES',v:String(active.length),c:'',sub:'armed & counting down'},
-   {k:'FIRED TOTAL',v:String(fired),c:'',sub:'in log'},
+   {k:'FIRED TOTAL',v:String(fired),c:'',sub:'executions in past 24 h'},
    {k:'FIRED OK',v:String(ok),c:'up',sub:'successful executions'},
    {k:'FIRED ERR',v:String(fired-ok),c:fired>ok?'down':'',sub:'failed executions'},
   ];
@@ -1093,6 +1099,7 @@ function renderSched(){
   let rows=S||[];
   if(FILTER==='ACTIVE')rows=rows.filter(s=>s.active);
   if(FILTER==='OFF')rows=rows.filter(s=>!s.active);
+  rows=rows.slice().sort((a,b)=>String(a.next_fire||'').localeCompare(String(b.next_fire||'')));
   if(!rows.length){$id('schedTbl').innerHTML='<div class="empty">'+
    (FILTER==='ACTIVE'?'no active schedules - create one with + NEW SCHEDULE (or arm one +30 s away)':'no schedules here')+'</div>';return}
   $id('schedTbl').innerHTML='<table><tr><th>#</th><th>account</th><th>pair</th><th>side</th>'+
@@ -1120,11 +1127,31 @@ function renderFired(){
   const btn = $id('seeAllBtn');
   if(btn) btn.textContent = FIRED_EXPANDED ? 'SHOW LESS'
     : (all.length>FIRED_PREVIEW ? 'SEE ALL (' + (all.length - FIRED_PREVIEW) + ' more)' : 'SEE ALL');
+  /* COLLAPSE N-TUPLE FIRES: a schedule of n positions writes n fired rows
+     in the same second - same schedule, pair, side, price - and that block
+     read exactly like a duplicate schedule had fired.  Collapse every run
+     of identical rows (OK and ERR alike) into ONE row with a 'x N' badge,
+     so a 4-position schedule shows a single 4-position fire.  The detail
+     string embeds the per-position ticket (price|ticket|volume), so the
+     ticket is stripped before comparing - that is the ONLY way OK rows of
+     one batch differ. */
+  const collapsed=[];
+  const stripTicket=(v,t)=>t?String(v||'').split(String(t)).join(''):String(v||'');
+  for(const r of all){
+   const last=collapsed[collapsed.length-1];
+   if(last && last.schedule_id===r.schedule_id &&
+      last.account===r.account && last.kind===r.kind &&
+      last.pair===r.pair && last.side===r.side &&
+      last.ok===r.ok &&
+      String(last.at).slice(0,16)===String(r.at).slice(0,16) &&
+      stripTicket(last.detail,last.ticket)===stripTicket(r.detail,r.ticket)){
+    last._n=(last._n||1)+1}
+   else collapsed.push(r)}
   $id('firedTbl').innerHTML='<table><tr><th>at</th><th>schedule</th><th>account</th><th>kind</th>'+
    '<th>pair</th><th>side</th><th class="num">lot</th><th>ticket</th><th>result</th>'+
    '<th>detail</th><th class="num">ms</th></tr>'+
-   show.map(r=>'<tr><td class="mut" style="font-size:11px">'+esc(String(r.at).slice(11,19))+'</td>'+
-    '<td class="mut">#'+r.schedule_id+'</td><td>acc'+r.account+'</td>'+
+   collapsed.map(r=>'<tr><td class="mut" style="font-size:11px">'+esc(String(r.at).slice(11,19))+'</td>'+
+    '<td class="mut">#'+r.schedule_id+(r._n?' <span class="down">x'+r._n+'</span>':'')+'</td><td>acc'+r.account+'</td>'+
     '<td>'+esc(r.kind)+'</td><td class="mono">'+esc(r.pair)+'</td>'+
     '<td><span class="side '+esc(r.side)+'">'+esc(r.side)+'</span></td>'+
     '<td class="num">'+fmt(r.lot,2)+'</td><td class="mono mut">'+esc(r.ticket||'-')+'</td>'+
