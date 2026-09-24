@@ -482,20 +482,34 @@ class Supervisor:
                         self.log(f"{RED}heal of terminal {inst} failed{RESET}")
                     st.heal_fails += 1
 
-            # SYNCHRONIZATION-DEAD detection: the feed is live but the EA
-            # header has NO account data (currency/balance empty) - the
-            # terminal never synchronized with the broker (rejected or
-            # absent credentials, server unreachable).  Feed-age-only
-            # healing called this state 'healthy' forever and the account
-            # card showed all zeros.  Heal exactly like a stale feed.
-            if b == "live" and st.header and not st.header.get("currency"):
+            # SYNCHRONIZATION-DEAD / LOGGED-OUT detection: the feed is live
+            # but the EA header has NO account data (currency empty - the
+            # terminal never synchronized with the broker) or reports MT5's
+            # LOGGED-OUT marker (login 0) while the session expects a real
+            # account - the login dropped and MT5 kept writing its feed.
+            # Feed-age-only health called both states 'healthy' forever:
+            # a terminal showing login 0 + 0.00 balances was rendered LIVE
+            # (13 ms feed!) and never healed, while its healthy sibling got
+            # restarted for a merely stale feed.  Heal exactly like a stale
+            # feed, back into the session account's credentials.
+            # header_for() is mtime-cached in spot.py - a live read here is
+            # cheap and keeps detection from lagging a whole poll behind.
+            h_now = header_for(inst)
+            if h_now:
+                st.header = h_now
+            h_login = (st.header or {}).get("login", "")
+            no_identity = ((not (st.header or {}).get("currency"))
+                           or h_login in ("", "0"))
+            if (b == "live" and st.header and no_identity
+                    and expected not in ("", "?")):
                 if st.sync_dead_since == 0.0:
                     st.sync_dead_since = time.monotonic()
                 if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
                         and time.monotonic() - st.last_start > GRACE_S
                         and time.monotonic() - st.last_heal > COOLDOWN_S):
-                    self.log(f"{YELLOW}terminal {inst} feed live but account never "
-                             f"synchronized - restarting into session credentials{RESET}")
+                    self.log(f"{YELLOW}terminal {inst} feed live but LOGGED OUT "
+                             f"(login 0) / never synchronized - restarting into "
+                             f"session account {expected}{RESET}")
                     st.last_heal = time.monotonic()
                     if restart_terminal(inst):
                         st.last_start = time.monotonic()
@@ -669,12 +683,17 @@ class Supervisor:
             a = accs.get(inst, {})
             exp = a.get("login", "?")
             h = st.header if st.header else header_for(inst)
-            login = h.get("login", "") or "-"
-            ok = (login == exp)
+            raw_login = h.get("login", "")
+            logged_out = raw_login in ("", "0")     # MT5's logged-out marker
+            login = "-" if logged_out else raw_login
+            ok = (not logged_out and login == exp)
             age = feed_age(inst)
             age_s = f"{age*1000:.0f} ms" if age < 5 else f"{age:.0f} s"
-            bal = h.get("balance", "-")
-            eq = h.get("equity", "-")
+            # a logged-out terminal has NO real account data: MT5 writes
+            # 0.00 balances into the header - presenting those as the
+            # account state hid the logged-out condition behind fake zeros
+            bal = "-" if logged_out else h.get("balance", "-")
+            eq = "-" if logged_out else h.get("equity", "-")
             algo = h.get("trade_allowed", "")   # EA v1.50+ header diagnostic
             if algo == "1":
                 algo_s = f"{GREEN}ALGO ON {RESET}"
@@ -682,8 +701,15 @@ class Supervisor:
                 algo_s = f"{RED}ALGO OFF{RESET}"
             else:
                 algo_s = f"{DIM}ALGO ?  {RESET}"
+            b = st.bucket()
+            # 'LIVE' describes the FEED - but a feed that keeps flowing while
+            # nobody is logged in is NOT a healthy terminal, so the status
+            # column says LOGOUT instead (and the poll loop heals it)
+            btxt = "LOGOUT" if (logged_out and b == "live" and exp not in ("", "?")) \
+                else b.upper()
+            bcol = RED if btxt == "LOGOUT" else st.color()
             out.append(
-                f"  T{inst}  {st.color()}{st.bucket().upper():<5}{RESET}  "
+                f"  T{inst}  {bcol}{btxt:<6}{RESET}  "
                 f"feed {age_s:>8}  {algo_s}  "
                 f"login {login:<11}"
                 f"{'(ok)' if ok else f'{RED}(want {exp}){RESET}'}  "

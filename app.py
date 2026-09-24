@@ -37,7 +37,7 @@ from config import CONFIG, setup_logging, validate_config
 import front
 import database as db
 from info import snapshot
-from spot import read_spots, feed_age, term_running
+from spot import read_spots, feed_age, term_running, read_header
 from executor import start_scheduler, sender_for
 from monitor import read_positions, account_info
 import metrics
@@ -209,10 +209,24 @@ def _system() -> dict:
     }
     for inst in (1, 2):
         age = feed_age(inst)
+        # a live feed with a logged-out EA header (login 0/empty) is NOT a
+        # healthy terminal: surface it so the pill reads LOGIN DROPPED
+        # instead of riding the feed's freshness
+        try:
+            # identity-aware header (same path the account cards use)
+            from monitor import read_accounts, pick_terminal
+            login = read_accounts().get(inst, {}).get("login", "")
+            term = pick_terminal(login) if login else None
+            h = read_header(term["trades_path"]) if term else {}
+        except Exception:
+            h = {}
+        logged_in = bool(str(h.get("login", "")) not in ("", "0"))
         sys_info[f"t{inst}"] = {
             "running": term_running(inst),
             "age": age,
-            "stale": age > CONFIG.bridge_stale_seconds
+            "stale": age > CONFIG.bridge_stale_seconds,
+            "logout": (not logged_in and not (age > CONFIG.bridge_stale_seconds)),
+            "logged_in": logged_in,
         }
     _sys_cache = sys_info
     _sys_cache_ts = now

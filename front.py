@@ -361,11 +361,18 @@ function linkOffline(){
   $id('sysLbl').textContent='OFFLINE'}
  const d=$id('sysdot');if(d)d.className='dot off'}
 function liveLink(sys){
- const ok=(sys.t1&&sys.t1.running)&&(sys.t2&&sys.t2.running);
+ /* a terminal whose feed runs but which reports MT5's LOGGED-OUT marker
+    (login 0) is NOT healthy: it must degrade the pill and show LOGOUT,
+    not ride on the feed's 'LIVE' (login 0 once showed LIVE 13 ms while
+    the balances read 0.00 and nothing could trade) */
+ const t1=sys.t1||{},t2=sys.t2||{};
+ const logout1=t1.logout,logout2=t2.logout;
+ const ok=(t1.running&&(t1.logged_in!==false))&&(t2.running&&(t2.logged_in!==false));
  FAILS=0;                                 // a good response resets the streak
  const pill=$id('sysPill');
  if(pill){pill.className='status-pill'+(ok?'':' bad');
-  $id('sysLbl').textContent=ok?'LINK LIVE':'LINK DEGRADED'}
+  $id('sysLbl').textContent=ok?'LINK LIVE':
+   ((logout1||logout2)?'LOGIN DROPPED':'LINK DEGRADED')}
  const d=$id('sysdot');if(d)d.className=ok?'dot':'dot off';
  return ok}
 /* ring gauge: pct 0..100, returns svg */
@@ -671,10 +678,12 @@ function card(n){const a=S.accounts[n]||{};const st=a.stats||{};
    '<span class="sub">terminal offline</span></div>'+
    '<div class="empty">waiting for the MT5 bridge...<br><span class="mut">'+
    'start bridge.py, then this card fills in live</span></div>'}
+ const out0=String(a.login||'')===''||String(a.login||'')==='0';
  return '<div class="acc-head">'+
-  '<span class="'+dot(a.live)+'"></span>'+
+  '<span class="'+dot(a.live&&!out0)+'"></span>'+
   '<span class="name">ACCOUNT '+n+'</span>'+
-  '<span class="sub mono">'+esc(a.login||'-')+'</span>'+
+  (out0?'<span class="sub" style="color:#ff5c5c;font-weight:600">NOT LOGGED IN</span>'
+       :'<span class="sub mono">'+esc(a.login||'-')+'</span>')+
   '<span class="sub">'+esc(a.server||'-')+'</span>'+
   '<span class="sub">'+esc(a.broker||'-')+'</span>'+
   '<span class="sub">'+esc(a.trade_mode||'').toUpperCase()+'</span>'+
@@ -944,7 +953,9 @@ function posTable(n){const a=(P.accounts||{})[n]||{};const ps=a.positions||[];
   '</table>'}
 function updAcc(n){const a=(P.accounts||{})[n]||{};
  if(!$id('live'+n))return;                     // panel not built yet
- $id('live'+n).className=dot(a.live,num(a.age_s)>0&&num(a.age_s)<60);
+ /* login 0 = MT5's logged-out marker: show LOGOUT, never fake LIVE + 0.00 */
+ const loggedOut=(String(a.login||'')===''||String(a.login||'')==='0');
+ $id('live'+n).className=dot(a.live&&!loggedOut,num(a.age_s)>0&&num(a.age_s)<60);
  $id('login'+n).textContent=a.login||'-';
  $id('server'+n).textContent=a.server||'-';
  $id('broker'+n).textContent=a.broker||'-';
