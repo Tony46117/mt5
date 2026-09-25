@@ -1,19 +1,4 @@
 #!/usr/bin/env python3.12
-"""metrics.py - trading performance for the web dashboard.
-
-A background observer watches both terminals' trades.csv (0.5 s poll):
-  * when a position ticket disappears it is recorded as a CLOSED trade
-    with its last known P/L + swap (works for manual and bot trades);
-  * balance/equity are sampled every 10 s into a per-account equity
-    curve (self-updating, shown as a chart in the dashboard).
-
-Everything is persisted through database.py's kv store, so the numbers
-survive restarts.  Consumers (front.py / app.py) call:
-    stats(n)         -> trades taken, wins/losses, winrate, net, pairs
-    equity_curve(n)  -> [[epoch_s, balance, equity], ...] downsampled
-    pairs_traded(n)  -> {symbol: count}
-Run directly:  python metrics.py        # print the stats tables once
-"""
 
 from __future__ import annotations
 
@@ -31,11 +16,10 @@ import database as db
 
 log = setup_logging(__name__)
 
-POLL = CONFIG.metrics_poll_seconds          # position watch poll (catches every close)
-SAMPLE_EVERY = CONFIG.metrics_sample_seconds   # equity-curve sampling (s)
-MAX_TRADES = CONFIG.max_closed_trades   # closed-trade history cap per account
-MAX_SAMPLES = CONFIG.max_equity_samples  # 12 h of 10 s samples
-
+POLL = CONFIG.metrics_poll_seconds
+SAMPLE_EVERY = CONFIG.metrics_sample_seconds
+MAX_TRADES = CONFIG.max_closed_trades
+MAX_SAMPLES = CONFIG.max_equity_samples
 
 def f(v) -> float:
     try:
@@ -43,23 +27,12 @@ def f(v) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
-# --------------------------------------------------------------------------
-# storage (through database.kv)
-# --------------------------------------------------------------------------
-
 def _load(key: str, default):
     v = db.kv_get(key)
     return v if v is not None else default
 
-
 def _save(key: str, value) -> None:
     db.kv_set(key, value)
-
-
-# --------------------------------------------------------------------------
-# observer
-# --------------------------------------------------------------------------
 
 class MetricsObserver(threading.Thread):
     def __init__(self):
@@ -68,7 +41,6 @@ class MetricsObserver(threading.Thread):
         self._open: dict[int, dict[str, dict]] = {1: {}, 2: {}}
         self._last_sample = 0.0
 
-    # -- read one account's open positions --------------------------------
     def _read(self, inst: int) -> tuple[dict, list[dict]]:
         login = read_accounts().get(inst, {}).get("login", "")
         term = pick_terminal(login) if login else None
@@ -94,7 +66,6 @@ class MetricsObserver(threading.Thread):
                              "time": parts[9]})
         return head, rows
 
-    # -- one poll -----------------------------------------------------------
     def _poll_account(self, inst: int) -> None:
         head, rows = self._read(inst)
         key = f"closed_trades_{inst}"
@@ -103,12 +74,10 @@ class MetricsObserver(threading.Thread):
         seen: dict[str, dict] = {}
         for r in rows:
             seen[r["ticket"]] = r
-            # refresh last-known P/L for still-open tickets
             if r["ticket"] in self._open[inst]:
                 self._open[inst][r["ticket"]].update(
                     pl=f(r["pl"]), swap=f(r["swap"]))
 
-        # vanished tickets = closed trades
         gone = [t for t in self._open[inst] if t not in seen]
         now = dt.datetime.now().isoformat(timespec="seconds")
         for t in gone:
@@ -121,14 +90,12 @@ class MetricsObserver(threading.Thread):
         if gone:
             _save(key, closed[-MAX_TRADES:])
 
-        # newly opened tickets
         for t, r in seen.items():
             if t not in self._open[inst]:
                 self._open[inst][t] = {"symbol": r["symbol"], "side": r["side"],
                                        "lot": f(r["volume"]), "pl": f(r["pl"]),
                                        "swap": f(r["swap"]), "time": r["time"]}
 
-        # equity-curve sampling
         if head and time.monotonic() - self._last_sample >= SAMPLE_EVERY:
             self._last_sample = time.monotonic()
             curve = _load(f"equity_curve_{inst}", [])
@@ -147,14 +114,8 @@ class MetricsObserver(threading.Thread):
                 log.error(f"metrics error: {exc}")
             self.stop_flag.wait(POLL)
 
-
-# --------------------------------------------------------------------------
-# public API
-# --------------------------------------------------------------------------
-
 def closed_trades(account: int) -> list[dict]:
     return _load(f"closed_trades_{account}", [])
-
 
 def open_trades(account: int) -> list[dict]:
     obs = _observer
@@ -162,9 +123,7 @@ def open_trades(account: int) -> list[dict]:
         return list(obs._open.get(account, {}).values())
     return []
 
-
 def pairs_traded(account: int) -> dict[str, int]:
-    """{symbol: trade count} over closed + currently open trades."""
     counts: dict[str, int] = {}
     for t in closed_trades(account):
         counts[t["symbol"]] = counts.get(t["symbol"], 0) + 1
@@ -172,9 +131,7 @@ def pairs_traded(account: int) -> dict[str, int]:
         counts[t["symbol"]] = counts.get(t["symbol"], 0) + 1
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
-
 def stats(account: int) -> dict:
-    """Dashboard card for one account."""
     closed = closed_trades(account)
     opened = open_trades(account)
     wins = sum(1 for t in closed if t["net"] > 0)
@@ -192,24 +149,18 @@ def stats(account: int) -> dict:
         "pairs": pairs_traded(account),
     }
 
-
 def equity_curve(account: int, max_points: int = 240) -> list[list]:
-    """[[epoch_s, balance, equity], ...] downsampled to max_points."""
     curve = _load(f"equity_curve_{account}", [])
     if len(curve) <= max_points:
         return curve
     step = len(curve) / max_points
     return [curve[int(i * step)] for i in range(max_points)]
 
-
 _observer: MetricsObserver | None = None
 
-
 def is_running() -> bool:
-    """Check if the metrics observer is running."""
     global _observer
     return _observer is not None and _observer.is_alive()
-
 
 def start_observer() -> MetricsObserver:
     global _observer
@@ -218,9 +169,7 @@ def start_observer() -> MetricsObserver:
         _observer.start()
     return _observer
 
-
 def stop_observer() -> None:
-    """Gracefully stop the metrics observer."""
     global _observer
     if _observer is not None and _observer.is_alive():
         log.info("stopping metrics observer...")
@@ -228,11 +177,6 @@ def stop_observer() -> None:
         _observer.join(timeout=5.0)
         log.info("metrics observer stopped")
     _observer = None
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
 
 def main() -> int:
     import signal
@@ -278,7 +222,6 @@ def main() -> int:
     finally:
         stop_observer()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1,16 +1,4 @@
-# docker-compose.override.podman.yml - rootless podman specifics.
-#
-#   podman-compose -f docker-compose.yml -f docker-compose.override.podman.yml up --build
-#
-# run.sh picks this up automatically when it detects podman on Linux.
-# Why the overrides:
-#   * ipc: host           - wine's esync/futex sync breaks on a private IPC
-#                           namespace with small semaphore limits.
-#   * label:disable       - the image ships a prebuilt wineprefix whose labels
-#                           we cannot relabel read-only; /data still works.
-# The default user mapping is kept (container mt5=1000; host-side files land
-# in your subuid range) - it is CONSISTENT between every boot and between
-# docker and podman, so /data never ends up with mixed owners.
+
 services:
   mt5-bridge:
     ipc: host

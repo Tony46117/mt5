@@ -1,39 +1,4 @@
-//+------------------------------------------------------------------+
-//| SpotDump.mq5 - live bridge between MT5 and the python scripts    |
-//| Attach as an Expert Advisor to any chart (one time). It writes   |
-//| MQL5/Files/spots.csv   (bid/ask for EVERY symbol with a quote)   |
-//| MQL5/Files/trades.csv  (all open positions + account header row) |
-//| MQL5/Files/candles.csv (last 120 M1 OHLC bars of EURUSD+GBPUSD)  |
-//| every 50 ms.                                                     |
-//|                                                                  |
-//| ORDER CHANNEL (v1.40) - python can now TRADE through the bridge: |
-//|   python drops ONE FILE per command into MQL5/Files:             |
-//|       exec_in.<id>.cmd                                           |
-//|   whose content is a TAB separated line:                         |
-//|       id<TAB>OPEN<TAB>SYMBOL<TAB>BUY|SELL<TAB>volume             |
-//|            [TAB sl TAB tp TAB magic TAB comment]                 |
-//|       id<TAB>CLOSE<TAB>ticket                                    |
-//|       id<TAB>CLOSEALL<TAB>SYMBOL|ALL                             |
-//|       id<TAB>PING                                                |
-//|   The EA reads the OLDEST command file, DELETES it (consume) and |
-//|   appends a result line to exec_out.csv (raw bytes):             |
-//|       id<TAB>OK|ERR<TAB>detail (ticket for OPEN, count for CLOSE)|
-//|   exec_out.csv keeps roughly the newest 4 KB of results.  A file |
-//|   rename/delete protocol makes lost or duplicated orders         |
-//|   impossible on a 50 ms polling loop.                            |
-//|                                                                  |
-//| BROKER PROBE (v1.60) - PROBE command:                            |
-//|       id<TAB>PROBE<TAB>SYMBOL                                    |
-//|   answers a machine-readable broker/symbol capability line:      |
-//|       id<TAB>OK<TAB>sym|digits|filling_flags|trade_exemode|      |
-//|             trade_mode|order_mode|stops_level|freeze_level|      |
-//|             vol_min|vol_max|vol_step|spread_pts                 |
-//|   broker_prober.py turns this into the best order filling method |
-//|   so trades never get rejected (retcode 10030).                  |
-//|   Additionally every OrderSend now FALLS BACK through the filling|
-//|   modes when the server rejects with 10030 (unsupported filling) |
-//|   and caches the proven mode per symbol.                         |                |
-//+------------------------------------------------------------------+
+
 #property copyright "spot bridge"
 #property version   "1.70"
 
@@ -42,34 +7,22 @@
 #define CANDLE_FILE  "candles.csv"
 #define EXEC_IN      "exec_in.csv"
 #define EXEC_OUT     "exec_out.csv"
-#define EXEC_NEXT    "exec_next.txt"   // pointer: filename of newest queued cmd
-#define SPOT_DUMP_MS 50                // spots.csv rewrite interval (display feed)
-#define ASYNC_MAX    64                // outstanding async orders tracked
+#define EXEC_NEXT    "exec_next.txt"
+#define SPOT_DUMP_MS 50
+#define ASYNC_MAX    64
 
-int        g_interval_ms = 1; // FIXED (non-input): charts can restore stale
-                           // saved inputs; a plain global guarantees the
-                           // 1 ms tick + sub-5 ms order pickup everywhere
+int        g_interval_ms = 1;
 
-// ---------------- async order pipeline (v1.70) ----------------
-// OrderSend() BLOCKS ~400-700 ms per order through this broker.  A batch
-// of n opens (or a CLOSEALL over n positions) executed serially in
-// ExecuteLine() held the timer thread n x 600 ms, so '4x every 5 s' took
-// 2.5 s of channel time and a big CLOSEALL starved every later command.
-// Orders are now sent with OrderSendAsync() - the request returns in <1 ms
-// and the broker confirms each deal through OnTradeTransaction() in
-// PARALLEL server-side.  One OPEN command = one async request, so a
-// 4-position batch lands in ~the time of one.  CLOSE/CLOSEALL build their
-// whole request list first, then fire every close back to back.
 struct AsyncReq
   {
-   ulong      req_id;      // request id (MqlTradeResult.request_id from the send)
-   string     cmd_id;      // exec_out.csv row to complete
-   bool       is_open;     // OPEN result format (price|ticket|vol) vs CLOSE
+   ulong      req_id;
+   string     cmd_id;
+   bool       is_open;
    string     sym;
    double     vol;
    int        digits;
-   long       fill;        // filling mode used (for the 10030 one-shot retry)
-   MqlTradeRequest req;    // original request (10030 retry re-sends it)
+   long       fill;
+   MqlTradeRequest req;
   };
 AsyncReq  g_async[ASYNC_MAX];
 int       g_nasync = 0;
@@ -78,13 +31,13 @@ void AsyncTrack(ulong req_id, string cmd_id, bool is_open,
                 string sym, double vol, int digits, long fill,
                 MqlTradeRequest &req)
   {
-   for(int i = 0; i < g_nasync; i++)          // update on re-assert
+   for(int i = 0; i < g_nasync; i++)
       if(g_async[i].req_id == req_id)
         {
          g_async[i].fill = fill;
          return;
         }
-   if(g_nasync >= ASYNC_MAX)                  // drop oldest tracking slot
+   if(g_nasync >= ASYNC_MAX)
      {
       for(int i = 1; i < ASYNC_MAX; i++) g_async[i - 1] = g_async[i];
       g_nasync = ASYNC_MAX - 1;
@@ -126,15 +79,12 @@ void AsyncReport(int i, bool ok, string detail)
   }
 #define IntervalMs g_interval_ms
 
-string      g_sym_names[];    // dynamic Market Watch snapshot
+string      g_sym_names[];
 int         g_nsymbols = 0;
-long        g_last_rescan_min = 0;   // last Market Watch rescan (minute)
-long        g_last_candle_min = 0;   // last candles.csv rewrite (minute)
-const long  MAGIC_PY = 777001;       // magic for python-placed orders
+long        g_last_rescan_min = 0;
+long        g_last_candle_min = 0;
+const long  MAGIC_PY = 777001;
 
-// per-symbol filling mode proven by a successful OrderSend (or 10030
-// fallback); the prober's answer is pre-seeded here so orders never even
-// try a mode the broker rejects.
 #define MAX_PROVEN 64
 string                       g_proven_sym[MAX_PROVEN];
 ENUM_ORDER_TYPE_FILLING      g_proven_fill[MAX_PROVEN];
@@ -157,11 +107,9 @@ ENUM_ORDER_TYPE_FILLING ProvenFill(string sym)
    for(int i = 0; i < g_nproven; i++)
       if(g_proven_sym[i] == sym)
          return(g_proven_fill[i]);
-   return((ENUM_ORDER_TYPE_FILLING)0);   // unset
+   return((ENUM_ORDER_TYPE_FILLING)0);
   }
 
-// pick a filling mode the symbol actually supports (retcode 10030 otherwise):
-// brokers allow FOK and/or IOC per symbol; RETURN for exchange-style.
 ENUM_ORDER_TYPE_FILLING FillingFor(string sym)
   {
    long fill = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
@@ -172,24 +120,13 @@ ENUM_ORDER_TYPE_FILLING FillingFor(string sym)
    return(ORDER_FILLING_RETURN);
   }
 
-// async pipeline: broker-side confirmations complete the exec_out rows here
-// (runs on MT5's own event thread - AppendOut is safe, OrderSend inside a
-// transaction handler is NOT, so a 10030 retry re-queues a fresh request
-// instead of a sync resend).
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
   {
    if(trans.type != TRADE_TRANSACTION_REQUEST)
       return;
-   // CORRELATION (MQL5 docs, OnTradeTransaction): for a
-   // TRADE_TRANSACTION_REQUEST the result.request_id field carries the
-   // request identifier that matches the MqlTradeResult.request_id returned
-   // by the original OrderSendAsync call.  Order tickets are NOT usable for
-   // this - they are assigned by the server later (and are 0 in market
-   // requests), so matching on them silently dropped every async result:
-   // python waited its full timeout and reported 'terminal not responding'
-   // while the trade had actually executed.
+
    int i = AsyncIndex(result.request_id);
    if(i < 0)
       return;
@@ -198,7 +135,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       result.retcode == TRADE_RETCODE_DONE_PARTIAL)
      {
       ProvenFillRemember(g_async[i].sym, (ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
-      // the callback's result mirrors the server reply: order/deal/price
+
       ulong tk = result.order;
       if(result.deal > 0 && HistoryDealSelect(result.deal))
          tk = (ulong)HistoryDealGetInteger(result.deal, DEAL_POSITION_ID);
@@ -214,7 +151,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
      }
    else if(result.retcode == TRADE_RETCODE_INVALID_FILL)
      {
-      // one-shot 10030 retry: next mode in the chain, new async request
+
       ENUM_ORDER_TYPE_FILLING nxt = NextFilling((ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
       if(nxt != 0)
         {
@@ -224,7 +161,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          r2.type_filling = nxt;
          if(OrderSendAsync(r2, res2) && res2.request_id != 0)
            {
-            g_async[i].req_id = res2.request_id;  // new request id replaces the old
+            g_async[i].req_id = res2.request_id;
             g_async[i].fill   = (long)nxt;
             g_async[i].req    = r2;
            }
@@ -238,7 +175,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       AsyncReport(i, false, "retcode " + IntegerToString((long)result.retcode));
   }
 
-// next mode in the 10030 fallback chain after `f` (0 when exhausted)
 ENUM_ORDER_TYPE_FILLING NextFilling(ENUM_ORDER_TYPE_FILLING f)
   {
    if(f == ORDER_FILLING_FOK)  return(ORDER_FILLING_IOC);
@@ -246,9 +182,6 @@ ENUM_ORDER_TYPE_FILLING NextFilling(ENUM_ORDER_TYPE_FILLING f)
    return((ENUM_ORDER_TYPE_FILLING)0);
   }
 
-// Round a requested volume onto the symbol's real volume step and clamp it
-// into [vol_min, vol_max].  A hardcoded 2-decimal round rejected or
-// mis-sized every symbol whose step is not 0.01 (many indices / crypto).
 double NormalizeVolume(string sym, double vol)
   {
    double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
@@ -259,17 +192,15 @@ double NormalizeVolume(string sym, double vol)
    double v = MathRound(vol / vstep) * vstep;
    if(vmin > 0.0 && v < vmin) v = vmin;
    if(vmax > 0.0 && v > vmax) v = vmax;
-   // step can be 0.001 -> keep enough decimals for the server
+
    return(NormalizeDouble(v, 8));
   }
 
-// send a DEAL request, falling back through filling modes on 10030.
-// Remembers the proven mode per symbol so later sends go straight in.
 bool SendDealWithFallback(MqlTradeRequest &req, MqlTradeResult &res)
   {
    ENUM_ORDER_TYPE_FILLING f = ProvenFill(req.symbol);
    if(f == 0) f = FillingFor(req.symbol);
-   ENUM_ORDER_TYPE_FILLING tried[4];   // modes tried this call
+   ENUM_ORDER_TYPE_FILLING tried[4];
    int ntried = 0;
    while(true)
      {
@@ -282,12 +213,11 @@ bool SendDealWithFallback(MqlTradeRequest &req, MqlTradeResult &res)
          ProvenFillRemember(req.symbol, f);
          return(true);
         }
-      // 10030 = unsupported filling mode: try the next one the symbol
-      // flags allow; anything else is a real error - report it.
+
       if(res.retcode != TRADE_RETCODE_INVALID_FILL)
          return(false);
       ENUM_ORDER_TYPE_FILLING nxt = NextFilling(f);
-      for(int t = 0; t < ntried; t++)          // never loop a mode twice
+      for(int t = 0; t < ntried; t++)
          if(tried[t] == nxt) nxt = (ENUM_ORDER_TYPE_FILLING)0;
       if(nxt == 0)
          return(false);
@@ -317,9 +247,6 @@ void OnDeinit(const int reason)
    EventKillTimer();
   }
 
-// event-driven order pickup: chart-symbol quotes arrive many times per
-// second during market hours - drains the order channel between timer
-// ticks so latency is bounded by the quote gap, not the timer.
 void OnTick()
   {
    ProcessExecIn();
@@ -327,25 +254,21 @@ void OnTick()
 
 void OnTimer()
   {
-   ProcessExecIn();                 // FIRST - order pickup runs every tick
-                                    // for sub-5 ms command latency
+   ProcessExecIn();
+
    long now_min = (long)(TimeCurrent() / 60);
-   if(now_min != g_last_rescan_min)  // rescan Market Watch each new minute
+   if(now_min != g_last_rescan_min)
       RefreshSymbols();
-   // spots.csv is a DISPLAY feed (panel prices + staleness watchdog) - it
-   // does not need the 1 ms order-channel cadence.  Rewriting a 40-symbol
-   // CSV 1000x/s through wine burned I/O and starved the exec channel;
-   // 50 ms matches what the bridge and README already document.
+
    static uint s_last_spot_ms = 0;
    uint now_ms = GetTickCount();
    if(now_ms - s_last_spot_ms >= SPOT_DUMP_MS)
      {
       s_last_spot_ms = now_ms;
-      DumpSpots();                  // quotes at ~20 Hz - feeds panel prices
+      DumpSpots();
      }
-   DumpCandles();                   // self-throttled to a new M1 bar
-   // trades.csv only when positions changed or every 20th tick (~40 ms):
-   // rewriting it every tick starved the order channel on wine.
+   DumpCandles();
+
    static int  s_last_pos   = -1;
    static int  s_since_dump = 0;
    int total = PositionsTotal();
@@ -359,9 +282,6 @@ void OnTimer()
       s_since_dump++;
   }
 
-// ------------------------------------------------------------------
-// symbols: everything in Market Watch that has a quote (max 40)
-// ------------------------------------------------------------------
 void RefreshSymbols()
   {
    g_nsymbols = 0;
@@ -381,9 +301,6 @@ void RefreshSymbols()
    g_last_rescan_min = (long)(TimeCurrent() / 60);
   }
 
-// ------------------------------------------------------------------
-// dumps
-// ------------------------------------------------------------------
 string MscToTime(long msc)
   {
    string s = TimeToString((datetime)(msc / 1000), TIME_DATE | TIME_SECONDS);
@@ -417,12 +334,7 @@ void DumpTrades()
       return;
 
    int total = PositionsTotal();
-// header row: NONE + position count + account snapshot
-    //   0 NONE, 1 positions, 2 login, 3 server, 4 balance, 5 equity,
-    //   6 currency, 7 leverage, 8 margin, 9 free margin, 10 margin level,
-    //   11 profit (floating), 12 broker/company, 13 account holder,
-    //   14 margin mode, 15 trade mode (0=disabled 1=close 2=full)
-    //   16 terminal trade allowed, 17 mql trade allowed, 18 account trade allowed
+
     FileWrite(handle,
               "NONE",
               IntegerToString(total),
@@ -475,17 +387,12 @@ void DumpTrades()
    FileClose(handle);
   }
 
-// ------------------------------------------------------------------
-// candles: last 120 M1 bars for EURUSD + GBPUSD (OHLC + tick volume)
-// rewritten only when a new bar opens (cheap) - monitor keeps its own
-// history, so gaps never appear in the web/terminal charts.
-// ------------------------------------------------------------------
 void DumpCandles()
   {
    string pairs[2] = {"EURUSD", "GBPUSD"};
    long now_min = (long)(TimeCurrent() / 60);
    if(now_min == g_last_candle_min)
-      return;                       // same M1 bar - nothing new to write
+      return;
    g_last_candle_min = now_min;
 
    int handle = FileOpen(CANDLE_FILE, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, '\t');
@@ -497,8 +404,8 @@ void DumpCandles()
       if(!SymbolSelect(sym, true))
          continue;
       MqlRates rates[];
-      int n = CopyRates(sym, PERIOD_M1, 0, 120, rates);   // 0 = include forming bar
-      for(int i = n - 1; i >= 0; i--)                     // newest first
+      int n = CopyRates(sym, PERIOD_M1, 0, 120, rates);
+      for(int i = n - 1; i >= 0; i--)
         {
          long msc = (long)rates[i].time * 1000;
          FileWrite(handle, sym, MscToTime(msc),
@@ -512,11 +419,6 @@ void DumpCandles()
    FileClose(handle);
   }
 
-// ------------------------------------------------------------------
-// order channel: consume exec_in.csv, write results to exec_out.csv
-// ------------------------------------------------------------------
-// append one "id<TAB>status<TAB>detail" line to exec_out.csv (raw bytes so
-// the tabs survive; the file keeps roughly the newest 4 KB of results)
 void AppendOut(string id, string status, string detail)
   {
    string old = "";
@@ -534,7 +436,7 @@ void AppendOut(string id, string status, string detail)
       FileSeek(h, 0, SEEK_SET);
       FileReadArray(h, buf, 0, (int)size);
       old = CharArrayToString(buf, 0, (int)size, CP_UTF8);
-      if(StringLen(old) > 4000)          // bound the history
+      if(StringLen(old) > 4000)
         {
          int cut = StringFind(old, "\n", StringLen(old) - 4000);
          if(cut >= 0)
@@ -550,16 +452,6 @@ void AppendOut(string id, string status, string detail)
    FileClose(h);
   }
 
-// EXEC NEXT protocol (no directory enumeration - Wine's FileFindNext
-// proved unreliable): python writes the command to exec_in.<id>.txt and
-// then atomically renames exec_next.<id>.tmp over exec_next.txt with the
-// filename as content.  The EA reads the pointer, executes that one
-// command file, deletes both, and repeats.  A sender whose command was
-// queued but overtaken simply re-asserts the pointer until its result
-// shows up - nothing can get stuck, nothing runs twice (the file is
-// always deleted before execution).  NOTE: command files must NOT use
-// executable extensions (.cmd/.bat) - MT5's file sandbox refuses to
-// open those (err 5002).
 void ProcessExecIn()
   {
    for(int i = 0; i < 50; i++)
@@ -569,7 +461,7 @@ void ProcessExecIn()
       int hp = FileOpen(EXEC_NEXT, FILE_READ | FILE_TXT | FILE_ANSI |
                         FILE_SHARE_READ | FILE_SHARE_WRITE);
       if(hp == INVALID_HANDLE)
-         return;                        // busy - retry next timer tick
+         return;
       string target = "";
       while(!FileIsEnding(hp))
         {
@@ -577,7 +469,7 @@ void ProcessExecIn()
          StringTrimLeft(l);
          StringTrimRight(l);
          if(StringLen(l) > 0)
-            target = l;                 // last line wins = newest queued
+            target = l;
         }
       FileClose(hp);
       if(StringLen(target) == 0)
@@ -589,7 +481,7 @@ void ProcessExecIn()
                         FILE_SHARE_READ | FILE_SHARE_WRITE);
       if(hc == INVALID_HANDLE)
         {
-         // diagnostics: why can we not open a file python just wrote?
+
          static int dbg2 = 0;
          int err = GetLastError();
          if(dbg2 < 6)
@@ -607,7 +499,7 @@ void ProcessExecIn()
                FileClose(h3);
             dbg2++;
            }
-         FileDelete(EXEC_NEXT);         // stale pointer; sender re-asserts
+         FileDelete(EXEC_NEXT);
          return;
         }
       string lines[50];
@@ -625,7 +517,7 @@ void ProcessExecIn()
         {
          Print("exec: delete ", target, " failed err=", GetLastError());
          FileDelete(EXEC_NEXT);
-         return;                        // never execute twice
+         return;
         }
       FileDelete(EXEC_NEXT);
       Print("exec: consumed ", target, " lines=", n);
@@ -666,9 +558,7 @@ void ExecuteLine(string line)
          AppendOut(id, "ERR", "unknown symbol " + sym);
          return;
         }
-      // NOTE: StringToUpper() returns a bool and uppercases IN PLACE.
-      // Using it inline as a value made this comparison always false,
-      // so every SELL was silently sent as a BUY.
+
       string sidestr = p[3];
       StringToUpper(sidestr);
       long ptype = (sidestr == "SELL") ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
@@ -710,7 +600,7 @@ void ExecuteLine(string line)
           ares.retcode != TRADE_RETCODE_DONE &&
           ares.retcode != TRADE_RETCODE_DONE_PARTIAL))
         {
-         // immediate reject (request never reached the broker queue)
+
          AppendOut(id, "ERR", "retcode " + IntegerToString((long)ares.retcode));
          return;
         }
@@ -731,7 +621,7 @@ void ExecuteLine(string line)
       double vol  = PositionGetDouble(POSITION_VOLUME);
       int digits  = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       double price = (type == POSITION_TYPE_BUY)
-                      ? SymbolInfoDouble(sym, SYMBOL_BID)   // closing a buy = sell bid
+                      ? SymbolInfoDouble(sym, SYMBOL_BID)
                       : SymbolInfoDouble(sym, SYMBOL_ASK);
       MqlTradeRequest req;
       MqlTradeResult  res;
@@ -763,17 +653,12 @@ void ExecuteLine(string line)
 
    if(cmd == "CLOSEALL" && k >= 3)
      {
-      // Symbol names are CASE-SENSITIVE ("Boom 1000 Index", "XAUUSD247").
-      // Uppercasing here made every mixed-case symbol match nothing, so a
-      // CLOSEALL closed zero positions and still reported success.  Only
-      // the literal keyword ALL is matched case-insensitively.
+
       string sym = p[2];
       string symup = sym;
       StringToUpper(symup);
       bool all = (symup == "ALL");
-      // build EVERY close request first, then fire them all back to back:
-      // n async requests queue in <1 ms total and the broker confirms the
-      // closes in parallel (the old sync loop paid n x 600 ms in here).
+
       int total = PositionsTotal();
       if(total > 0)
         {
@@ -829,24 +714,22 @@ void ExecuteLine(string line)
          if(sent == 0)
             AppendOut(id, "ERR", "no close sent (failed " +
                               IntegerToString(failed) + ")");
-         // each request completes this cmd id via OnTradeTransaction
+
          return;
         }
-      AppendOut(id, "OK", "closed 0 failed 0");   // nothing to close
+      AppendOut(id, "OK", "closed 0 failed 0");
       return;
      }
 
    if(cmd == "PROBE" && k >= 3)
      {
-      string sym = p[2];          // case-sensitive: do NOT uppercase
+      string sym = p[2];
       if(!SymbolSelect(sym, true))
         {
          AppendOut(id, "ERR", "unknown symbol " + sym);
          return;
         }
-      // machine-readable broker/symbol capabilities for broker_prober.py:
-      // sym|digits|filling_flags|trade_exemode|trade_mode|order_mode|
-      // stops_level|freeze_level|vol_min|vol_max|vol_step|spread_pts
+
       AppendOut(id, "OK",
                 sym + "|" +
                 IntegerToString(SymbolInfoInteger(sym, SYMBOL_DIGITS)) + "|" +
@@ -865,4 +748,4 @@ void ExecuteLine(string line)
 
    AppendOut(id, "ERR", "unknown cmd " + cmd);
   }
-//+------------------------------------------------------------------+
+

@@ -1,17 +1,4 @@
 #!/usr/bin/env bash
-# install.sh - one-command setup for the MT5 bridge trading system.
-#
-# Autodetects OS + installed components and installs everything missing:
-#   * system packages (python3.12+, wine, xvfb, winetricks, curl...)
-#   * the python virtualenv (~/python312) + every library in requirements.txt
-#   * MetaTrader 5 into ~/.mt5 (downloads the official installer, installs
-#     it under wine, creates the SECOND terminal copy for account 2)
-#   * compiles the SpotDump EA bridge inside both terminals
-#
-# Idempotent: re-run any time, it only fixes what is missing.
-# Supported: Debian/Ubuntu (+derivatives), Fedora, Arch. macOS: partial
-# (wine via Homebrew; MT5 install works but is less tested).
-# Windows is NOT supported (this stack runs MT5 under Wine on Linux).
 
 set -euo pipefail
 
@@ -23,7 +10,6 @@ MT5_DIR2="$WINEPREFIX/drive_c/Program Files/MetaTrader 5-2"
 MT5_SETUP_URL="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 MT5_SETUP="$WINEPREFIX/drive_c/mt5setup.exe"
 
-# --- pretty output ---------------------------------------------------------
 B="\033[1m"; D="\033[2m"; R="\033[91m"; G="\033[92m"; Y="\033[93m"; N="\033[0m"
 step() { echo -e "${B}==> ${N}$*"; }
 ok()   { echo -e "  ${G}OK${N}  $*"; }
@@ -31,10 +17,6 @@ skip() { echo -e "  ${D}SKIP${N}  $* (already present)"; }
 warn() { echo -e "  ${Y}WARN${N}  $*"; }
 die()  { echo -e "${R}ERROR:${N} $*" >&2; exit 1; }
 
-# --- auto-retry -------------------------------------------------------------
-# retry <attempts> <delay-s> <label> <cmd...>  - reruns a flaky/slow step
-# (downloads, wine boot, package transactions) with a short backoff so one
-# network hiccup never kills the whole install.
 RETRY_MAX="${RETRY_MAX:-3}"
 retry() {
   local attempts="$1" delay="$2" label="$3"; shift 3
@@ -51,10 +33,8 @@ retry() {
   ok "$label"
 }
 
-# fast-install pip flags: no version check, prebuilt wheels only, real timeouts
 PIPFAST=(--disable-pip-version-check --prefer-binary --timeout 30)
 
-# --- OS detection -----------------------------------------------------------
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
@@ -78,10 +58,9 @@ step "detected: $PLATFORM ($ARCH), package manager: $PKG"
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
-# --- 1. system packages (batched: ONE transaction = fast) -------------------
 step "1/6 system packages"
 MISSING_PKGS=()
-need_pkg() {  # need_pkg <binary> <apt-name> <dnf-name> <pacman-name>
+need_pkg() {
   local bin="$1" apt="$2" dnf="$3" pacman="$4" name
   command -v "$bin" >/dev/null 2>&1 && { skip "$bin"; return 0; }
   case "$PKG" in
@@ -98,7 +77,7 @@ need_pkg() {  # need_pkg <binary> <apt-name> <dnf-name> <pacman-name>
 }
 
 if [ "$PLATFORM" = "linux" ]; then
-  # python3.12+: distro package may be older; 3.10+ is what the code needs
+
   if command -v python3 >/dev/null 2>&1 && [ "$(python3 -c 'import sys; print(sys.version_info >= (3,10))')" = "True" ]; then
     skip "python3 ($(python3 -V))"
   else
@@ -112,7 +91,7 @@ if [ "$PLATFORM" = "linux" ]; then
   need_pkg wine    wine      wine       wine
   need_pkg wine64  wine64    wine64     wine
   need_pkg wineserver wine   wine       wine
-  # X virtual framebuffer: MT5 is a GUI app; headless servers need xvfb
+
   need_pkg Xvfb    xvfb      xorg-x11-server-Xvfb xorg-server-xvfb
   need_pkg winetricks winetricks winetricks winetricks
 
@@ -138,7 +117,6 @@ elif [ "$PLATFORM" = "macos" ]; then
   brew list wine-stable >/dev/null 2>&1 && skip "wine" || { step "installing wine via Homebrew"; brew install --cask wine-stable; }
 fi
 
-# --- 2+3. python venv AND wineprefix in PARALLEL ----------------------------
 step "2-3/6 venv + libraries  |  wineprefix (parallel)"
 export WINEPREFIX
 mkdir -p "$WINEPREFIX"
@@ -169,7 +147,7 @@ prefix_task() {
     return 0
   fi
   step "initialising wineprefix (first run, ~1 min)"
-  try_boot() {  # -i first; plain wineboot as fallback; never hard-fails
+  try_boot() {
     "$WINE" wineboot -i >/dev/null 2>&1 || "$WINE" wineboot >/dev/null 2>&1
     return 0
   }
@@ -192,11 +170,7 @@ else
   retry "$RETRY_MAX" 5 "MT5 download" \
     curl -fL --retry 5 --retry-all-errors -C - -o "$MT5_SETUP" "$MT5_SETUP_URL"
   step "installing MT5 under wine (GUI wizard may appear - click through, it remembers)"
-  # /auto runs the installer unattended where supported; otherwise the
-  # wizard shows once and the user finishes it.  Two attempts: the very
-  # first wine run sometimes loses the race against prefix init.  The
-  # existence check below (not the exit code) decides success - the user
-  # may finish the wizard manually and re-run this script.
+
   mt5_install() {
     bash -c '"$1" "$2" /auto || "$1" "$2"' _ "$WINE" "$MT5_SETUP" || true
     return 0
@@ -207,7 +181,6 @@ else
     || warn "MT5 not found at $MT5_DIR - finish the wizard manually, then re-run install.sh"
 fi
 
-# --- 4. second terminal (account 2) -----------------------------------------
 step "4/6 second terminal (one-time copy)"
 if [ -f "$MT5_DIR2/terminal64.exe" ]; then
   skip "terminal 2"
@@ -221,7 +194,6 @@ else
   warn "terminal 1 missing - nothing to copy yet (finish step 3, re-run)"
 fi
 
-# --- 5. EA bridge compile ----------------------------------------------------
 step "5/6 SpotDump EA bridge"
 "$VENV_DIR/bin/python" - <<PYEOF
 import sys; sys.path.insert(0, "$HERE")
@@ -234,7 +206,6 @@ for inst in (1, 2):
         print(f"terminal {inst}: EA install skipped ({e})")
 PYEOF
 
-# --- 6. chart template + summary --------------------------------------------
 step "6/6 chart template (algo trading permissions)"
 "$VENV_DIR/bin/python" "$HERE/make_bridge_tpl.py" || warn "template install failed (re-run after first terminal boot)"
 

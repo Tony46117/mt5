@@ -1,6 +1,4 @@
-# Python libraries for the MT5 bridge trading system (install.sh uses this).
+
 flask>=3.0
 waitress>=3.0
-# psycopg2-binary is OPTIONAL (only needed when DATABASE_URL points at
-# PostgreSQL; database.py falls back to SQLite without it):
-# psycopg2-binary>=2.9
+

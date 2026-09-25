@@ -1,24 +1,4 @@
 #!/usr/bin/env python3.12
-"""ms.py - live terminal candlestick chart (15s EURUSD by default).
-
-v3 - hand-rolled ANSI renderer:
-  * plotext 6.x removed the old module-level API (plt.plot/plt.clf/...)
-    and its new candlestick() is alpha-broken (empty canvas on floats,
-    crash on datetimes).  Candles are therefore drawn directly with
-    ANSI block glyphs: zero chart dependencies, full control, and it
-    cannot crash.
-  * theme: black background, BLUE bullish candles, RED bearish -
-    no green anywhere.
-  * static WINDOW-candle view, redraws only when the frame changes
-    (no flicker).
-  * graceful bridge-down state + LIVE/LAG/STALE status in the header.
-
-Usage:
-    python ms.py               # live chart (static screen, redraws on change)
-    python ms.py --once        # draw one frame and exit
-    python ms.py --symbol EURUSD
-    python ms.py --width 110 --height 22
-"""
 
 from __future__ import annotations
 
@@ -33,21 +13,18 @@ from spot import read_spots, candles, feed_age, BOLD, DIM, RESET, BLUE, RED, YEL
 
 log = setup_logging(__name__)
 
-SEC = CONFIG.ms_candle_seconds          # 15
-WINDOW = CONFIG.ms_window               # 5
-MAX_BARS = CONFIG.ms_max_bars           # 200
+SEC = CONFIG.ms_candle_seconds
+WINDOW = CONFIG.ms_window
+MAX_BARS = CONFIG.ms_max_bars
 SYMBOL_DEFAULT = CONFIG.default_symbol
 
 GLYPH_WICK = "│"
 GLYPH_BODY = "█"
 GLYPH_GRID = "·"
 
-# theme: black bg, blue up, red down - no green
 CANDLE_COLORS = {"up": BLUE, "down": RED, "dim": DIM}
 
-
 class CandleBuilder:
-    """Aggregates live ticks into SEC-second candles; exposes the last WINDOW."""
 
     __slots__ = ("bars", "cur", "last_mid", "symbol")
 
@@ -58,7 +35,6 @@ class CandleBuilder:
         self.symbol = symbol
 
     def seed_from_m1(self) -> None:
-        """Backfill from bridge M1 history (t converted to epoch seconds)."""
         self.bars = []
         for b in candles(self.symbol, limit=MAX_BARS):
             self.bars.append({
@@ -69,7 +45,6 @@ class CandleBuilder:
             })
 
     def tick(self) -> bool:
-        """Ingest the newest midpoint; True if anything changed."""
         bid, ask, _ = read_spots().get(self.symbol, ("", "", ""))
         if not bid or not ask:
             return False
@@ -104,31 +79,25 @@ class CandleBuilder:
         return changed
 
     def window(self) -> list[dict]:
-        """Last WINDOW candles (includes the forming candle)."""
         all_bars = self.bars + ([self.cur] if self.cur else [])
         return all_bars[-WINDOW:]
 
-
 def _row_of(p: float, hi: float, lo: float, rows: int) -> int:
-    """Price -> screen row (0 = top)."""
     r = int((hi - p) / (hi - lo) * (rows - 1))
     return max(0, min(rows - 1, r))
 
-
 def render_candles(bars: list[dict], width: int, height: int,
                    digits: int = 5) -> str:
-    """Draw bars (oldest->newest, each {o,h,l,c}) as an ANSI candlestick
-    chart with a dim price gutter and the last price highlighted."""
     if not bars:
         return f"{DIM}  collecting data...{RESET}"
 
     rows = max(6, height)
-    gutter = 10                                   # "   1.10943 " price label
+    gutter = 10
     chart_w = max(12, width - gutter)
 
     hi = max(b["h"] for b in bars)
     lo = min(b["l"] for b in bars)
-    if hi - lo < 1e-9:                            # flat feed: fake a band
+    if hi - lo < 1e-9:
         band = max(abs(hi) * 1e-6, 1e-6)
         hi += band
         lo -= band
@@ -144,7 +113,6 @@ def render_candles(bars: list[dict], width: int, height: int,
     grid: list[list[tuple[str, str]]] = [
         [(" ", "") for _ in range(chart_w)] for _ in range(rows)]
 
-    # horizontal grid lines
     for gy in range(0, rows, max(3, rows // 5)):
         for x in range(chart_w):
             grid[gy][x] = (GLYPH_GRID, "dim")
@@ -159,11 +127,11 @@ def render_candles(bars: list[dict], width: int, height: int,
         r_ob = _row_of(max(b["o"], b["c"]), hi, lo, rows)
         r_oc = _row_of(min(b["o"], b["c"]), hi, lo, rows)
 
-        for r in range(r_top, r_bot + 1):         # wick
+        for r in range(r_top, r_bot + 1):
             ch, _ = grid[r][cx]
             if ch != GLYPH_BODY:
                 grid[r][cx] = (GLYPH_WICK, col)
-        for r in range(r_ob, r_oc + 1):           # body (doji = 1 row)
+        for r in range(r_ob, r_oc + 1):
             for x in range(x0, x1 + 1):
                 grid[r][x] = (GLYPH_BODY, col)
 
@@ -185,7 +153,6 @@ def render_candles(bars: list[dict], width: int, height: int,
             lab = f"{DIM}{p:>9.{digits}f} {RESET}"
         lines.append(lab + "".join(cell(ch, tag) for ch, tag in grid[r]))
     return "\n".join(lines)
-
 
 def draw(cb: CandleBuilder, symbol: str, width: int, height: int) -> str:
     bars = cb.window()
@@ -219,7 +186,6 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int) -> str:
             f"{BOLD}{CYAN}└──────────────────────────────────────────────────┘{RESET}")
 
     return head + "\n" + render_candles(bars, width, height, digits)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Live 15s candlestick terminal chart")
@@ -268,7 +234,6 @@ def main() -> int:
         log.info("MS chart stopped")
         sys.stdout.write("\033[?25h\nbye!\n")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

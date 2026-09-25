@@ -1,34 +1,4 @@
 #!/usr/bin/env python3.12
-"""executor.py - the ONLY way python code trades through the bridge.
-Optimized for lightning-fast execution.
-
-SendCommand: writes a TAB-separated command line into the terminal's
-    MQL5/Files as exec_in.<id>.txt with a unique id, then polls exec_out.csv
-    for the matching result.  The SpotDump EA (v1.40+) consumes the file and
-    places/closes orders server-side, so a command round-trip is a few tens
-    of milliseconds (bounded below by the EA's 50 ms timer).  One lock per
-    terminal serialises writers (flask routes, executor thread).
-    Reads of exec_out.csv are mtime/size-gated: a stat per poll, a full read
-    only when the EA actually appended.  (A previous mmap-based fast path
-    could SIGBUS-kill the whole app when the EA truncated/rewrote the file
-    under the mapping - plain gated reads are just as fast for a 4 KB file.)
-
-FutureTradeScheduler: background thread that fires each schedule slot to
-    the millisecond.  A due schedule is CLAIMED (next_fire moved forward,
-    atomic compare-and-swap) before any order is sent, so a crash or a
-    second scheduler can never double-fire, and a schedule missed by more
-    than MAX_FIRE_LATE is rescheduled instead of burst-firing stale orders:
-      * at exec time  -> n_positions market orders (OPEN), back-to-back
-      * at close time -> CLOSEALL for that account+pair
-    Polling is adaptive: one indexed DB query per wake-up while far from a
-    fire, 5 ms steps through the final 2 s, then a busy-spin over the last
-    20 ms so the command file lands on the exact second.  (The EA consumes
-    commands on its 50 ms timer, so sub-millisecond python polling buys
-    nothing - landing the write within ~1-2 ms of the tick is optimal.)
-    Results are logged to the `fired` table and shown in the panel.
-
-Run directly for a CLI heartbeat:  python executor.py --ping
-"""
 
 from __future__ import annotations
 
@@ -48,60 +18,27 @@ import database as db
 
 log = setup_logging(__name__)
 
-# Fast constants
-EXEC_POLL_INTERVAL = 0.0005       # 0.5 ms polling for the EA's result
-EXEC_POLL_SLEEP = 0.0002          # s sleep between result polls after the spin window
-EXEC_REASSERT_INTERVAL = 0.001    # 1 ms pointer re-assert
-SCHEDULER_POLL_IDLE = 0.250       # s between DB re-lists when no fire is near
-SCHEDULER_POLL_NEAR = 0.005       # s steps through the final 2 s before a fire
-SCHEDULER_NEAR_WINDOW = 2.0       # s - switch to fine steps inside this window
-FIRE_SPIN_WINDOW = 0.020          # s - busy-spin the final 20 ms for precision
-STAGGER_MS = 0.0                  # stagger between multi-position orders: NONE -
-                                  # orders are queued back-to-back and the terminal
-                                  # pipelines them; a sleep here only delayed fires
-MAX_FIRE_LATE = 120.0             # s - missed by more than this = reschedule, NOT fire late
-FIRE_DEADLINE = 20.0              # s - max wall time for one schedule's openings
-                                  # (5 s was too tight: HFM fills pipeline at
-                                  # ~1.4 s each through wine, so a 2-open batch
-                                  # legitimately runs past 5 s and the results
-                                  # were discarded + a false stall-heal fired)
-RETRY_DELAY_S = 0.5               # HARDENING: an open/close that FAILED (bad
-                                  # volume, requote, price-off, no-connection)
-                                  # is automatically retried after 500 ms -
-                                  # 3 attempts max, then it reports for real
+EXEC_POLL_INTERVAL = 0.0005
+EXEC_POLL_SLEEP = 0.0002
+EXEC_REASSERT_INTERVAL = 0.001
+SCHEDULER_POLL_IDLE = 0.250
+SCHEDULER_POLL_NEAR = 0.005
+SCHEDULER_NEAR_WINDOW = 2.0
+FIRE_SPIN_WINDOW = 0.020
+STAGGER_MS = 0.0
+MAX_FIRE_LATE = 120.0
+FIRE_DEADLINE = 20.0
+RETRY_DELAY_S = 0.5
 RETRY_MAX = 3
-# Hard rejects a retry can NEVER fix - re-sending them just burned the
-# scheduler for a second (or doubled a later recovery) and tripled every
-# row in the fired log (one failure showed up as 3 identical-looking rows,
-# which read as 'duplicate trades' in the panel).  Transient rejects that
-# DO benefit from a retry: requotes (10004/10006/10008), price-off (10015),
-# no-quotes (10020/10021), and 'not responding' timeouts handled elsewhere.
 HARD_REJECT_MARKERS = ("10017", "10019", "10027",
                        "unknown symbol", "invalid volume")
-# TRANSIENT MARKERS: broker-side conditions that clear on their own, so a
-# failed slot must RETRY in-epoch instead of skipping silently to tomorrow.
-#   10018 market closed = the broker's DAILY BREAK (gold: ~23:00-01:00 UTC,
-#   observed live 2026-09-24: XAUUSD feed froze at 22:59:59.961, opens got
-#   'bad volume or no quote' at 23:23 and retcode 10018 at 23:26/23:28 while
-#   AUDCAD filled at 23:25) - it ends within the hour, so retry THROUGH it.
-#   'bad volume or no quote' = no quote at the fire second (also 10020/10021
-#   no-quotes, 10004/10006/10008 requotes, 10015 price-off).  NOTE: this
-#   string CONTAINS 'bad volume', so it must never match HARD_REJECT_MARKERS
-#   or no-quote failures are written off as permanent (that collision is
-#   exactly what left schedules #586/#588/#589 unfired).
 TRANSIENT_RETRY_MARKERS = ("10018", "bad volume or no quote", "10020", "10021",
                            "10004", "10006", "10008", "10015", "10031",
                            "requote", "price changed", "no quotes",
                            "market closed", "no connection")
-# failed-slot retry cadence (IN-MEMORY ONLY - see _retry_failed_slot):
-# the operator's next_fire countdown is NEVER touched, so the panel cannot
-# show a 'retry countdown duplicate'.  Attempts start 45 s after a transient
-# failure and back off to one attempt per 5 min, giving up after 2 h.
 RETRY_SCHED_FIRST_DELAY_S = 45.0
-RETRY_SCHED_MAX_RETRY_S = 300.0    # cap per-retry delay at 5 min
-RETRY_SCHED_EPOCH_S = 7200.0       # abandon the slot after 2 h of failures
-# Plain-language hints for broker retcodes, appended to fired-log rows so
-# the panel explains WHY an order died instead of a bare 'retcode 10017'.
+RETRY_SCHED_MAX_RETRY_S = 300.0
+RETRY_SCHED_EPOCH_S = 7200.0
 RETCODE_HINTS = {
     "10004": "requote", "10006": "rejected by broker", "10013": "invalid request",
     "10014": "invalid volume", "10015": "invalid price", "10016": "invalid stops",
@@ -113,76 +50,34 @@ RETCODE_HINTS = {
     "10031": "no connection to broker",
 }
 
-
 def _explain(detail: str) -> str:
-    """'retcode 10017' -> 'retcode 10017 - trade disabled by broker
-    (symbol/account)' (only when a hint exists and isn't already there)."""
     for code, hint in RETCODE_HINTS.items():
         if code in detail and hint not in detail:
             return f"{detail} - {hint}"
     return detail
-# 24/7 instruments (Deriv synthetics, HFM's XAUUSD247, ...) trade on
-# weekends too - the Mon-Fri guard must never eat their schedules.
 ALWAYS_ON_MARKERS = ("247", "BOOM", "CRASH", "JUMP", "RANGE BREAK", "STEP INDEX",
                      "DERIV")
 
-
 def is_always_on_symbol(pair: str) -> bool:
-    """True for 24/7 symbols (XAUUSD247, Boom/Crash, ...) - schedules on
-    them fire on any weekday, including Saturday/Sunday."""
     p = (pair or "").upper()
     return any(m in p for m in ALWAYS_ON_MARKERS)
-HORIZON_CACHE = 0.1               # s - reuse the nearest-fire DB query this long
-EXEC_IN_TTL = 15.0                # s - unconsumed exec_in.<id>.txt older than
-                                  # this = EA stalled past the client timeout;
-                                  # sweep it so it can never fire as a phantom
-HEAL_COOLDOWN_S = 600.0           # s - min spacing between stall auto-restarts
-HEAL_BOOT_GRACE_S = 120.0         # s - NEVER stall-heal a terminal this soon
-                                  # after the app/terminal booted: leftover exec
-                                  # files from BEFORE a boot are purged by
-                                  # spot.launch_terminal, so a sweep hit right
-                                  # after boot is stale data, not a live stall
-                                  # (the old 0 s grace restart-stormed BOTH
-                                  # terminals seconds after every app start)
-# weekdays (0=Mon..6=Sun) schedules are allowed to fire on.
-# DEFAULT = ALL SEVEN DAYS: the old Mon-Fri default silently ate every
-# weekend schedule (observed: four Sunday schedules skipped with only a
-# log line - 'skipped - not a trading day for AUDCAD' - and nothing in
-# the panel).  A schedule the operator armed must FIRE, every day; the
-# broker itself rejects orders when a market is closed.  Weekday-only
-# behaviour is now OPT-IN: MT5_TRADING_DAYS=0,1,2,3,4.
+HORIZON_CACHE = 0.1
+EXEC_IN_TTL = 15.0
+HEAL_COOLDOWN_S = 600.0
+HEAL_BOOT_GRACE_S = 120.0
 TRADING_DAYS = tuple(int(x) for x in
                      os.getenv("MT5_TRADING_DAYS", "0,1,2,3,4,5,6").split(",")
                      if x.strip()) or (0, 1, 2, 3, 4, 5, 6)
 
-# EA Protocol constants
-EXEC_NEXT_FILE = "exec_next.txt"  # pointer file for EA protocol
-
+EXEC_NEXT_FILE = "exec_next.txt"
 
 def _current_exec_dir(inst: int):
-    """Get the current exec directory for a terminal instance (resolves dynamically)."""
     return exec_in_path(inst)
 
-
 def _current_out_path(inst: int):
-    """Get the current exec_out.csv path for a terminal instance."""
     return exec_out_path(inst)
 
-
 class SendCommand:
-    """One atomic command file per order + wait for the result in
-    exec_out.csv (per-terminal lock serialises writers).
-
-    Protocol (SpotDump EA v1.40+):
-    1. Python writes command to exec_in.<id>.txt (TAB-separated line)
-    2. Python writes pointer file exec_next.<id>.tmp with the filename,
-       then atomically renames to exec_next.txt
-    3. EA reads exec_next.txt, opens the command file, DELETES both files,
-       executes the command, appends result to exec_out.csv
-    4. Python polls exec_out.csv for the matching result id
-
-    This pointer protocol ensures no commands are lost or duplicated.
-    """
 
     __slots__ = ('inst', 'lock', 'timeout')
 
@@ -192,19 +87,15 @@ class SendCommand:
         self.lock = threading.Lock()
 
     def _get_paths(self):
-        """Get current (files_dir, out_path, ptr_file) for this terminal."""
         files_dir = _current_exec_dir(self.inst)
         out_path = _current_out_path(self.inst)
         ptr_file = files_dir / EXEC_NEXT_FILE
         return files_dir, out_path, ptr_file
 
-    # -- result parsing -----------------------------------------------------
     @staticmethod
     def _parse_out(raw: bytes, want: str) -> tuple[str, str] | None:
-        """Find id==want in exec_out text -> ('OK'|'ERR', detail) (newest wins)."""
         want_bytes = want.encode() + b"\t"
         found = None
-        # Search from end for newest match
         for line in reversed(raw.splitlines()):
             if line.startswith(want_bytes):
                 parts = line.split(b"\t")
@@ -213,14 +104,10 @@ class SendCommand:
                     break
         return found
 
-    # -- internals ----------------------------------------------------------
     def _write_cmd(self, files_dir, parts: tuple[str, ...]) -> tuple[str, Path]:
-        """Write ONE exec_in.<id>.txt command file (caller holds self.lock
-        and has ensured files_dir exists) -> (id, cmd_file)."""
         cid = uuid.uuid4().hex[:12]
         cmd_file = files_dir / f"exec_in.{cid}.txt"
         line = ("\t".join((cid, *parts)) + "\n").encode("ascii")
-        # Atomic write with O_SYNC - single syscall, no fsync needed
         fd = os.open(str(cmd_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_SYNC, 0o644)
         try:
             os.write(fd, line)
@@ -230,12 +117,6 @@ class SendCommand:
 
     def _await_result(self, cid: str, cmd_file, files_dir, out_path,
                       ptr_file, deadline: float) -> tuple[bool, str]:
-        """Assert the exec_next.txt pointer until the EA consumes the command,
-        then poll exec_out.csv (mtime/size-gated) for this id's result.
-        exec_out.csv is re-read only when its mtime/size changes (the EA
-        appends results; one stat per poll, one read per actual result -
-        no mmap, so the EA truncating/rewriting the file can never crash us).
-        """
         t0 = time.monotonic()
         next_assert = 0.0
         last_mtime = 0.0
@@ -244,19 +125,14 @@ class SendCommand:
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
-                # Re-assert pointer file (atomic rename) - EA deletes before
-                # executing.  Stop asserting once the EA has consumed the
-                # command file (re-asserting after consumption only makes the
-                # EA churn on failed opens until the result lands).
                 if now >= next_assert and cmd_file.exists():
                     try:
                         ptr_tmp.write_text(cmd_file.name, encoding="ascii")
-                        ptr_tmp.rename(ptr_file)   # atomic pointer assert
+                        ptr_tmp.rename(ptr_file)
                     except OSError:
                         ptr_tmp.unlink(missing_ok=True)
                     next_assert = now + EXEC_REASSERT_INTERVAL
 
-                # Check for result in exec_out.csv (mtime/size-gated read)
                 try:
                     st = out_path.stat()
                     if st.st_mtime != last_mtime or st.st_size != last_size:
@@ -268,33 +144,18 @@ class SendCommand:
                 except OSError:
                     pass
 
-                # Wait strategy: pure busy-spin for the first ~1.5 ms (a
-                # 0.5 ms sleep can cost 1-2 ms of timer slack on Linux),
-                # then a 0.2 ms sleep - still sub-ms granular, but unlike the
-                # old yield-only loop it does not peg a whole core for the
-                # full timeout while the EA is busy.
                 if now - t0 < 0.0015:
-                    continue                       # spin - poll again immediately
+                    continue
                 time.sleep(EXEC_POLL_SLEEP)
         finally:
             ptr_tmp.unlink(missing_ok=True)
         return False, (f"terminal {self.inst} not responding "
                        f"(is the terminal running with the SpotDump EA attached?)")
 
-    # -- public API --------------------------------------------------------
     def send(self, *parts: str, timeout: float | None = None) -> tuple[bool, str]:
-        """send("OPEN", "EURUSD", "BUY", "0.10") -> (ok, detail).
-
-        Writes exec_in.<id>.txt with O_SYNC, then asserts the exec_next.txt
-        pointer until the EA consumes the command and the result appears in
-        exec_out.csv.
-        """
         to = self.timeout if timeout is None else timeout
         with self.lock:
             files_dir, out_path, ptr_file = self._get_paths()
-            # The order channel used to die with '[Errno 2] No such file or
-            # directory' when the terminal had never run yet - create the
-            # MQL5/Files dir so orders can always be queued.
             try:
                 files_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -308,15 +169,6 @@ class SendCommand:
 
     def send_batch(self, *commands: tuple[str, ...],
                    timeout: float | None = None) -> list[tuple[bool, str]]:
-        """Queue ALL commands first, THEN await their results.
-
-        A schedule with n positions used to pay n full round trips back to
-        back (each bounded by the terminal's own ~5-10 ms through wine);
-        batching queues every command in ~0.1 ms and pays ONE wait whose
-        terminal-side work overlaps, so n opens land in about the time of
-        one.  The EA consumes the queued files in order via the pointer
-        protocol and results are matched by id.
-        """
         results: list[tuple[bool, str]] = [(False, "no command")] * len(commands)
         if not commands:
             return results
@@ -345,9 +197,6 @@ class SendCommand:
             try:
                 while time.monotonic() < deadline and any(r is None for r in got):
                     now = time.monotonic()
-                    # Keep the pointer on the OLDEST still-unconsumed command;
-                    # the EA deletes each file as it consumes it, so this walks
-                    # the queue forward command by command.
                     pending = [cf for (cid, cf, err), r in zip(queued, got)
                                if r is None and cf is not None and cf.exists()]
                     if pending and now >= next_assert:
@@ -385,7 +234,6 @@ class SendCommand:
                                            f"(is the terminal running with the SpotDump EA attached?)")
         return results
 
-    # convenience wrappers -------------------------------------------------
     def open_trade(self, symbol: str, side: str, lot: float,
                    magic: int = 777001, comment: str = "py",
                    timeout: float | None = None) -> tuple[bool, str]:
@@ -403,26 +251,13 @@ class SendCommand:
     def ping(self) -> tuple[bool, str]:
         return self.send("PING", timeout=1.0)
 
-
-# module-level senders: web routes import these
 CMD1 = SendCommand(1, timeout=CONFIG.exec_timeout_seconds)
 CMD2 = SendCommand(2, timeout=CONFIG.exec_timeout_seconds)
-
 
 def sender_for(account: int) -> SendCommand:
     return CMD1 if account == 1 else CMD2
 
-
 def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, str]:
-    """One CLOSEALL with the 500 ms failed-close retry - NO database on the
-    hot path (close.py parity: the command round trip is the only latency).
-    A failed close (requote/price-off/10027) is retried after 500 ms, up to
-    `attempts` times, then reported for real.
-
-    The close gets the FULL fire deadline, not the 3 s order timeout: in the
-    5 s burst cycle a close lands while the EA is still pipelining the next
-    slot's 4 opens, and its result can legitimately take longer than 3 s -
-    the old short timeout turned every such close into a 3.5 s-late retry."""
     ok, detail = False, ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
@@ -440,11 +275,7 @@ def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, st
     log.error(f"close acc{acc} {pair} FAILED after {attempts} attempts: {detail}")
     return False, detail
 
-
 def _restart_terminal_async(inst: int) -> None:
-    """Restart a blocked terminal OFF the scheduler thread (10027 self-heal).
-    The bridge supervisor will keep the feed alive while it boots; the EA
-    comes back with algo trading ON because launch_terminal() enforces it."""
     def _worker():
         try:
             from spot import restart_terminal
@@ -454,19 +285,7 @@ def _restart_terminal_async(inst: int) -> None:
     threading.Thread(target=_worker, daemon=True,
                      name=f"restart-terminal-{inst}").start()
 
-
-# --------------------------------------------------------------------------
-# future-trade scheduler (microsecond precision)
-# --------------------------------------------------------------------------
-
 class FutureTradeScheduler(threading.Thread):
-    """Fires scheduled trades to the millisecond.
-
-    Adaptive polling: one indexed DB re-list per wake-up (250 ms while far
-    from a fire, 5 ms through the final 2 s), then a 20 ms busy-spin onto
-    the exact second.  Never queries the DB more than ~4x/s in steady state
-    (the old 0.5 ms hot loop did 2000/s and starved the web app of the
-    SQLite lock)."""
 
     __slots__ = ('stop_flag', '_closes', '_closes_lock',
                  '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts',
@@ -475,53 +294,30 @@ class FutureTradeScheduler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="future-trade-scheduler")
         self.stop_flag = threading.Event()
-        self._hz_ts = 0.0          # nearest-fire query cache (monotonic ts)
+        self._hz_ts = 0.0
         self._hz_val: float | None = None
-        # close jobs: {account:pair: close_datetime (UTC)}
         self._closes: dict[str, dt.datetime] = {}
         self._closes_lock = threading.Lock()
-        self._janitor_ts = 0.0     # last stray exec_in sweep (monotonic)
-        self._heal_ts = {1: 0.0, 2: 0.0}   # last stall-heal per terminal
-        self._boot_ts = time.monotonic()   # scheduler start = boot grace anchor
-        # failed-slot retries: {schedule_id: [first_attempt_monotonic, tries]}
-        # and {schedule_id: next_try_monotonic}.  Deliberately IN MEMORY:
-        # next_fire belongs to the operator's daily countdown and must never
-        # be hijacked as a retry timer (bouncing it 30 s ahead every 31 s is
-        # exactly the 'retry countdown duplicate' the panel showed).
+        self._janitor_ts = 0.0
+        self._heal_ts = {1: 0.0, 2: 0.0}
+        self._boot_ts = time.monotonic()
         self._slot_attempts: dict[int, list] = {}
         self._slot_next_try: dict[int, float] = {}
         self._catchup_done = False
 
     @staticmethod
     def _is_trading_day(dt_obj: dt.datetime) -> bool:
-        """Check if the given datetime is a configured trading day
-        (default: EVERY day - schedules must never be silently skipped;
-        MT5_TRADING_DAYS=0,1,2,3,4 opts back into weekday-only)."""
         return dt_obj.weekday() in TRADING_DAYS
 
     def _next_trading_day(self, dt_obj: dt.datetime) -> dt.datetime:
-        """Move to the next trading day if on weekend."""
         while not self._is_trading_day(dt_obj):
             dt_obj += dt.timedelta(days=1)
         return dt_obj
 
-    # register close time when a schedule fires.  The close H/M/S typed in
-    # the panel are LOCAL wall clock (same semantics as the exec time - see
-    # database._local_to_utc); anchoring them as UTC once shifted every
-    # auto-close by the machine's tz offset.
     def _register_close(self, sch: dict) -> None:
         ch, cm, cs = int(sch["close_h"]), int(sch["close_m"]), int(sch["close_s"])
         now = dt.datetime.now(dt.timezone.utc)
-        # Anchor to the schedule's fire time (not 'now'): registration runs
-        # AFTER the opens complete, so a short-lifetime schedule (e.g. close
-        # 5s after exec) whose opens finish past the close second must close
-        # ASAP - not be pushed a full day ahead.
         fire = self._fire_dt(sch)
-        # Anchor to the slot's fire time ONLY when it already passed (the
-        # normal case - registration runs after the opens).  A slot retry
-        # that lands AFTER a broker break has next_fire pointing at TOMORROW
-        # (the untouched daily countdown) - anchoring the close to that
-        # future value would schedule the auto-close a full day late.
         if fire and fire <= now:
             fire_local = fire.astimezone()
             anchored = fire_local.replace(hour=ch, minute=cm, second=cs,
@@ -538,21 +334,11 @@ class FutureTradeScheduler(threading.Thread):
             close = close_local.astimezone(dt.timezone.utc)
         if close <= now:
             close = now + dt.timedelta(seconds=1)
-        # 24/7 symbols (XAUUSD247, Boom/Crash, ...) must close on weekends
-        # too - without this exemption every Saturday trade stayed open
-        # until Monday (observed: 24 open XAUUSD247 positions, zero closes).
         if not is_always_on_symbol(sch.get("pair", "")):
             close = self._next_trading_day(close)
         key = f"{sch['account']}:{sch['pair']}"
         with self._closes_lock:
             prev = self._closes.get(key)
-            # EARLIEST close wins: a CLOSEALL closes every position of the
-            # pair anyway, so keeping a later pending close silently DELAYED
-            # the earlier schedule's close (its positions stayed open until
-            # the other schedule's close time - observed with overlapping
-            # same-pair schedules).  Firing the earliest pending close closes
-            # the earlier batch exactly when it should and is harmless for
-            # the later one (its close fires too, then a no-op).
             if prev is None or close < prev[0]:
                 self._closes[key] = (close, sch.get("pair", ""))
 
@@ -567,23 +353,11 @@ class FutureTradeScheduler(threading.Thread):
                     del self._closes[key]
         return due
 
-    # stray-command janitor --------------------------------------------------
     def _sweep_stale_exec_in(self) -> None:
-        """Delete unconsumed exec_in.<id>.txt command files older than the
-        client timeout.  When a terminal's EA stalls (wine pause, etc.) its
-        queued command outlives the sender's timeout and the EA can consume
-        it minutes later as a phantom trade.  Sweeping turns a stall into a
-        logged failure - never a surprise order.
-
-        Files left over from BEFORE a boot are purged by launch_terminal, so
-        anything swept here while the terminal is inside its boot grace is
-        stale disk content - logged, but NEVER treated as a live stall
-        (the old code restart-stormed freshly booted terminals)."""
         now_m = time.monotonic()
         if now_m - self._janitor_ts < 5.0:
             return
         self._janitor_ts = now_m
-        # fired-log retention: the scheduled page shows the past 24 h only
         try:
             pruned = db.prune_fired(24)
             if pruned:
@@ -611,13 +385,9 @@ class FutureTradeScheduler(threading.Thread):
                                             f"command {p.name}")
                                 stalled.append(inst)
                     except OSError:
-                        pass          # vanished or busy - next pass
+                        pass
             except OSError:
                 pass
-        # a swept command = the EA never picked it up = the exec channel is
-        # stalled even though the feed may look alive: auto-restart that
-        # terminal - but only OUTSIDE the boot grace and with a cooldown, so
-        # a broken install can never restart-storm
         for inst in set(stalled):
             if (now_m - self._boot_ts < HEAL_BOOT_GRACE_S
                     or now_m - self._heal_ts.get(inst, 0.0) < HEAL_COOLDOWN_S):
@@ -629,7 +399,6 @@ class FutureTradeScheduler(threading.Thread):
 
     @staticmethod
     def _fire_dt(sch: dict) -> dt.datetime | None:
-        """Schedule next_fire as an aware UTC datetime (None if unparsable)."""
         nf = sch.get("next_fire")
         if not nf:
             return None
@@ -643,9 +412,6 @@ class FutureTradeScheduler(threading.Thread):
         return nf
 
     def _claim(self, sch: dict) -> bool:
-        """Validate + atomically claim a due schedule.  True = caller fires it.
-        (Split out of _process_due so the run loop can claim EVERYTHING first
-        and then fire all claimed schedules concurrently.)"""
         nf = self._fire_dt(sch)
         now = dt.datetime.now(dt.timezone.utc)
         if nf is None:
@@ -653,15 +419,12 @@ class FutureTradeScheduler(threading.Thread):
                         f"{sch.get('next_fire')!r} - skipped (delete + recreate it)")
             return False
         if nf > now:
-            return False               # someone else already claimed it
+            return False
         late = (now - nf).total_seconds()
         if late > MAX_FIRE_LATE:
             log.warning(f"schedule #{sch['id']} missed its slot by {late:.0f}s "
                         f"> {MAX_FIRE_LATE:.0f}s - one-shot schedule done, "
                         f"NOT fired late")
-            # ONE-SHOT: the operator scheduled THIS time only.  A missed slot
-            # used to be re-armed for tomorrow (reading as a 'duplicate' "23 h
-            # away"); now the schedule is simply done.
             db.deactivate(sch["id"])
             self._slot_attempts.pop(sch["id"], None)
             self._slot_next_try.pop(sch["id"], None)
@@ -669,19 +432,10 @@ class FutureTradeScheduler(threading.Thread):
         return db.claim_schedule(sch["id"], sch["next_fire"])
 
     def _process_due(self, sch: dict) -> None:
-        """Claim one due schedule and fire it (kept for API/tests)."""
         if self._claim(sch):
             self._fire(sch)
 
-    # fire one schedule ----------------------------------------------------
     def _fire(self, sch: dict) -> None:
-        # Trading-day guard BEFORE the claim - a schedule for a weekend-
-        # closed market must be skipped EARLY (in every racing scheduler),
-        # never claimed-and-dropped.  24/7 symbols are exempt: they trade
-        # every day, so XAUUSD247/Boom/Crash fire on Saturday too.
-        # A skip is VISIBLE: it is logged to the fired table so the panel
-        # shows exactly why nothing happened (the old silent skip left the
-        # operator staring at a schedule that 'did nothing').
         if (not self._is_trading_day(dt.datetime.now(dt.timezone.utc))
                 and not is_always_on_symbol(sch.get("pair", ""))):
             log.info(f"schedule #{sch['id']} skipped - not a trading day "
@@ -696,15 +450,6 @@ class FutureTradeScheduler(threading.Thread):
                 log.warning(f"schedule #{sch['id']}: could not log the "
                             f"trading-day skip: {exc}")
             return
-        # CRASH-SAFE: the claim already consumed the slot - an exception here
-        # must NEVER swallow the fire silently (a dead fire thread once made
-        # schedules vanish: claimed, never fired, no log anywhere).  Before
-        # any open succeeded the slot is retried in 2 s; AFTER opens landed
-        # the slot is consumed (retrying would duplicate positions).
-        # ONE-SHOT SEMANTICS: every schedule fires ONCE, at the time the
-        # operator typed - the claim's 're-arm for tomorrow' dance (which
-        # read as a duplicate scheduled 23 h ahead) is undone the moment the
-        # slot is consumed, wherever that consumption leads.
         opened = {"ok": 0}
         try:
             results = self._fire_inner(sch, opened)
@@ -713,7 +458,6 @@ class FutureTradeScheduler(threading.Thread):
                 log.error(f"schedule #{sch['id']} fire crashed AFTER "
                           f"{opened['ok']} opens ({exc}) - slot consumed, "
                           f"NOT retrying (duplicates)")
-                # the opened positions must not dangle without an auto-close
                 try:
                     self._register_close(sch)
                 except Exception:
@@ -730,41 +474,20 @@ class FutureTradeScheduler(threading.Thread):
                     log.error(f"schedule #{sch['id']} could not be "
                               f"rescheduled after crash: {exc}")
         else:
-            # ZERO-OPEN TRANSIENT FAILURE (market closed / no quote / requote):
-            # retry the slot on the in-memory cadence WITHOUT touching
-            # next_fire - bouncing the operator's countdown was shown in the
-            # panel as a 'retry countdown duplicate'.  Any open that landed,
-            # and any 'not responding' timeout (the command may have
-            # executed server-side), still consume the slot.
             if (opened["ok"] == 0 and results is not None
                     and self._failed_open_transient(results)):
                 self._retry_failed_slot(sch, dt.datetime.now(dt.timezone.utc))
             else:
-                # fired-and-consumed (filled, hard-rejected or timed out):
-                # one-shot schedule is DONE - never re-arms for tomorrow
                 db.deactivate(sch["id"])
                 self._slot_attempts.pop(sch["id"], None)
                 self._slot_next_try.pop(sch["id"], None)
 
     @staticmethod
     def _failed_open_transient(results: list[tuple[bool, str]]) -> bool:
-        """True when a 0-open fire hit a TRANSIENT broker condition (market
-        closed / no quote / requote / no connection).  Those clear on their
-        own, so the slot is retried at the in-memory cadence instead of the
-        schedule silently skipping to tomorrow (which the panel showed as a
-        'duplicate' suddenly scheduled a day ahead)."""
         return any(not ok and any(m in det for m in TRANSIENT_RETRY_MARKERS)
                    for ok, det in results)
 
     def _retry_failed_slot(self, sch: dict, now_utc: dt.datetime) -> None:
-        """Schedule an in-memory retry for a fully-failed slot.  next_fire is
-        NOT touched - it keeps counting down to tomorrow's daily slot, so the
-        panel shows one stable schedule.  The retry itself is driven by the
-        run loop off _slot_next_try and writes only fired-log summary rows;
-        if a retry opens a position its auto-close is armed normally.  The
-        slot is abandoned after RETRY_SCHED_EPOCH_S (2 h) of failures - a
-        later success would just double the day's trade against the next
-        daily fire."""
         sid = sch["id"]
         st = self._slot_attempts.get(sid)
         if st is None:
@@ -786,7 +509,6 @@ class FutureTradeScheduler(threading.Thread):
                 pass
             log.warning(f"schedule #{sid}: slot given up after {st[1]} "
                         f"attempts / {elapsed / 60:.0f} min - one-shot done")
-            # ONE-SHOT: abandoned slot = schedule finished (nothing re-arms)
             db.deactivate(sid)
             return
         delay = min(RETRY_SCHED_MAX_RETRY_S,
@@ -797,8 +519,6 @@ class FutureTradeScheduler(threading.Thread):
                     f"{delay:.0f} s")
 
     def retry_snapshot(self) -> dict[int, dict]:
-        """Retry state for the panel (/api/schedules): attempts so far and
-        seconds until the next attempt (0/absent when not retrying)."""
         now_m = time.monotonic()
         out: dict[int, dict] = {}
         for sid, (_t0, tries) in self._slot_attempts.items():
@@ -809,14 +529,6 @@ class FutureTradeScheduler(threading.Thread):
         return out
 
     def _recover_pending_slots(self) -> None:
-        """Boot catch-up: a slot that was fired-and-failed while this process
-        was DOWN has no in-memory retry state (and next_fire already points
-        at tomorrow), so it used to be lost until the next daily fire - and
-        a RESTART during the retry window silently killed the retries.  Scan
-        the fired log since the previous boot: any active schedule whose
-        latest rows are transient failures AND whose daily slot was consumed
-        (next_fire > now) gets its retry re-armed here.  Runs once, just
-        after thread start, BEFORE the first poll."""
         try:
             boot_iso = (dt.datetime.now(dt.timezone.utc)
                         - dt.timedelta(seconds=time.monotonic()))
@@ -843,7 +555,7 @@ class FutureTradeScheduler(threading.Thread):
                 continue
             nf = self._fire_dt(sch)
             if nf is None or nf <= now:
-                continue      # slot not consumed yet - normal path handles it
+                continue
             log.info(f"boot catch-up: schedule #{sid} had a transiently "
                      f"failed slot before the restart - re-arming retries")
             self._retry_failed_slot(sch, now)
@@ -854,13 +566,8 @@ class FutureTradeScheduler(threading.Thread):
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
         ok_cnt = 0
-        # one blocked terminal (algo trading off -> 10027) must not burn the
-        # whole queue: 2+ 10027s in one batch = restart the terminal
         blocked_10027 = 0
 
-        # BATCH fire: queue all n OPEN commands (~0.1 ms), then wait once -
-        # the terminal-side order times overlap, so n opens cost about one
-        # round trip.  The old serial loop paid n full round trips + stagger.
         commands = [("OPEN", pair, side, f"{lot:.2f}", "0", "0",
                      str(777000 + acc), f"sch#{sch['id']}")
                     for _ in range(n)]
@@ -874,11 +581,6 @@ class FutureTradeScheduler(threading.Thread):
             if opened is not None:
                 opened["ok"] = ok_cnt
 
-        # SUMMARY MODE: when the WHOLE batch died to one transient broker
-        # condition (market closed / no quote), n identical failed rows per
-        # attempt are pure noise - one summary row per attempt instead, and
-        # the 500 ms in-batch retry is skipped entirely (the slot-retry
-        # cadence owns this case).
         summary_mode = (ok_cnt == 0 and bool(results)
                         and self._failed_open_transient(results))
         if summary_mode:
@@ -903,20 +605,6 @@ class FutureTradeScheduler(threading.Thread):
             elif "10027" in detail:
                 blocked_10027 += 1
 
-        # HARDENING - 500 ms auto-retry on positions that FAILED to open:
-        # a transient reject (freshly selected symbol without a quote yet,
-        # requote, price-off) is retried after 500 ms instead of leaving
-        # the schedule short of its positions.  BUT a broker break rejects
-        # everything in the batch with the same transient marker (10018 /
-        # no quote): retrying those 500 ms apart is pure noise - the SLOT
-        # retry cadence (45 s..5 min) owns that case, so when the whole
-        # batch failed transiently only ONE summary row is written here.
-        # Hard rejects (trade disabled, unknown symbol, invalid volume) are
-        # NEVER retried: the broker will answer the same a second later.
-        # 'not responding' is NOT retried either: a timed-out command may
-        # still have executed server-side, and re-sending it would
-        # duplicate the position (a stalled terminal is the janitor's +
-        # supervisor's job to restart).
         first_attempt_all_transient = (
             ok_cnt == 0 and bool(results) and self._failed_open_transient(results))
         for attempt in range(1, RETRY_MAX):
@@ -946,13 +634,6 @@ class FutureTradeScheduler(threading.Thread):
                       f"ALGO TRADING OFF (10027) - restarting it")
             _restart_terminal_async(acc)
 
-        # Register the auto-close only when a position may actually exist:
-        # every open answered with a DEFINITE broker reject (retcode /
-        # unknown symbol) means nothing was placed - registering a close
-        # here used to fire a CLOSEALL at close time that could close
-        # ANOTHER schedule's positions early (earliest close wins).
-        # Indeterminate results ('not responding') still register: the
-        # order may have executed server-side and must not dangle.
         if ok_cnt > 0 or any(not ok and "not responding" in det
                              for ok, det in results):
             self._register_close(sch)
@@ -961,22 +642,15 @@ class FutureTradeScheduler(threading.Thread):
         else:
             log.info(f"schedule #{sch['id']} acc{acc} {pair}: no position "
                      f"opened - auto-close not armed")
-            # non-transient 0-open result (hard rejects): any pending slot
-            # retry state is obsolete - the outer layer decides what's next
             self._slot_attempts.pop(sch["id"], None)
             self._slot_next_try.pop(sch["id"], None)
         log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
                  f"{ok_cnt}/{n} opened in {fire_ms:.1f} ms")
         return results
 
-    # concurrent fan-out -----------------------------------------------------
     def _fire_concurrently(self, schedules: list[dict]) -> None:
-        """Fire every claimed schedule AT THE SAME TIME - one thread per
-        schedule (per terminal).  Both terminals' order bursts are queued
-        into their exec channels within milliseconds of each other, so
-        opens are truly simultaneous, not terminal-1-then-terminal-2."""
         if len(schedules) == 1:
-            self._fire(schedules[0])       # common case: no thread overhead
+            self._fire(schedules[0])
             return
         threads = [threading.Thread(target=self._fire, args=(sch,),
                                     daemon=True, name=f"fire-{sch['id']}")
@@ -987,20 +661,11 @@ class FutureTradeScheduler(threading.Thread):
             t.join()
 
     def _close_concurrently(self, due: list[tuple[int, str]]) -> None:
-        """Close every due (acc, pair) AT THE SAME TIME - one daemon thread
-        per pair, each with the 500 ms failed-close retry.
-
-        LIGHTNING-FAST + DB-FREE (matches close.py): the close command goes
-        straight down the exec channel - NO database round trip on the hot
-        path, and no attempt to hold the GIL against the web app's DB work
-        while orders are in flight."""
         for acc, pair in due:
             threading.Thread(target=_close_one, args=(acc, pair), daemon=True,
                              name=f"close-{acc}-{pair}").start()
 
     def _nearest_fire_seconds(self) -> float | None:
-        """Seconds until the next active schedule fires (cached 0.1 s so the
-        hot loop never hammers the database)."""
         now_m = time.monotonic()
         if now_m - self._hz_ts < HORIZON_CACHE:
             return self._hz_val
@@ -1009,7 +674,6 @@ class FutureTradeScheduler(threading.Thread):
         return val
 
     def _nearest_fire_seconds_uncached(self) -> float | None:
-        """Uncached DB-backed seconds until the next active fire (None if none)."""
         try:
             rows = db.list_future_trades(active_only=True)
         except Exception:
@@ -1040,21 +704,10 @@ class FutureTradeScheduler(threading.Thread):
                  f"{STAGGER_MS * 1000:.1f} ms stagger)")
         while not self.stop_flag.is_set():
             try:
-                # CONCURRENT closes FIRST: when a batch's close lands on
-                # the next batch's open second (e.g. the 5 s burst-cycle),
-                # the CLOSEALL must be queued BEFORE the new OPENs - the EA
-                # executes commands in order, so firing first would close
-                # the fresh positions instantly and let the old ones live
-                # twice as long.  DB-free + fully parallel.
                 due_closes = self._due_closes()
                 if due_closes:
                     self._close_concurrently(due_closes)
 
-                # CONCURRENT fires: claim EVERYTHING due first (claiming is
-                # instant DB CAS - no trade latency), then fire all claimed
-                # schedules in parallel (one thread per schedule, i.e. per
-                # terminal) so both terminals' opens land in the same instant
-                # instead of terminal 2 waiting for terminal 1's batch.
                 claimed: list[dict] = []
                 for sch in db.due_schedules():
                     if self._claim(sch):
@@ -1062,10 +715,6 @@ class FutureTradeScheduler(threading.Thread):
                 if claimed:
                     self._fire_concurrently(claimed)
 
-                # FAILED-SLOT RETRIES: run on their own cadence (45 s..5 min)
-                # WITHOUT touching the schedules' next_fire - a transient
-                # failure (market closed / no quote) gets re-sent here until
-                # it fills or the 2 h epoch expires.  One attempt per wake.
                 if self._slot_next_try:
                     now_m = time.monotonic()
                     for sid in [s for s, t in self._slot_next_try.items()
@@ -1093,7 +742,7 @@ class FutureTradeScheduler(threading.Thread):
                                      f"{fired['ok']} position(s)")
                             self._slot_attempts.pop(sid, None)
                             self._slot_next_try.pop(sid, None)
-                            db.deactivate(sid)   # one-shot: done
+                            db.deactivate(sid)
                         elif self._failed_open_transient(results):
                             self._retry_failed_slot(sch,
                                                     dt.datetime.now(dt.timezone.utc))
@@ -1102,35 +751,27 @@ class FutureTradeScheduler(threading.Thread):
                                         f"hard reject - abandoning retries")
                             self._slot_attempts.pop(sid, None)
                             self._slot_next_try.pop(sid, None)
-                            db.deactivate(sid)   # one-shot: done
+                            db.deactivate(sid)
 
-                # Boot catch-up runs once, shortly after the first poll, so
-                # slots that transiently failed before a restart resume
-                # retrying instead of being lost.
                 if not self._catchup_done and (time.monotonic()
                                                - self._boot_ts) > 5.0:
                     self._catchup_done = True
                     self._recover_pending_slots()
 
-                # Sweep stray exec_in commands (EA stalled past its timeout)
                 self._sweep_stale_exec_in()
 
-                # Adaptive sleep: coarse while far from a fire, fine inside
-                # the near window, exact busy-spin over the last 20 ms.
                 nearest = self._nearest_fire_seconds()
                 if nearest is None:
                     sleep = SCHEDULER_POLL_IDLE
                 elif nearest <= SCHEDULER_NEAR_WINDOW:
                     if nearest <= FIRE_SPIN_WINDOW:
-                        # fresh (uncached) read, then busy-spin to the exact
-                        # fire second - NO further DB reads inside the spin
                         val = self._nearest_fire_seconds_uncached()
                         if val is not None and val <= FIRE_SPIN_WINDOW:
                             target = time.time() + max(0.0, val)
                             while (not self.stop_flag.is_set()
                                    and time.time() < target):
-                                pass              # millisecond-precision landing
-                        sleep = 0.0               # process due immediately
+                                pass
+                        sleep = 0.0
                     else:
                         sleep = SCHEDULER_POLL_NEAR
                 else:
@@ -1142,9 +783,7 @@ class FutureTradeScheduler(threading.Thread):
             if sleep > 0:
                 self.stop_flag.wait(sleep)
 
-
 def start_scheduler() -> FutureTradeScheduler:
-    """Start the singleton scheduler thread (idempotent)."""
     global _scheduler_instance
     if _scheduler_instance and _scheduler_instance.is_alive():
         return _scheduler_instance
@@ -1153,23 +792,14 @@ def start_scheduler() -> FutureTradeScheduler:
     _scheduler_instance = sch
     return sch
 
-
 def stop_scheduler() -> None:
-    """Stop the scheduler if running."""
     global _scheduler_instance
     if _scheduler_instance:
         _scheduler_instance.stop_flag.set()
         _scheduler_instance.join(timeout=2.0)
         _scheduler_instance = None
 
-
-# Module-level scheduler instance for start/stop_scheduler
 _scheduler_instance: FutureTradeScheduler | None = None
-
-
-# --------------------------------------------------------------------------
-# CLI: heartbeat / manual commands
-# --------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Trade executor via the SpotDump exec channel")
@@ -1222,7 +852,6 @@ def main() -> int:
 
     ap.print_help()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

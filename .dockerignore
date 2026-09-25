@@ -1,4 +1,3 @@
-# .dockerignore - keep the image lean and secrets out of the build context
 .git
 .gitignore
 **/__pycache__

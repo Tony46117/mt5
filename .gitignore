@@ -1,4 +1,3 @@
-# --- runtime state: never commit ---
 acc.env
 acc.enc
 session.json

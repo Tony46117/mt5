@@ -1,7 +1,6 @@
 services:
   mt5-bridge:
-    # Auto-detects OS/environment (docker / WSL2 / k8s) and the X display
-    # (X11 forward, Wayland, or headless Xvfb) on every start.
+
     build: .
     image: mt5-bridge:latest
     container_name: mt5-bridge
@@ -11,23 +10,19 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Stable machine key so session.json survives container recreation.
-      # CHANGE THIS to any long random string on your machine.
+
       - MT5_MACHINE_KEY=${MT5_MACHINE_KEY:-please-change-me}
       - MT5_WINEPREFIX=/data/prefix
-      # Accounts are seeded from acc.env placed in ./data on the host
+
       - MT5_NO_LAUNCH_JITTER=${MT5_NO_LAUNCH_JITTER:-1}
       - MT5_TRADING_DAYS=${MT5_TRADING_DAYS:-0,1,2,3,4,5,6}
-      # Postgres backend (optional)
+
       - DATABASE_URL=${MT5_DATABASE_URL:-}
     volumes:
       - mt5-data:/data
-      # Drop your acc.env on the host at ./data/acc.env (gitignored);
-      # the entrypoint copies it next to the code so seeding just works.
+
       - ./data:/data/seed:ro
-      # Uncomment on a desktop Linux host to render MT5 on your real screen
-      # instead of the internal Xvfb:
-      # - /tmp/.X11-unix:/tmp/.X11-unix
+
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
       interval: 30s

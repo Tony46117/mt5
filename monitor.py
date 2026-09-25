@@ -1,28 +1,4 @@
 #!/usr/bin/env python3.12
-"""monitor.py - ONE monitor for BOTH accounts, side by side.
-
-The old monitor1.py / monitor2.py pair merged: both accounts render on a
-single static screen separated by a straight line, redrawn only when
-something actually changes.  LIVE TRADES ONLY: the screen shows the
-positions that are open RIGHT NOW (plus balance/equity) - there is
-deliberately NO event log of opened/closed trades; history lives in the
-database/web panel, the monitor is a pure live book.
-
-Identity stays strict: each half only shows data when a terminal's EA
-header proves it is logged into that acc.env account - it can never show
-account1's trades mislabelled as account2's.
-
-Also exposes the data helpers the web terminal uses:
-    read_positions(inst)  -> open positions of terminal `inst`
-    account_info(inst)    -> {login, server, balance, equity, ...}
-
-Usage:
-    python monitor.py            # live dashboard (auto-starts terminals)
-    python monitor.py --once     # single frame
-    python monitor.py --check    # which terminals are visible & their accounts
-    python monitor.py --restart 1      # bounce terminal 1
-    python monitor.py --restart 2      # bounce terminal 2
-"""
 
 from __future__ import annotations
 
@@ -48,20 +24,13 @@ HEADER = (f"{'TICKET':<11} {'SYMBOL':<8} {'SIDE':<5} {'VOL':>6} "
 
 SEP = "=" * 100
 
-
 def f(v: str) -> float:
     try:
         return float(v)
     except ValueError:
         return 0.0
 
-
-# --------------------------------------------------------------------------
-# shared data helpers (web app imports these)
-# --------------------------------------------------------------------------
-
 def read_positions(inst: int) -> list[dict]:
-    """Open positions of terminal `inst` (identity-checked against acc.env)."""
     login = read_accounts().get(inst, {}).get("login", "")
     term = pick_terminal(login) if login else None
     if not term:
@@ -87,15 +56,7 @@ def read_positions(inst: int) -> list[dict]:
             })
     return rows
 
-
 def account_info(inst: int) -> dict:
-    """Account snapshot of terminal `inst` from its EA header.
-
-    Strict identity, same as read_positions(): the card reports the
-    session account only when the EA header PROVES that login - the old
-    unchecked version displayed whichever terminal wrote freshest
-    (typically the OTHER account's balance during boot), which read as
-    'account refusing to show / showing wrong data'."""
     login = read_accounts().get(inst, {}).get("login", "")
     term = pick_terminal(login) if login else None
     if not term or read_header(term["trades_path"]).get("login") != login:
@@ -112,18 +73,11 @@ def account_info(inst: int) -> dict:
             "margin_level": f(head.get("margin_level", "")),
             "positions": head.get("positions", 0)}
 
-
 def TERMINAL_DIR(inst: int):
     from spot import TERMINALS
     return TERMINALS[inst]["dir"]
 
-
-# --------------------------------------------------------------------------
-# per-account monitor (adapted from monitor_core.Monitor)
-# --------------------------------------------------------------------------
-
 class Monitor:
-    """One instance per account number (1 or 2); inst == account_no."""
 
     def __init__(self, account_no: int, strict_identity: bool = True):
         self.account_no = account_no
@@ -135,7 +89,6 @@ class Monitor:
         self.prev_mtime = 0.0
         self.last_head: dict = {}
 
-    # ------------------------------------------------------------------
     def acc_env(self) -> dict:
         return read_accounts().get(self.account_no, {})
 
@@ -178,7 +131,6 @@ class Monitor:
                      f"python monitor.py --setup2), or:  python monitor.py --restart 2{RESET}")
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
     def load(self) -> tuple[dict, list[dict], float, str]:
         login = self.acc_env().get("login", "")
         term = pick_terminal(login) if login else None
@@ -210,17 +162,13 @@ class Monitor:
                 })
         return head, rows, mtime, status
 
-    # ------------------------------------------------------------------
     def detect_changes(self, head: dict, trades: list[dict], mtime: float) -> bool:
-        """Detect ANY change so the static screen redraws at the exact
-        moment the live book moves - deliberately no OPENED/CLOSED event
-        log (monitor = live ongoing trades only)."""
         changed = False
         tickets = {t["ticket"] for t in trades}
         if self.prev_tickets is None:
             self.prev_tickets = tickets
         elif tickets != self.prev_tickets:
-            changed = True                 # book changed - redraw only
+            changed = True
             self.prev_tickets = tickets
 
         pl = sum(f(t["pl"]) for t in trades)
@@ -240,7 +188,6 @@ class Monitor:
             changed = True
         return changed
 
-    # ------------------------------------------------------------------
     def render(self, head: dict, trades: list[dict], mtime: float) -> str:
         a = self.acc_env()
         login = head.get("login") or a.get("login", "?")
@@ -292,11 +239,6 @@ class Monitor:
                    f"floating {pl:>+10.2f}   net {net_c}{net:>+10.2f}{RESET}")
         return "\n".join(out)
 
-
-# --------------------------------------------------------------------------
-# merged screen
-# --------------------------------------------------------------------------
-
 def build_frame(monitors: dict[int, Monitor], once: bool = False) -> str:
     frames: list[str] = []
     for inst in (1, 2):
@@ -311,7 +253,6 @@ def build_frame(monitors: dict[int, Monitor], once: bool = False) -> str:
             m.detect_changes(head, trades, mtime)
             frames.append(m.render(head, trades, mtime))
     return f"\n{SEP}\n".join(frames)
-
 
 def check() -> int:
     print(f"{BOLD}monitor --check{RESET}\n")
@@ -334,7 +275,6 @@ def check() -> int:
             print(f"  account{n} ({login}) -> {RED}no terminal reports this login{RESET}")
     return 0
 
-
 def setup2() -> int:
     if not setup_terminal2():
         return 1
@@ -343,11 +283,7 @@ def setup2() -> int:
           f"SpotDump EA when launched.{RESET}")
     return 0
 
-
 def _wait_bridges(insts: tuple[int, ...], timeout: float) -> dict[int, bool]:
-    """Wait for SEVERAL terminals' EA feeds CONCURRENTLY (the old code waited
-    serially - one dead terminal stalled startup for the full timeout).
-    Prints a progress line every 15 s so a slow boot never looks hung."""
     res: dict[int, bool] = {i: False for i in insts}
 
     def w(inst: int) -> None:
@@ -371,34 +307,28 @@ def _wait_bridges(insts: tuple[int, ...], timeout: float) -> dict[int, bool]:
         t.join()
     return res
 
-
 def run(once: bool, interval: float, restart: int | None) -> int:
     log.info("MT5 DUAL ACCOUNT MONITOR starting - account1 + account2, one screen, strict identity")
 
-    # --once mode: skip terminal launch / compile / long waits entirely -
-    # just read whatever data the EA has already written and print one frame.
     if not once:
         for inst in (1, 2):
             if inst == 2 and not (MT5_DIR2 / "terminal64.exe").exists():
                 if not setup_terminal2():
                     return 1
             if restart == inst or restart == 0:
-                install_script(inst)       # compile BEFORE the restart boot
+                install_script(inst)
                 if not restart_terminal(inst):
                     return 1
             elif not term_running(inst):
-                install_script(inst)       # EA ready BEFORE the first boot
+                install_script(inst)
                 if not ensure_terminal(inst):
                     return 1
             else:
-                install_script(inst)       # no-op when unchanged
+                install_script(inst)
             if not any(p.exists() for p in compiled_paths(inst)):
                 log.error(f"SpotDump.ex5 missing for terminal {inst} - compilation failed.")
                 return 1
 
-        # Parallel 45 s wait, then ONE automatic self-heal restart for a dead
-        # bridge (the old code sat on a serial 180 s wait and then told the
-        # user to run --restart by hand - three minutes of nothing).
         log.info("waiting for the EA bridges (both terminals, 45 s max)...")
         ok = _wait_bridges((1, 2), timeout=45.0)
         dead = [i for i in (1, 2) if not ok[i]]
@@ -423,7 +353,7 @@ def run(once: bool, interval: float, restart: int | None) -> int:
     try:
         while True:
             frame = build_frame(monitors)
-            if frame != last_frame:            # redraw ONLY on real change
+            if frame != last_frame:
                 if first:
                     sys.stdout.write("\033[2J\033[H" + frame + "\033[?25l")
                     first = False
@@ -435,7 +365,6 @@ def run(once: bool, interval: float, restart: int | None) -> int:
     except KeyboardInterrupt:
         sys.stdout.write("\033[?25h\nbye!\n")
     return 0
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -458,7 +387,6 @@ def main() -> int:
     if args.setup2:
         sys.exit(setup2())
     sys.exit(run(args.once, args.interval, args.restart))
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

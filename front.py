@@ -1,28 +1,8 @@
 #!/usr/bin/env python3.12
-"""front.py - ALL html/css/js for the web terminal (no data logic here).
-
-app.py renders two pages from this module:
-    render_dashboard()  -> "/"     metrics: trades, winrate, equity curve, pairs
-    render_panel()      -> "/panel"  one-click trading + future trades setup
-
-Design language (derived from the inspo dashboards, theme: BLACK / BLUE / WHITE):
-    * near-black layered panels, soft rounded cards, subtle blue glow
-    * fixed sidebar navigation with live account badges
-    * KPI card grid with monospace numerics + ring/donut gauges
-    * sharp data density of a trading terminal, none of the clutter
-
-The pages render a static skeleton once and then a small JS poller
-refreshes data nodes (dashboard ~1 s, panel ~0.6 s) - hyper responsive
-without losing form input focus.
-"""
 
 from __future__ import annotations
 
 from flask import render_template_string
-
-# --------------------------------------------------------------------------
-# shared css - black / blue / white techy trading terminal
-# --------------------------------------------------------------------------
 
 CSS = """
 :root{
@@ -318,10 +298,6 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
   background:var(--blue3);color:var(--blue);border:1px solid var(--line3)}
 """
 
-# --------------------------------------------------------------------------
-# shared js helpers
-# --------------------------------------------------------------------------
-
 COMMON_JS = """
 function $id(x){return document.getElementById(x)}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
@@ -591,10 +567,6 @@ async function saveScheduleEdit(sid,n){if(SCHED_SAVING)return;SCHED_SAVING=true;
   f.className='feedback err';f.textContent=e.message}}
 """
 
-# --------------------------------------------------------------------------
-# dashboard page
-# --------------------------------------------------------------------------
-
 DASHBOARD_TMPL = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -754,14 +726,8 @@ async function refresh(){try{S=await api('/api/dashboard');render()}
 refresh();setInterval(refresh,1000);
 """
 
-
 def render_dashboard() -> str:
     return render_template_string(DASHBOARD_TMPL, css=CSS, js=DASHBOARD_JS)
-
-
-# --------------------------------------------------------------------------
-# panel page
-# --------------------------------------------------------------------------
 
 PANEL_TMPL = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1001,14 +967,8 @@ async function refresh(){
 refresh();setInterval(refresh,600);
 """
 
-
 def render_panel() -> str:
     return render_template_string(PANEL_TMPL, css=CSS, js=PANEL_JS)
-
-
-# --------------------------------------------------------------------------
-# scheduled trades page
-# --------------------------------------------------------------------------
 
 SCHEDULED_TMPL = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1231,7 +1191,6 @@ function renderCountdowns(){
 setInterval(renderCountdowns,1000);
 refresh();setInterval(refresh,2000);
 """
-
 
 def render_scheduled() -> str:
     return render_template_string(SCHEDULED_TMPL, css=CSS, js=SCHEDULED_JS)

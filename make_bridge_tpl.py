@@ -1,15 +1,4 @@
 #!/usr/bin/env python3.12
-"""make_bridge_tpl.py - install Bridge.tpl (expertmode=1) into both terminals.
-
-The chart-level 'Allow algo trading' permission (expertmode) defaults to 0 on
-charts MT5 creates for a config-attached EA, which leaves MQL_TRADE_ALLOWED=0
-and every OrderSend dies with retcode 10027 even when the algo button is ON.
-A start-config 'Template=' that carries expertmode=1 fixes that layer too.
-
-Derives Bridge.tpl from the bundled ADX.tpl when present (keeps any user
-chart styling); otherwise writes a minimal chart template.  Idempotent:
-skips the write when the installed template already has expertmode=1.
-"""
 
 from __future__ import annotations
 
@@ -69,9 +58,7 @@ period_flags=0
 </chart>
 """
 
-
 def _candidate_sources() -> list[Path]:
-    """Existing templates to derive from, best first (user's own styling)."""
     out: list[Path] = []
     src = CONFIG.spot_dump_src.parent / "Profiles" / "Templates" / "ADX.tpl"
     out.append(src)
@@ -80,13 +67,10 @@ def _candidate_sources() -> list[Path]:
         out.append(TERMINALS[inst]["dir"] / "MQL5" / "Profiles" / "Templates" / "ADX.tpl")
     return [p for p in out if p.exists()]
 
-
 def _read_text_utf16(path: Path) -> str:
     return path.read_text(encoding="utf-16", errors="replace")
 
-
 def build_tpl_text() -> str:
-    """Bridge.tpl text: any base template with expertmode forced to 1."""
     for src in _candidate_sources():
         try:
             text = _read_text_utf16(src)
@@ -109,7 +93,6 @@ def build_tpl_text() -> str:
     log.info("no base template found - writing minimal Bridge.tpl")
     return MINIMAL_TPL.replace("\r\n", "\n").replace("\n", "\r\n")
 
-
 def needs_install(dst: Path, tpl_text: str) -> bool:
     if not dst.exists():
         return True
@@ -117,7 +100,6 @@ def needs_install(dst: Path, tpl_text: str) -> bool:
         return "expertmode=1" not in _read_text_utf16(dst).lower()
     except OSError:
         return True
-
 
 def install() -> bool:
     tpl_text = build_tpl_text()
@@ -133,7 +115,6 @@ def install() -> bool:
                 log.info(f"terminal {inst}: wrote {dst}")
             else:
                 log.info(f"terminal {inst}: {TPL_NAME} already has expertmode=1")
-            # legacy dir too - older builds look in Profiles\\Templates first
             legacy_dir.mkdir(parents=True, exist_ok=True)
             legacy_dst = legacy_dir / TPL_NAME
             if needs_install(legacy_dst, tpl_text):
@@ -143,7 +124,6 @@ def install() -> bool:
             log.error(f"terminal {inst}: template install failed: {exc}")
             ok = False
     return ok
-
 
 if __name__ == "__main__":
     raise SystemExit(0 if install() else 1)

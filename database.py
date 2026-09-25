@@ -1,21 +1,4 @@
 #!/usr/bin/env python3.12
-"""database.py - the one store for everything persistent (PostgreSQL + SQLite).
-
-Supports both PostgreSQL (via DATABASE_URL env var) and SQLite (fallback).
-Tables:
-  * future_trades : trades scheduled from the web panel (pair, lot,
-    number of positions, execute time, close time) - executor.py polls
-    this table and fires each trade to the second;
-  * fired log     : one row per executed schedule slot (id, ticket,
-    result) so the panel can show what actually happened;
-  * kv            : small JSON blobs (equity-curve history, metrics).
-
-Threading: connections are per-call (context manager) and every
-write is wrapped in a transaction, so the Flask threads, the executor
-thread and the metrics observer can share the database safely.
-
-Schema is created on first import - no migrations needed for now.
-"""
 
 from __future__ import annotations
 
@@ -32,19 +15,14 @@ from config import CONFIG, setup_logging
 
 log = setup_logging(__name__)
 
-# Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
 
-# PostgreSQL connection pool (if using PostgreSQL)
 _pg_pool = None
 _pg_lock = threading.Lock()
 
-# SQLite connection (if using SQLite)
-# MT5_DB_PATH lets tests (or a second instance) point at a private DB file
 _sqlite_path = Path(os.getenv("MT5_DB_PATH", "") or CONFIG.db_path)
 _sqlite_lock = threading.Lock()
-
 
 if USE_POSTGRES:
     try:
@@ -60,11 +38,6 @@ if USE_POSTGRES:
 if not USE_POSTGRES:
     log.info(f"Using SQLite: {_sqlite_path}")
 
-
-# --------------------------------------------------------------------------
-# Connection management
-# --------------------------------------------------------------------------
-
 def _get_pg_pool():
     global _pg_pool
     if _pg_pool is None:
@@ -75,16 +48,13 @@ def _get_pg_pool():
                     maxconn=20,
                     dsn=DATABASE_URL,
                     cursor_factory=RealDictCursor,
-                    # fail fast instead of hanging the web thread
                     options="-c statement_timeout=5000 -c lock_timeout=2000",
                 )
                 log.info("PostgreSQL connection pool created (2-20 conns, 5s stmt timeout)")
     return _pg_pool
 
-
 @contextmanager
 def _pg_conn():
-    """Get a PostgreSQL connection from the pool."""
     p = _get_pg_pool()
     conn = p.getconn()
     try:
@@ -96,26 +66,10 @@ def _pg_conn():
     finally:
         p.putconn(conn)
 
-
 _sqlite_conn_obj: sqlite3.Connection | None = None
-
 
 @contextmanager
 def _sqlite_conn():
-    """ONE autocommit connection, reused, serialised by _sqlite_lock.
-
-    Every call used to open a fresh connection and re-issue eight pragmas.
-    Three of those (journal_mode, page_size, auto_vacuum) persist in the
-    file header and were no-ops after the first run; the rest cost a round
-    trip each.  More importantly the connect() itself dominated, and the
-    scheduler re-lists due schedules up to 200x/s in the two seconds before
-    a fire WHILE HOLDING THIS LOCK - so the setup cost sat on the web app's
-    critical path as well.
-
-    Reusing one connection is safe here: the lock already serialises every
-    caller, and isolation_level=None means each statement is its own
-    transaction, so no reader ever pins a WAL snapshot.
-    """
     global _sqlite_conn_obj
     with _sqlite_lock:
         conn = _sqlite_conn_obj
@@ -128,23 +82,19 @@ def _sqlite_conn():
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("PRAGMA cache_size=-32768")     # 32 MB
+            conn.execute("PRAGMA cache_size=-32768")
             _sqlite_conn_obj = conn
         try:
             yield conn
         except Exception:
-            # autocommit: only an explicitly opened transaction can be
-            # pending, but never leave one behind on a shared connection.
             try:
                 conn.rollback()
             except sqlite3.Error:
                 pass
             raise
 
-
 @contextmanager
 def _conn():
-    """Get a database connection (PostgreSQL or SQLite)."""
     if USE_POSTGRES:
         with _pg_conn() as conn:
             yield conn
@@ -152,22 +102,14 @@ def _conn():
         with _sqlite_conn() as conn:
             yield conn
 
-
-# --------------------------------------------------------------------------
-# Schema initialization
-# --------------------------------------------------------------------------
-
 def init_db() -> None:
-    """Create tables if they don't exist."""
     if USE_POSTGRES:
         _init_pg()
     else:
         _init_sqlite()
     _migrate()
 
-
 def _migrate() -> None:
-    """Lightweight idempotent migrations (no migration framework yet)."""
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
@@ -182,16 +124,6 @@ def _migrate() -> None:
             if "ms" not in cols:
                 cur.execute("ALTER TABLE fired ADD COLUMN ms REAL")
 
-        # CLONE PROTECTION: an exact duplicate of an ACTIVE schedule (same
-        # account/pair/side/lot/positions/exec/close) must be IMPOSSIBLE,
-        # whatever path tries to create one (double POST from a stale page,
-        # two browsers, a race between the check and the write).  First
-        # demote any clones that already exist (keep the oldest id), then
-        # enforce it at the engine level with a unique partial index.
-        # Paused schedules are exempt: they can never fire, and ARMing one
-        # goes through the duplicate check in the update endpoint.
-        # NOTE: plain cur.execute here - _exec/_fetchone are defined further
-        # down and this runs at import time.
         ph = "%s" if USE_POSTGRES else "?"
         act = "TRUE" if USE_POSTGRES else "1"
         grp = ("account, pair, side, lot, n_positions, "
@@ -207,7 +139,6 @@ def _migrate() -> None:
         if deduped and deduped > 0:
             log.warning(f"schedule dedupe: demoted {deduped} clone row(s) - "
                         f"identical active schedules are no longer allowed")
-
 
 def _init_pg() -> None:
     with _conn() as c:
@@ -259,7 +190,6 @@ def _init_pg() -> None:
         );
         """)
 
-
 def _init_sqlite() -> None:
     with _conn() as c:
         c.executescript("""
@@ -305,26 +235,13 @@ def _init_sqlite() -> None:
         );
         """)
 
-
 init_db()
-
-
-# --------------------------------------------------------------------------
-# Helper functions for cross-DB compatibility
-# --------------------------------------------------------------------------
 
 def _now_iso() -> str:
     import datetime as dt
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
-
 def _exec(cur, query: str, params: tuple) -> Any:
-    """Execute query with proper placeholder style.
-
-    (A previous version cached cursors across connections as 'prepared
-    statements'; sqlite3 caches statements internally per connection, and
-    a cursor from another connection is invalid, so the cache was both
-    useless and a latent bug.)"""
     if USE_POSTGRES:
         cur.execute(query, params)
     else:
@@ -332,48 +249,22 @@ def _exec(cur, query: str, params: tuple) -> Any:
         cur.execute(q, params)
     return cur
 
-
 def _fetchone(cur) -> dict | None:
     r = cur.fetchone()
     return dict(r) if r else None
 
-
 def _fetchall(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
-
-# --------------------------------------------------------------------------
-# future trades
-# --------------------------------------------------------------------------
-
 class DuplicateScheduleError(Exception):
-    """Raised when a create/update would produce an exact clone of an
-    already-ACTIVE schedule.  The panel turns this into a clear 409 so the
-    operator sees WHY nothing was saved instead of finding a clone row."""
-
+    pass
 
 def _local_to_utc(dt_obj: dt.datetime) -> dt.datetime:
-    """Interpret a naive LOCAL wall-clock datetime and convert it to UTC.
-
-    The panel's time pickers are read in the OPERATOR'S wall clock (what the
-    terminal/monitor/browser clock shows).  Schedules used to be anchored as
-    if those numbers were UTC, which silently shifted every slot by the
-    machine's tz offset (observed: UTC+3 box -> slots fired 3 h late).
-    """
     return dt_obj.astimezone(dt.timezone.utc)
-
 
 def add_future_trade(account: int, pair: str, side: str, lot: float,
                      n_positions: int, exec_h: int, exec_m: int, exec_s: int,
                      close_h: int, close_m: int, close_s: int) -> int:
-    """Insert a schedule; returns its id. next_fire = today (or tomorrow if
-    the time already passed) at exec_h:exec_m:exec_s IN LOCAL WALL CLOCK
-    (converted to UTC for storage).
-
-    `pair` is stored EXACTLY as given: MT5 symbol names are case-sensitive
-    (Deriv's 'Boom 1000 Index' must never become 'BOOM 1000 INDEX' or every
-    order dies with 'unknown symbol').  FX pairs arrive uppercase anyway.
-    """
     import datetime as dt
     now_local = dt.datetime.now().astimezone()
     fire = _local_to_utc(now_local.replace(hour=exec_h, minute=exec_m,
@@ -382,9 +273,6 @@ def add_future_trade(account: int, pair: str, side: str, lot: float,
     if fire <= now:
         fire += dt.timedelta(days=1)
 
-    # CLONE GUARD: refuse to write an exact copy of a schedule that is
-    # already armed.  uq_future_trades_active (see _migrate) is the
-    # engine-level backstop for a race between this check and the INSERT.
     dup = find_duplicate(account, pair, side, lot, n_positions,
                          exec_h, exec_m, exec_s, close_h, close_m, close_s)
     if dup:
@@ -426,22 +314,15 @@ def add_future_trade(account: int, pair: str, side: str, lot: float,
                 "an identical active schedule already exists - none created") from exc
         raise
 
-
 def _is_unique_violation(exc: Exception) -> bool:
-    """True for a unique-constraint failure on either backend."""
     if isinstance(exc, sqlite3.IntegrityError):
         return True
     return "duplicate key" in str(exc) or "UNIQUE constraint" in str(exc)
-
 
 def find_duplicate(account: int, pair: str, side: str, lot: float,
                    n_positions: int, exec_h: int, exec_m: int, exec_s: int,
                    close_h: int, close_m: int, close_s: int,
                    exclude_id: int | None = None) -> dict | None:
-    """An ACTIVE schedule identical in every trade-relevant field, or None.
-    Used by add_future_trade and by the create/update endpoints so a clone
-    can never be written through any path; the unique partial index
-    uq_future_trades_active is the engine-level backstop."""
     ph = "%s" if USE_POSTGRES else "?"
     act = "TRUE" if USE_POSTGRES else "1"
     q = (f"SELECT * FROM future_trades WHERE active={act} "
@@ -459,9 +340,7 @@ def find_duplicate(account: int, pair: str, side: str, lot: float,
         _exec(cur, q, tuple(params))
         return _fetchone(cur)
 
-
 def due_schedules(now: float | None = None) -> list[dict]:
-    """Schedules whose next_fire has passed (executor fires these)."""
     import datetime as dt
     now_dt = dt.datetime.fromtimestamp(now, dt.timezone.utc) if now else dt.datetime.now(dt.timezone.utc)
     with _conn() as c:
@@ -478,11 +357,7 @@ def due_schedules(now: float | None = None) -> list[dict]:
                 (now_dt.isoformat(timespec="seconds"),))
         return _fetchall(cur)
 
-
 def reschedule(sid: int) -> None:
-    """Move a schedule's next_fire to the next occurrence of its exec time
-    STRICTLY AFTER the current next_fire (forward anchor: never same/earlier,
-    even when next_fire is already tomorrow-at-exec-time)."""
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
@@ -495,11 +370,7 @@ def reschedule(sid: int) -> None:
         _update_fire(cur, sid, row["exec_h"], row["exec_m"], row["exec_s"],
                      row["next_fire"])
 
-
 def reschedule_at(sid: int, when) -> None:
-    """Force a schedule's next_fire to an exact UTC moment (used by the
-    executor's crash-safe retry: the claimed slot is handed back to 'now'
-    so the fire is retried seconds later instead of a day later)."""
     if isinstance(when, str):
         when = dt.datetime.fromisoformat(when)
     if getattr(when, "tzinfo", None) is None:
@@ -513,12 +384,7 @@ def reschedule_at(sid: int, when) -> None:
             _exec(cur, "UPDATE future_trades SET next_fire=? WHERE id=?",
                   (when.isoformat(timespec="seconds"), sid))
 
-
 def claim_schedule(sid: int, expected_fire) -> bool:
-    """Atomic compare-and-swap claim: move next_fire to the next exec-time
-    occurrence after `expected_fire` IFF the stored next_fire still equals
-    `expected_fire`.  Returns True when THIS caller won the claim - only a
-    winner may fire, so two scheduler processes can never double-fire."""
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
@@ -541,13 +407,7 @@ def claim_schedule(sid: int, expected_fire) -> bool:
                 (nxt.isoformat(timespec="seconds"), sid, exp))
         return cur.rowcount > 0
 
-
 def _next_fire_from(exec_h: int, exec_m: int, exec_s: int, anchor) -> dt.datetime:
-    """Next occurrence of exec_h:exec_m:exec_s strictly after `anchor`
-    (aware UTC datetime or ISO string).  The H/M/S are LOCAL wall-clock
-    (see _local_to_utc): the anchored datetime is converted from local to
-    UTC before the comparison so daily re-fires land on the operator's
-    typed second, not the tz-shifted one."""
     if isinstance(anchor, str):
         try:
             anchor = dt.datetime.fromisoformat(anchor)
@@ -562,17 +422,14 @@ def _next_fire_from(exec_h: int, exec_m: int, exec_s: int, anchor) -> dt.datetim
         nxt_local += dt.timedelta(days=1)
     return _local_to_utc(nxt_local)
 
-
 def _update_fire(cur, sid: int, exec_h: int, exec_m: int, exec_s: int,
                  current_fire) -> None:
-    """Unconditional forward-only next_fire update (reschedule helper)."""
     nxt = _next_fire_from(exec_h, exec_m, exec_s, current_fire)
     if USE_POSTGRES:
         _exec(cur, "UPDATE future_trades SET next_fire=%s WHERE id=%s", (nxt, sid))
     else:
         _exec(cur, "UPDATE future_trades SET next_fire=? WHERE id=?",
               (nxt.isoformat(timespec="seconds"), sid))
-
 
 def deactivate(sid: int) -> None:
     with _conn() as c:
@@ -582,20 +439,12 @@ def deactivate(sid: int) -> None:
         else:
             _exec(cur, "UPDATE future_trades SET active=0 WHERE id=?", (sid,))
 
-
 def update_schedule(sid: int, *, pair: str | None = None, side: str | None = None,
                     lot: float | None = None, n_positions: int | None = None,
                     exec_h: int | None = None, exec_m: int | None = None,
                     exec_s: int | None = None, close_h: int | None = None,
                     close_m: int | None = None, close_s: int | None = None,
                     active: bool | None = None) -> bool:
-    """Adjust an existing schedule in place (EDIT from the scheduled page).
-
-    Any field left None keeps its current value.  When the exec time (or the
-    active flag) changes, next_fire is recomputed from the NEW exec time
-    anchored at NOW: editing a schedule that already fired today must arm it
-    for its next occurrence computed from the new time - not leave a stale
-    next_fire.  Returns True when a row was updated."""
     cur_sch = get_schedule(sid)
     if not cur_sch:
         return False
@@ -613,11 +462,6 @@ def update_schedule(sid: int, *, pair: str | None = None, side: str | None = Non
     act = 1 if act in (1, True) else 0
     now = dt.datetime.now(dt.timezone.utc)
 
-    # CLONE GUARD: an edit that would make this schedule identical to
-    # ANOTHER active one is refused (e.g. re-arming a paused row whose
-    # identity an armed twin already holds).  The unique partial index is
-    # the engine-level backstop for a race between this check and the
-    # UPDATE.
     if act:
         dup = find_duplicate(account=cur_sch["account"], pair=p, side=s,
                              lot=l, n_positions=n, exec_h=eh, exec_m=em,
@@ -629,11 +473,6 @@ def update_schedule(sid: int, *, pair: str | None = None, side: str | None = Non
                 f"{cur_sch['account']} {p} {s} {l} x{n} at "
                 f"{eh:02d}:{em:02d}:{es:02d} (edit or PAUSE that one instead)")
 
-    # NEXT_FIRE POLICY: only re-anchor when the exec time actually changed.
-    # Every save used to recompute next_fire anchored at NOW, so touching an
-    # UNFIRED schedule (e.g. a lot tweak minutes before the slot) silently
-    # jumped 'in 2 m' to 'tomorrow' - the panel then showed two slots for the
-    # same daily trade and read like a clone had been created.
     same_exec = (int(eh) == int(cur_sch["exec_h"])
                  and int(em) == int(cur_sch["exec_m"])
                  and int(es) == int(cur_sch["exec_s"]))
@@ -646,11 +485,8 @@ def update_schedule(sid: int, *, pair: str | None = None, side: str | None = Non
     if cur_fire is not None and getattr(cur_fire, "tzinfo", None) is None:
         cur_fire = cur_fire.replace(tzinfo=dt.timezone.utc)
     if same_exec and cur_fire is not None and cur_fire > now:
-        fire = cur_fire               # pre-fire edit: keep the armed countdown
+        fire = cur_fire
     else:
-        # exec time changed, or the slot already fired/passed: re-arm from
-        # the (possibly new) exec time anchored now, using the same LOCAL
-        # wall-clock semantics as add_future_trade
         now_local = dt.datetime.now().astimezone()
         fire = _local_to_utc(now_local.replace(hour=int(eh), minute=int(em),
                                                second=int(es), microsecond=0))
@@ -679,10 +515,7 @@ def update_schedule(sid: int, *, pair: str | None = None, side: str | None = Non
                 "another active schedule already does this - none changed") from exc
         raise
 
-
 def delete_schedule(sid: int) -> bool:
-    """HARD delete: remove the row entirely (the scheduled page's DEL).
-    deactivate() only flips the flag; this makes it disappear for good."""
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
@@ -691,11 +524,7 @@ def delete_schedule(sid: int) -> bool:
             _exec(cur, "DELETE FROM future_trades WHERE id=?", (sid,))
         return cur.rowcount > 0
 
-
 def clear_history() -> int:
-    """START AFRESH: wipe the entire fired log and remove every INACTIVE
-    schedule (active schedules are kept - they are armed trades, not
-    history).  Returns the number of rows deleted."""
     deleted = 0
     with _conn() as c:
         cur = c.cursor()
@@ -711,7 +540,6 @@ def clear_history() -> int:
             deleted += max(0, cur.rowcount)
     return deleted
 
-
 def list_future_trades(active_only: bool = False) -> list[dict]:
     q = "SELECT * FROM future_trades"
     if active_only:
@@ -725,7 +553,6 @@ def list_future_trades(active_only: bool = False) -> list[dict]:
         _exec(cur, q, ())
         return _fetchall(cur)
 
-
 def get_schedule(sid: int) -> dict | None:
     with _conn() as c:
         cur = c.cursor()
@@ -735,16 +562,9 @@ def get_schedule(sid: int) -> dict | None:
             _exec(cur, "SELECT * FROM future_trades WHERE id=?", (sid,))
         return _fetchone(cur)
 
-
-# --------------------------------------------------------------------------
-# fired log
-# --------------------------------------------------------------------------
-
 def log_fired(schedule_id: int, account: int, pair: str, side: str,
               lot: float, kind: str, ticket: str, ok: bool, detail: str,
               ms: float | None = None) -> None:
-    """Log one fired command.  `ms` = wall milliseconds the whole fire took
-    (batch of n opens -> same ms on each of the n rows) - latency auditing"""
     import datetime as dt
     with _conn() as c:
         cur = c.cursor()
@@ -762,7 +582,6 @@ def log_fired(schedule_id: int, account: int, pair: str, side: str,
                  1 if ok else 0, detail, ms,
                  dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")))
 
-
 def list_fired(limit: int = 50) -> list[dict]:
     with _conn() as c:
         cur = c.cursor()
@@ -772,11 +591,7 @@ def list_fired(limit: int = 50) -> list[dict]:
             _exec(cur, "SELECT * FROM fired ORDER BY id DESC LIMIT ?", (limit,))
         return _fetchall(cur)
 
-
 def fired_since(iso_utc: str) -> list[dict]:
-    """Fired rows logged at or after `iso_utc` (ascending) - the executor's
-    boot catch-up uses this to re-arm retries for slots that transiently
-    failed while the process was down."""
     with _conn() as c:
         cur = c.cursor()
         if USE_POSTGRES:
@@ -786,11 +601,6 @@ def fired_since(iso_utc: str) -> list[dict]:
             _exec(cur, "SELECT * FROM fired WHERE at >= ? ORDER BY id ASC",
                   (iso_utc,))
         return _fetchall(cur)
-
-
-# --------------------------------------------------------------------------
-# kv blobs (equity curve, metrics)
-# --------------------------------------------------------------------------
 
 def kv_set(key: str, value: Any) -> None:
     with _conn() as c:
@@ -806,7 +616,6 @@ def kv_set(key: str, value: Any) -> None:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, json.dumps(value)))
 
-
 def kv_get(key: str, default=None):
     with _conn() as c:
         cur = c.cursor()
@@ -817,15 +626,7 @@ def kv_get(key: str, default=None):
         r = _fetchone(cur)
         return json.loads(r["value"]) if r else default
 
-
-# --------------------------------------------------------------------------
-# retention: the UI shows only the past 24 h of fired rows
-# --------------------------------------------------------------------------
-
 def prune_fired(hours: int = 24) -> int:
-    """Delete fired-log rows older than `hours` (default 24) - the scheduled
-    page is a 'what happened recently' view, not an archive.  Returns the
-    count of deleted rows."""
     cutoff = (dt.datetime.now(dt.timezone.utc)
               - dt.timedelta(hours=hours)).isoformat(timespec="seconds")
     with _conn() as c:
@@ -836,12 +637,7 @@ def prune_fired(hours: int = 24) -> int:
             _exec(cur, "DELETE FROM fired WHERE at < ?", (cutoff,))
         return cur.rowcount
 
-
 def prune_inactive_schedules(days: int = 1) -> int:
-    """Drop inactive schedules older than `days` (default 1) so the table
-    cannot fill up with deleted rows forever - the 24-hour afresh policy
-    applies to inactive schedules as well as the fired log.  Returns the
-    count of deleted rows."""
     cutoff = (dt.datetime.now(dt.timezone.utc)
               - dt.timedelta(days=days)).isoformat(timespec="seconds")
     with _conn() as c:
@@ -856,9 +652,7 @@ def prune_inactive_schedules(days: int = 1) -> int:
                   (cutoff,))
         return cur.rowcount
 
-
 if __name__ == "__main__":
-    # Quick test
     print("Testing database connection...")
     print(f"Using PostgreSQL: {USE_POSTGRES}")
     print(f"Future trades: {list_future_trades()}")

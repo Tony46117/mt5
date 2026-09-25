@@ -1,21 +1,4 @@
 #!/usr/bin/env python3.12
-"""info.py - full information about the accounts logged into the two MT5
-terminals (identities come from the runtime login session - session.py -
-set up by bridge.py; data comes from the SpotDump EA bridge).
-
-Shows, per account: login, holder, broker, server, currency, trade/margin
-mode, leverage, balance, equity, floating P/L, margin state, position
-count, live SPREADS (pts) for every symbol the terminal quotes and the
-probed best order FILLING method (broker_prober.py) so you can see exactly
-how orders will be filled.
-
-Two consumers:
-  * CLI:      python info.py            # one snapshot and exit
-              python info.py --watch    # static screen, redraws on change
-  * web:      snapshot() -> JSON-friendly dict for the web dashboard
-              (see app.py / front.py); spread() is the single place that
-              turns a bid/ask into a spread in points.
-"""
 
 from __future__ import annotations
 
@@ -37,24 +20,16 @@ log = setup_logging(__name__)
 MARGIN_MODES = {0: "netting", 1: "exchange", 2: "hedging"}
 TRADE_MODES = {0: "demo", 1: "contest", 2: "real"}
 
-
 def _probed_filling(inst: int, sym: str) -> str:
-    """Best order filling for (terminal, symbol) from the broker prober;
-    '' when the prober has not probed it (never blocks rendering)."""
     try:
         import broker_prober
         return broker_prober.best_filling(inst, sym) or ""
     except Exception:
         return ""
 
-
 _PROBE_TS = 0.0
 
-
 def _ensure_probed() -> None:
-    """CLI convenience: when this process has no probe results yet (app.py
-    normally owns them), run one quick probe so the FILLING column shows
-    real answers.  Throttled to once a minute (--watch)."""
     global _PROBE_TS
     if time.time() - _PROBE_TS < 60:
         return
@@ -70,16 +45,13 @@ def _ensure_probed() -> None:
     except Exception:
         pass
 
-
 def f(v: str) -> float:
     try:
         return float(v)
     except ValueError:
         return 0.0
 
-
 def spread_pts(sym: str, spots: dict) -> float | None:
-    """Spread of `sym` in points from the (bid, ask, ts) map; None if no quote."""
     bid, ask, _ = spots.get(sym, ("", "", ""))
     if not bid or not ask:
         return None
@@ -89,27 +61,14 @@ def spread_pts(sym: str, spots: dict) -> float | None:
     except ValueError:
         return None
 
-
 def spread(sym: str, spots: dict) -> str:
-    """Spread of `sym` formatted for the terminal ('-' when no quote)."""
     s = spread_pts(sym, spots)
     return f"{s:.0f} pts" if s is not None else f"{DIM}-{RESET}"
-
 
 def acc_line(label: str, value: str, color: str = "") -> str:
     return f"  {DIM}{label:<15}{RESET} {color}{value}{RESET}"
 
-
-# --------------------------------------------------------------------------
-# structured snapshot (web dashboard consumes this)
-# --------------------------------------------------------------------------
-
 def snapshot() -> dict:
-    """JSON-friendly live state of both accounts for the web dashboard.
-
-    {'ts': iso, 'feeds': {'age_1': s, 'age_2': s, 'running_1': b, ...},
-     'accounts': {'1': {...account fields..., 'spreads': {...}}, '2': {...}}}
-    """
     accs = read_accounts()
     spots = read_spots()
     out: dict = {"ts": dt.datetime.now().isoformat(timespec="seconds"),
@@ -154,21 +113,15 @@ def snapshot() -> dict:
             "margin_free": round(f(head.get("margin_free", "")), 2),
             "margin_level": round(f(head.get("margin_level", "")), 2),
             "positions": head.get("positions", 0),
-            "algo_allowed": head.get("trade_allowed", ""),   # EA v1.50+: 1=algo on
+            "algo_allowed": head.get("trade_allowed", ""),
             "mql_allowed": head.get("mql_allowed", ""),
             "identity_ok": bool(login_got) and login_got == expected,
             "live": age < 5,
             "age_s": round(age, 2),
             "spreads": {sym: spread_pts(sym, spots) for sym in spots},
-            # broker-probe results per symbol: best filling + spread pts
             "fillings": {sym: _probed_filling(inst, sym) for sym in spots},
         }
     return out
-
-
-# --------------------------------------------------------------------------
-# terminal rendering
-# --------------------------------------------------------------------------
 
 def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     age = feed_age(inst)
@@ -245,7 +198,6 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
         out.append(f"  {sym:<8}{b:>11}{a:>11}  {spread(sym, spots):>10}  {fill_s}")
     return "\n".join(out)
 
-
 def build_frame() -> str:
     accs = read_accounts()
     spots = read_spots()
@@ -272,7 +224,6 @@ def build_frame() -> str:
         out.append(f"{RED}note: nobody logged in - run bridge.py to log in{RESET}")
     return "\n".join(out)
 
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Full account info for both MT5 terminals")
     ap.add_argument("--watch", action="store_true",
@@ -291,7 +242,7 @@ def main() -> int:
     try:
         while True:
             frame = build_frame()
-            if frame != last:                    # redraw only on change
+            if frame != last:
                 if first:
                     sys.stdout.write("\033[2J\033[H" + frame + "\033[?25l")
                     first = False
@@ -304,7 +255,6 @@ def main() -> int:
         log.info("info watch stopped")
         sys.stdout.write("\033[?25h\nbye!\n")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
