@@ -30,15 +30,6 @@ MAX_FIRE_LATE = 120.0
 FIRE_DEADLINE = 20.0
 RETRY_DELAY_S = 0.5
 RETRY_MAX = 3
-HARD_REJECT_MARKERS = ("10017", "10019", "10027",
-                       "unknown symbol", "invalid volume")
-TRANSIENT_RETRY_MARKERS = ("10018", "bad volume or no quote", "10020", "10021",
-                           "10004", "10006", "10008", "10015", "10031",
-                           "requote", "price changed", "no quotes",
-                           "market closed", "no connection")
-RETRY_SCHED_FIRST_DELAY_S = 45.0
-RETRY_SCHED_MAX_RETRY_S = 300.0
-RETRY_SCHED_EPOCH_S = 7200.0
 RETCODE_HINTS = {
     "10004": "requote", "10006": "rejected by broker", "10013": "invalid request",
     "10014": "invalid volume", "10015": "invalid price", "10016": "invalid stops",
@@ -288,8 +279,7 @@ def _restart_terminal_async(inst: int) -> None:
 class FutureTradeScheduler(threading.Thread):
 
     __slots__ = ('stop_flag', '_closes', '_closes_lock',
-                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts',
-                 '_slot_attempts', '_slot_next_try', '_catchup_done')
+                 '_hz_ts', '_hz_val', '_janitor_ts', '_heal_ts', '_boot_ts')
 
     def __init__(self):
         super().__init__(daemon=True, name="future-trade-scheduler")
@@ -301,9 +291,6 @@ class FutureTradeScheduler(threading.Thread):
         self._janitor_ts = 0.0
         self._heal_ts = {1: 0.0, 2: 0.0}
         self._boot_ts = time.monotonic()
-        self._slot_attempts: dict[int, list] = {}
-        self._slot_next_try: dict[int, float] = {}
-        self._catchup_done = False
 
     @staticmethod
     def _is_trading_day(dt_obj: dt.datetime) -> bool:
@@ -426,8 +413,6 @@ class FutureTradeScheduler(threading.Thread):
                         f"> {MAX_FIRE_LATE:.0f}s - one-shot schedule done, "
                         f"NOT fired late")
             db.deactivate(sch["id"])
-            self._slot_attempts.pop(sch["id"], None)
-            self._slot_next_try.pop(sch["id"], None)
             return False
         return db.claim_schedule(sch["id"], sch["next_fire"])
 
@@ -452,121 +437,27 @@ class FutureTradeScheduler(threading.Thread):
             return
         opened = {"ok": 0}
         try:
-            results = self._fire_inner(sch, opened)
+            self._fire_inner(sch, opened)
         except Exception as exc:
             if opened["ok"] > 0:
                 log.error(f"schedule #{sch['id']} fire crashed AFTER "
                           f"{opened['ok']} opens ({exc}) - slot consumed, "
-                          f"NOT retrying (duplicates)")
+                          f"NOT re-fired (duplicates)")
                 try:
                     self._register_close(sch)
                 except Exception:
                     log.error(f"schedule #{sch['id']}: could not arm the "
                               f"auto-close after the crash")
             else:
-                log.error(f"schedule #{sch['id']} fire CRASHED before any "
-                          f"open ({exc}) - retrying slot in 2 s")
-                try:
-                    db.reschedule_at(sch["id"],
-                                     dt.datetime.now(dt.timezone.utc)
-                                     + dt.timedelta(seconds=2))
-                except Exception:
-                    log.error(f"schedule #{sch['id']} could not be "
-                              f"rescheduled after crash: {exc}")
-        else:
-            if (opened["ok"] == 0 and results is not None
-                    and self._failed_open_transient(results)):
-                self._retry_failed_slot(sch, dt.datetime.now(dt.timezone.utc))
-            else:
-                db.deactivate(sch["id"])
-                self._slot_attempts.pop(sch["id"], None)
-                self._slot_next_try.pop(sch["id"], None)
-
-    @staticmethod
-    def _failed_open_transient(results: list[tuple[bool, str]]) -> bool:
-        return any(not ok and any(m in det for m in TRANSIENT_RETRY_MARKERS)
-                   for ok, det in results)
-
-    def _retry_failed_slot(self, sch: dict, now_utc: dt.datetime) -> None:
-        sid = sch["id"]
-        st = self._slot_attempts.get(sid)
-        if st is None:
-            st = [time.monotonic(), 0]
-            self._slot_attempts[sid] = st
-        st[1] += 1
-        elapsed = time.monotonic() - st[0]
-        if elapsed > RETRY_SCHED_EPOCH_S:
-            self._slot_attempts.pop(sid, None)
-            self._slot_next_try.pop(sid, None)
-            try:
-                db.log_fired(sid, sch["account"], sch.get("pair", ""),
-                             sch.get("side", ""), sch["lot"], "giveup", "",
-                             False,
-                             f"slot abandoned after {st[1]} attempts in "
-                             f"{elapsed / 60:.0f} min - broker kept rejecting "
-                             f"(market closed / no quote)")
-            except Exception:
-                pass
-            log.warning(f"schedule #{sid}: slot given up after {st[1]} "
-                        f"attempts / {elapsed / 60:.0f} min - one-shot done")
-            db.deactivate(sid)
-            return
-        delay = min(RETRY_SCHED_MAX_RETRY_S,
-                    max(RETRY_SCHED_FIRST_DELAY_S, 45.0 * st[1]))
-        self._slot_next_try[sid] = time.monotonic() + delay
-        log.warning(f"schedule #{sid} {sch.get('pair')}: broker rejected the "
-                    f"opens (market closed / no quote) - retry #{st[1]} in "
-                    f"{delay:.0f} s")
-
-    def retry_snapshot(self) -> dict[int, dict]:
-        now_m = time.monotonic()
-        out: dict[int, dict] = {}
-        for sid, (_t0, tries) in self._slot_attempts.items():
-            nxt = self._slot_next_try.get(sid)
-            out[sid] = {"tries": tries,
-                        "next_in": (max(0.0, round(nxt - now_m))
-                                    if nxt is not None else None)}
-        return out
-
-    def _recover_pending_slots(self) -> None:
-        try:
-            boot_iso = (dt.datetime.now(dt.timezone.utc)
-                        - dt.timedelta(seconds=time.monotonic()))
-            since = (boot_iso - dt.timedelta(minutes=10)).isoformat(
-                timespec="seconds")
-            rows = db.fired_since(since)
-        except Exception as exc:
-            log.warning(f"boot catch-up scan failed (non-fatal): {exc}")
-            return
-        if not rows:
-            return
-        last_by_sched: dict[int, dict] = {}
-        for r in rows:
-            last_by_sched[r["schedule_id"]] = r
-        now = dt.datetime.now(dt.timezone.utc)
-        for sid, r in last_by_sched.items():
-            if r["ok"] or r["kind"] not in ("open", "retry-open"):
-                continue
-            if not any(m in (r["detail"] or "")
-                       for m in TRANSIENT_RETRY_MARKERS):
-                continue
-            sch = db.get_schedule(sid)
-            if not sch or not sch.get("active"):
-                continue
-            nf = self._fire_dt(sch)
-            if nf is None or nf <= now:
-                continue
-            log.info(f"boot catch-up: schedule #{sid} had a transiently "
-                     f"failed slot before the restart - re-arming retries")
-            self._retry_failed_slot(sch, now)
+                log.error(f"schedule #{sch['id']} fire crashed before any "
+                          f"open ({exc}) - slot consumed (no retries)")
+        db.deactivate(sch["id"])
 
     def _fire_inner(self, sch: dict, opened: dict | None = None) -> None:
         acc = sch["account"]
         pair, side, lot = sch["pair"], sch["side"], sch["lot"]
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
-        ok_cnt = 0
-        blocked_10027 = 0
 
         commands = [("OPEN", pair, side, f"{lot:.2f}", "0", "0",
                      str(777000 + acc), f"sch#{sch['id']}")
@@ -575,75 +466,29 @@ class FutureTradeScheduler(threading.Thread):
         results = list(cmd.send_batch(*commands, timeout=FIRE_DEADLINE))
         fire_ms = (time.perf_counter() - t0) * 1000.0
 
-        def _count_open() -> None:
-            nonlocal ok_cnt
-            ok_cnt += 1
-            if opened is not None:
-                opened["ok"] = ok_cnt
-
-        summary_mode = (ok_cnt == 0 and bool(results)
-                        and self._failed_open_transient(results))
-        if summary_mode:
-            try:
-                db.log_fired(sch["id"], acc, pair, side, lot, "retry-open",
-                             "", False,
-                             f"x{n} rejected - {_explain(results[0][1])} "
-                             f"(auto-retrying until the market reopens)")
-            except Exception:
-                pass
-            log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
-                     f"0/{n} opened in {fire_ms:.1f} ms (transient - slot "
-                     f"retry scheduled)")
-            return results
-
+        ok_cnt = 0
+        blocked_10027 = 0
         for ok, detail in results:
             ticket = detail.split("|")[1] if ok and "|" in detail else ""
             db.log_fired(sch["id"], acc, pair, side, lot, "open",
                          ticket, ok, _explain(detail), ms=fire_ms)
             if ok:
-                _count_open()
+                ok_cnt += 1
+                if opened is not None:
+                    opened["ok"] = ok_cnt
             elif "10027" in detail:
                 blocked_10027 += 1
-
-        first_attempt_all_transient = (
-            ok_cnt == 0 and bool(results) and self._failed_open_transient(results))
-        for attempt in range(1, RETRY_MAX):
-            retry_idx = [i for i, (ok, det) in enumerate(results)
-                         if not ok and "not responding" not in det
-                         and not any(m in det for m in HARD_REJECT_MARKERS)]
-            if not retry_idx:
-                break
-            time.sleep(RETRY_DELAY_S)
-            log.warning(f"schedule #{sch['id']}: auto-retry {attempt}/"
-                        f"{RETRY_MAX - 1} for {len(retry_idx)} failed open(s) "
-                        f"(+{RETRY_DELAY_S * 1000:.0f} ms)")
-            for i in retry_idx:
-                ok, detail = cmd.send(*commands[i], timeout=FIRE_DEADLINE)
-                results[i] = (ok, detail)
-                ticket = detail.split("|")[1] if ok and "|" in detail else ""
-                db.log_fired(sch["id"], acc, pair, side, lot, "open", ticket,
-                             ok, f"retry{attempt}: {_explain(detail)}",
-                             ms=(time.perf_counter() - t0) * 1000.0)
-                if ok:
-                    _count_open()
-                elif "10027" in detail:
-                    blocked_10027 += 1
 
         if blocked_10027 >= 2:
             log.error(f"schedule #{sch['id']}: terminal {acc} has "
                       f"ALGO TRADING OFF (10027) - restarting it")
             _restart_terminal_async(acc)
 
-        if ok_cnt > 0 or any(not ok and "not responding" in det
-                             for ok, det in results):
+        if ok_cnt > 0:
             self._register_close(sch)
-            self._slot_attempts.pop(sch["id"], None)
-            self._slot_next_try.pop(sch["id"], None)
         else:
             log.info(f"schedule #{sch['id']} acc{acc} {pair}: no position "
                      f"opened - auto-close not armed")
-            self._slot_attempts.pop(sch["id"], None)
-            self._slot_next_try.pop(sch["id"], None)
         log.info(f"schedule #{sch['id']} acc{acc} {pair} {side} {lot} x{n}: "
                  f"{ok_cnt}/{n} opened in {fire_ms:.1f} ms")
         return results
@@ -715,49 +560,6 @@ class FutureTradeScheduler(threading.Thread):
                 if claimed:
                     self._fire_concurrently(claimed)
 
-                if self._slot_next_try:
-                    now_m = time.monotonic()
-                    for sid in [s for s, t in self._slot_next_try.items()
-                                if now_m >= t]:
-                        self._slot_next_try.pop(sid, None)
-                        st = self._slot_attempts.get(sid)
-                        if st is None:
-                            continue
-                        sch = next((r for r in db.list_future_trades()
-                                    if r["id"] == sid and r["active"]), None)
-                        if sch is None:
-                            self._slot_attempts.pop(sid, None)
-                            continue
-                        fired = {"ok": 0}
-                        try:
-                            results = self._fire_inner(sch, fired)
-                        except Exception as exc:
-                            log.error(f"schedule #{sid} slot retry crashed "
-                                      f"({exc}) - retry continues")
-                            self._slot_next_try[sid] = (now_m +
-                                                        RETRY_SCHED_FIRST_DELAY_S)
-                            continue
-                        if fired["ok"] > 0:
-                            log.info(f"schedule #{sid}: slot retry FILLED "
-                                     f"{fired['ok']} position(s)")
-                            self._slot_attempts.pop(sid, None)
-                            self._slot_next_try.pop(sid, None)
-                            db.deactivate(sid)
-                        elif self._failed_open_transient(results):
-                            self._retry_failed_slot(sch,
-                                                    dt.datetime.now(dt.timezone.utc))
-                        else:
-                            log.warning(f"schedule #{sid}: slot retry hit a "
-                                        f"hard reject - abandoning retries")
-                            self._slot_attempts.pop(sid, None)
-                            self._slot_next_try.pop(sid, None)
-                            db.deactivate(sid)
-
-                if not self._catchup_done and (time.monotonic()
-                                               - self._boot_ts) > 5.0:
-                    self._catchup_done = True
-                    self._recover_pending_slots()
-
                 self._sweep_stale_exec_in()
 
                 nearest = self._nearest_fire_seconds()
@@ -801,13 +603,15 @@ def stop_scheduler() -> None:
 
 _scheduler_instance: FutureTradeScheduler | None = None
 
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Trade executor via the SpotDump exec channel")
-    ap.add_argument("--ping", action="store_true", help="PING both terminals")
+    ap = argparse.ArgumentParser(description="manual / debug CLI for the MT5 bridge")
+    ap.add_argument("--ping", action="store_true",
+                    help="ping both terminals and show feed age")
     ap.add_argument("--open", nargs=4, metavar=("ACC", "PAIR", "SIDE", "LOT"),
-                    help="e.g. --open 1 EURUSD BUY 0.10")
+                    help="open a trade: acc pair side lot")
     ap.add_argument("--closeall", nargs=2, metavar=("ACC", "PAIR"),
-                    help="close all positions of ACC/PAIR (PAIR=ALL for everything)")
+                    help="close all positions for acc (pair or ALL)")
     ap.add_argument("--status", action="store_true", help="show schedule + fired log")
     args = ap.parse_args()
 
