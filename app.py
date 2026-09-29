@@ -25,6 +25,7 @@ from executor import start_scheduler, sender_for
 from monitor import read_positions, account_info
 import metrics
 import broker_prober
+import account_engine
 
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
@@ -172,6 +173,111 @@ def _ok(payload: dict | None = None):
 
 def _fail(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
+
+# ---------------- account integration engine ----------------
+
+@app.get("/api/engine/status")
+@rate_limit(max_requests=240, window=60)
+def api_engine_status():
+    try:
+        return jsonify(account_engine.get_engine().status())
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+
+@app.get("/api/engine/accounts")
+@rate_limit(max_requests=60, window=60)
+def api_engine_known():
+    try:
+        return _ok({"accounts": account_engine.get_engine().known()})
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+
+@app.post("/api/engine/login")
+@rate_limit(max_requests=12, window=60)
+def api_engine_login():
+    d = request.get_json(silent=True) or {}
+    try:
+        terminal = int(d.get("terminal", 0))
+    except (TypeError, ValueError):
+        return _fail("bad terminal")
+    try:
+        op = account_engine.get_engine().request_login(
+            terminal,
+            str(d.get("login", "")),
+            str(d.get("password", "")),
+            str(d.get("server", "")))
+    except account_engine.EngineError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"detail": f"terminal {terminal}: logging into "
+                          f"{d.get('login')} @ {d.get('server')} ...",
+                "op": op})
+
+@app.post("/api/engine/adopt")
+@rate_limit(max_requests=12, window=60)
+def api_engine_adopt():
+    d = request.get_json(silent=True) or {}
+    try:
+        terminal = int(d.get("terminal", 0))
+    except (TypeError, ValueError):
+        return _fail("bad terminal")
+    try:
+        op = account_engine.get_engine().request_adopt(terminal)
+    except account_engine.EngineError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"detail": f"terminal {terminal}: adopting the account "
+                          f"logged in on it ...", "op": op})
+
+@app.post("/api/engine/logout")
+@rate_limit(max_requests=12, window=60)
+def api_engine_logout():
+    d = request.get_json(silent=True) or {}
+    try:
+        terminal = int(d.get("terminal", 0))
+    except (TypeError, ValueError):
+        return _fail("bad terminal")
+    try:
+        op = account_engine.get_engine().request_logout(terminal)
+    except account_engine.EngineError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"detail": f"terminal {terminal}: logging out ...",
+                "op": op})
+
+@app.post("/api/engine/restart")
+@rate_limit(max_requests=6, window=60)
+def api_engine_restart():
+    d = request.get_json(silent=True) or {}
+    try:
+        terminal = int(d.get("terminal", 0))
+    except (TypeError, ValueError):
+        return _fail("bad terminal")
+    try:
+        op = account_engine.get_engine().request_restart(terminal)
+    except account_engine.EngineError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"detail": f"terminal {terminal}: restarting ...", "op": op})
+
+@app.post("/api/engine/forget")
+@rate_limit(max_requests=20, window=60)
+def api_engine_forget():
+    d = request.get_json(silent=True) or {}
+    login_id = str(d.get("login", "")).strip()
+    if not login_id:
+        return _fail("login is required")
+    try:
+        removed = account_engine.get_engine().forget(login_id)
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"removed": removed,
+                "detail": f"{login_id} "
+                          f"{'forgotten' if removed else 'not found'}"})
 
 @app.get("/api/debug")
 @rate_limit(max_requests=30, window=60)

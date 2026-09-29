@@ -761,6 +761,19 @@ PANEL_TMPL = """<!doctype html>
         <section class="panel acc" id="acc1"></section>
         <section class="panel acc" id="acc2"></section>
       </div>
+      <section class="panel" id="engineCard">
+        <div class="sect"><h4>Account Integration</h4>
+          <div class="right">
+            <span class="chip" id="engBusy">IDLE</span>
+            <button class="btn mini" onclick="engRefresh()">REFRESH</button>
+          </div></div>
+        <div class="tblwrap" id="engSlots"><div class="empty">loading...</div></div>
+        <div class="body mut" style="font-size:11px;padding-top:8px">
+          log any account (live or demo) into either terminal - verified
+          against the EA feed, one at a time per terminal, the whole software
+          follows. TIP: to switch an account already logged in inside MT5,
+          just switch it there and press ADOPT.</div>
+      </section>
     </div>
   </main>
 </div>
@@ -772,7 +785,7 @@ PANEL_TMPL = """<!doctype html>
 </body></html>"""
 
 PANEL_JS = COMMON_JS + """
-let P=null,SCH=null,BUILT=false,MODAL_ACC=null,INFLIGHT={};
+let P=null,SCH=null,BUILT=false,MODAL_ACC=null,INFLIGHT={},ENG=null,ENGOPS=null;
 function num(v){return (v===null||v===undefined||isNaN(+v))?0:+v}
 function setBusy(n,busy){for(const b of document.querySelectorAll('#acc'+n+' .tbtn'))
  b.disabled=busy}
@@ -965,6 +978,67 @@ async function refresh(){
    if(c&&c.children.length===0)
     c.innerHTML='<div class="empty">waiting for data - '+esc(e.message)+'</div>'}}}
 refresh();setInterval(refresh,600);
+/* ---------------- account integration engine ---------------- */
+function engState(s){
+ if(s.running)return '<span style="color:var(--yellow,#eab308)">● '+esc(s.running.op)+'…</span>';
+ if(s.verified)return '<span style="color:#22c55e">● synced</span>';
+ if(s.login)return '<span style="color:var(--yellow,#eab308)">● adopted '+esc(s.login)+'</span>';
+ return '<span class="mut">○ logged out</span>'}
+function engMode(s){
+ if(!s.mode)return '';
+ const live=String(s.mode).toLowerCase()==='live';
+ const demo=String(s.mode).toLowerCase()==='demo';
+ const col=live?'#ef4444':(demo?'#22c55e':'#eab308');
+ return ' <span style="color:'+col+';font-weight:700">['+esc(String(s.mode).toUpperCase())+']</span>'}
+function engRender(){
+ if(!ENG)return;
+ const slots=ENG.slots||[];
+ $id('engSlots').innerHTML=slots.map(s=>
+  '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;'+
+   'padding:10px 0;border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent)">'+
+   '<b>T'+s.terminal+'</b>'+
+   '<span class="mono">'+esc(s.login||'-')+'</span>'+engMode(s)+
+   '<span class="mut sub">'+esc(s.server||'-')+'</span>'+
+   '<span class="mut sub">'+esc(s.broker||'-')+'</span>'+
+   '<span class="sub">bal '+esc(s.balance||'-')+'</span>'+
+   '<span class="sub">eq '+esc(s.equity||'-')+'</span>'+
+   '<span class="mut sub">feed '+(s.feed_age_s!=null?s.feed_age_s+'s':'-')+'</span>'+
+   '<span class="spacer" style="flex:1"></span>'+engState(s)+
+   '<button class="btn mini" onclick="engLogin('+s.terminal+')">LOGIN</button>'+
+   '<button class="btn mini" onclick="engAdopt('+s.terminal+')">ADOPT</button>'+
+   '<button class="btn mini" onclick="engRestart('+s.terminal+')">RESTART</button>'+
+   '<button class="btn mini danger" onclick="engLogout('+s.terminal+')">LOGOUT</button>'+
+   '</div>').join('')+
+  (ENGOPS&&ENGOPS.length?'<div class="mut" style="font-size:11px;padding-top:8px">'+
+   ENGOPS.slice(0,4).map(o=>'['+esc(o.state)+'] T'+o.terminal+' '+esc(o.op)+' - '
+    +esc(o.detail||'…')).join('<br>')+'</div>':'');
+ const busy=(ENG.slots||[]).some(s=>s.running);
+ const chip=$id('engBusy');
+ chip.textContent=busy?'SYNCING':'IDLE';
+ chip.style.color=busy?'var(--yellow,#eab308)':'';}
+async function engPoll(){
+ try{const j=await api('/api/engine/status');
+  ENG=j;ENGOPS=j.ops||[];engRender()}
+ catch(e){/* supervisor may be down - keep the last frame */}}
+function engRefresh(){engPoll();toast('engine status refreshed',true)}
+async function engAct(path,body){
+ try{const j=await post(path,body);
+  toast(j.detail||'sent',true);engPoll();return j}
+ catch(e){toast(e.message,false);return null}}
+async function engAdopt(t){await engAct('/api/engine/adopt',{terminal:t})}
+async function engRestart(t){await engAct('/api/engine/restart',{terminal:t})}
+async function engLogout(t){
+ if(!confirm('Log terminal '+t+' out and scrub its stored credentials?'))return;
+ await engAct('/api/engine/logout',{terminal:t})}
+async function engLogin(t){
+ const login=prompt('MT5 account number for terminal '+t+':');
+ if(!login)return;
+ const password=prompt('Password:');
+ if(password===null)return;
+ const server=prompt('Server (e.g. HFM-Real, MetaQuotes-Demo):');
+ if(server===null)return;
+ await engAct('/api/engine/login',{terminal:t,login:login,password:password,server:server})}
+engPoll();setInterval(engPoll,2000);
 """
 
 def render_panel() -> str:

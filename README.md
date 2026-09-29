@@ -45,6 +45,7 @@ One command starts everything; Ctrl+C stops everything.
 | `close.py`      | Database-free concurrent close of all positions (one atomic `CLOSEALL` per terminal). |
 | `monitor.py`    | Dual-account live dashboard: open positions only, strict identity checks, no event log. |
 | `session.py`    | Obfuscated credential store (`session.json`), stat-validated on every read so account changes propagate live across all processes. |
+| `account_engine.py` | Account Integration Engine: concurrent per-terminal login/switch/adopt/logout of any account (live or demo) with pre-validation, EA-verified results, demo/live detection, an operation registry, CLI (`--login/--adopt/--status/...`) and `/api/engine/*` endpoints for the panel. |
 | `database.py`   | SQLite/Postgres storage for schedules and the fired log. |
 | `broker_prober.py` | Probes broker symbols/spreads and order-fill behaviour. |
 | `metrics.py`    | Closed-trade and equity observation. |
