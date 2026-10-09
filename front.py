@@ -110,7 +110,42 @@ a{color:var(--blue);text-decoration:none}
 /* panels + sections */
 .grid{display:grid;gap:14px}
 .accounts{grid-template-columns:1fr 1fr;align-items:start}
-@media(max-width:1180px){.accounts{grid-template-columns:1fr}}
+.accounts.mid{grid-template-columns:1fr auto 1fr;align-items:stretch}
+.midclose{display:flex;align-items:center;justify-content:center;padding:6px 2px}
+.btn.big{padding:6px 12px;font-size:10px;font-weight:700;letter-spacing:.14em;
+  line-height:1.2;background:linear-gradient(160deg,#2a0e0e,#180808);
+  border:1px solid #5a1a1a;color:#ffb4b4;border-radius:12px;white-space:nowrap;
+  box-shadow:0 1px 6px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,92,92,.15);
+  transition:transform .08s ease,box-shadow .08s ease,background .08s ease,
+  border-color .08s ease,color .08s ease;cursor:pointer}
+.btn.big:hover{border-color:#ff5c5c;color:#fff;
+  background:linear-gradient(160deg,#3a1212,#220a0a);
+  box-shadow:0 0 12px rgba(255,92,92,.28),inset 0 1px 0 rgba(255,92,92,.28);
+  transform:translateY(-1px)}
+.btn.big:active{transform:scale(.94);
+  box-shadow:0 0 6px rgba(255,92,92,.35),inset 0 1px 0 rgba(255,92,92,.3)}
+.btn.big:disabled{opacity:.55;cursor:progress;transform:none}
+.btn.big.pop{animation:pop .18s ease}
+@keyframes pop{0%{transform:scale(1)}40%{transform:scale(.9)}100%{transform:scale(1)}}
+/* small cool ORDER button (replaces the old full-width block) */
+.btn.order-mini{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;
+  font-size:10px;font-weight:700;letter-spacing:.14em;border-radius:11px;
+  background:linear-gradient(160deg,#0e1e33,#0a1220);border:1px solid #23456b;
+  color:#7db9ff;cursor:pointer;white-space:nowrap;
+  box-shadow:0 1px 6px rgba(0,0,0,.4),inset 0 1px 0 rgba(77,166,255,.18);
+  transition:transform .08s ease,box-shadow .08s ease,border-color .08s ease,
+  color .08s ease;width:auto;max-width:230px}
+.btn.order-mini:hover{border-color:var(--blue);color:#fff;
+  box-shadow:0 0 12px rgba(77,166,255,.32),inset 0 1px 0 rgba(77,166,255,.3);
+  transform:translateY(-1px)}
+.btn.order-mini:active{transform:scale(.94)}
+.btn.order-mini:disabled{opacity:.55;cursor:progress;transform:none}
+.btn.order-mini.pop{animation:pop .18s ease}
+.order-wrap{display:flex;justify-content:center;margin-top:10px}
+@media(max-width:1180px){.accounts{grid-template-columns:1fr}
+  .accounts.mid{grid-template-columns:1fr}
+  .midclose{padding:8px 0}
+  .btn.big{padding:7px 14px;width:auto}}
 .panel{background:linear-gradient(180deg,var(--panel2),var(--panel));
   border:1px solid var(--line);border-radius:0px;overflow:hidden;
   box-shadow:0 8px 30px rgba(0,0,0,.35)}
@@ -204,10 +239,11 @@ input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
   font-family:ui-monospace,Consolas,monospace}
 .lchip:hover,.lchip.on{border-color:var(--blue);color:var(--blue);
   box-shadow:var(--glow)}
-select,input[type=text]{background:var(--bg);border:1px solid var(--line2);
-  color:#fff;padding:7px 9px;font-size:12px;outline:none;width:100%;
-  border-radius:0px}
-select:focus,input[type=text]:focus{border-color:var(--blue);box-shadow:var(--glow)}
+select,input[type=text],input[type=password]{background:var(--bg);
+  border:1px solid var(--line2);color:#fff;padding:7px 9px;font-size:12px;
+  outline:none;width:100%;border-radius:0px}
+select:focus,input[type=text]:focus,input[type=password]:focus{
+  border-color:var(--blue);box-shadow:var(--glow)}
 .frow{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:9px}
 .fgroup label{display:block;font-size:9px;letter-spacing:1.5px;
   color:var(--dim);text-transform:uppercase;margin-bottom:4px}
@@ -300,6 +336,21 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
 
 COMMON_JS = """
 function $id(x){return document.getElementById(x)}
+/* ASMR tap: soft satisfying click (quiet sine blip + haptic). Fast: <40 ms,
+   no assets, no blocking. Used by CLOSE ALL + ORDER buttons. */
+let _AC=null;
+function asmrTap(f){try{
+  if(navigator.vibrate)try{navigator.vibrate(8)}catch(e){}
+  const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
+  _AC=_AC||new C();
+  if(_AC.state==='suspended')_AC.resume();
+  const o=_AC.createOscillator(),g=_AC.createGain();
+  o.type='sine';o.frequency.value=f||1900;
+  g.gain.setValueAtTime(0.06,_AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001,_AC.currentTime+0.07);
+  o.connect(g);g.connect(_AC.destination);o.start();o.stop(_AC.currentTime+0.08);
+ }catch(e){}}
+function asmrPop(el){if(!el)return;el.classList.remove('pop');void el.offsetWidth;el.classList.add('pop')}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function fmt(v,d){if(v===null||v===undefined||isNaN(v))return '-';
@@ -757,8 +808,12 @@ PANEL_TMPL = """<!doctype html>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
-      <div class="grid accounts">
+      <div class="grid accounts mid">
         <section class="panel acc" id="acc1"></section>
+        <div class="midclose">
+          <button class="btn big" id="closeBothBtn" onclick="closeAllBoth()"
+            title="close every position on BOTH accounts at once (close.py)">✕&nbsp;CLOSE ALL</button>
+        </div>
         <section class="panel acc" id="acc2"></section>
       </div>
       <section class="panel" id="engineCard">
@@ -768,6 +823,29 @@ PANEL_TMPL = """<!doctype html>
             <button class="btn mini" onclick="engRefresh()">REFRESH</button>
           </div></div>
         <div class="tblwrap" id="engSlots"><div class="empty">loading...</div></div>
+        <div id="engForm" style="display:none;margin-top:12px;
+          border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
+          padding-top:10px">
+          <div class="sect"><h4>Log in - Terminal <span id="engFormT">1</span></h4>
+            <div class="right"><button class="btn mini" onclick="engCloseForm()">CANCEL</button></div></div>
+          <div class="frow" style="margin-top:8px">
+            <div class="fgroup" style="grid-column:span 2"><label>Saved account</label>
+              <select id="engKnownIn" onchange="engPickKnown()"><option value="">- pick a saved account -</option></select></div>
+            <div class="fgroup" style="grid-column:span 2"><label>Account number</label>
+              <input id="engLoginIn" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 51234567"></div>
+            <div class="fgroup" style="grid-column:span 2"><label>Server</label>
+              <input id="engServerIn" type="text" autocomplete="off" placeholder="HFM-Real / MetaQuotes-Demo"></div>
+            <div class="fgroup" style="grid-column:span 4"><label>Password</label>
+              <input id="engPassIn" type="password" autocomplete="current-password" placeholder="leave blank to use a saved password"></div>
+          </div>
+          <div class="feedback" id="engFeedback"></div>
+          <div class="frow" style="margin-top:6px">
+            <button class="btn blue" style="grid-column:span 2" onclick="engSubmitLogin()">LOG IN</button>
+          </div>
+          <div class="body mut" style="font-size:11px;padding-top:6px">
+            works for any account, live or demo, in either terminal - the
+            terminal restarts into it and the whole software follows.</div>
+        </div>
         <div class="body mut" style="font-size:11px;padding-top:8px">
           log any account (live or demo) into either terminal - verified
           against the EA feed, one at a time per terminal, the whole software
@@ -839,6 +917,8 @@ function buildPanel(n){
    '<button class="tbtn tbuy" onclick="doTrade('+n+',\\'BUY\\')">BUY</button>'+
   '</div>'+
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
+  '<div class="order-wrap"><button class="btn order-mini" id="ordBtn'+n+'" '+
+   'onclick="asmrTap(1900);asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
  '</div>'+ '<div class="sect"><h4>Open positions</h4><div class="right">'+
   '<span class="chip">P/L <b id="pospl'+n+'">-</b></span>'+
   '<button class="btn mini danger" onclick="closeAll('+n+')">CLOSE ALL</button></div></div>'+
@@ -894,6 +974,20 @@ async function closeAll(n){
   toast(j.detail||'close all sent',j.ok);refresh()}
  catch(e){toast(e.message,false)}
  finally{delete INFLIGHT['ca'+n]}}
+/* the small pill between ACCOUNT 1 and ACCOUNT 2: closes everything on
+   BOTH terminals at once via close.py (one thread per terminal - wall time
+   is the slowest terminal, not the sum). Fast: instant ASMR tap + pop,
+   immediate "closing..." toast, no artificial waits. */
+async function closeAllBoth(){
+ if(INFLIGHT['caall'])return;INFLIGHT['caall']=true;
+ const b=$id('closeBothBtn');if(b){b.disabled=true;asmrPop(b)}
+ asmrTap(1400);
+ toast('closing ALL (both accounts)...',true);
+ try{const j=await post('/api/close-all',{symbol:'ALL'});
+  asmrTap(2200);
+  toast((j.detail||'close-all sent')+'  -  '+(j.wall_ms||0)+' ms wall',true);refresh()}
+ catch(e){toast('CLOSE ALL: '+e.message,false)}
+ finally{INFLIGHT['caall']=false;if(b)b.disabled=false}}
 async function restartTerm(n){
  if(INFLIGHT['r'+n])return;INFLIGHT['r'+n]=true;
  toast('restarting terminal '+n+' ...',true);
@@ -901,6 +995,95 @@ async function restartTerm(n){
   toast(j.detail||('terminal '+n+' restarting'),true);refresh()}
  catch(e){toast(e.message,false)}
  finally{setTimeout(()=>{delete INFLIGHT['r'+n]},15000)}}
+/* ---------- pending-order ticket (BUY/SELL LIMIT & STOP) ----------
+   The level is entered the same way the schedule form takes prices: a whole
+   number plus the decimal digits, so EURUSD 1.12165 is 1 + 12165 and
+   XAUUSD 4185.01 is 4185 + 01.  On open we prefill both from the live bid. */
+function splitLevel(v){v=String(v==null?'':v).trim();
+ if(!v.includes('.'))return[String(parseInt(v||'0',10)),''];
+ const p=v.split('.');return[p[0],p[1]]}
+function otypeHint(n){
+ const t=($id('otyp'+n)||{}).value||'';
+ const b=$id('owl'+n)&&$id('owl'+n).value, f=$id('ofr'+n)&&$id('ofr'+n).value;
+ const lvl=(b+'')+((f!==''&&f!==undefined)?('.'+f):'');
+ if(t.indexOf('BUY LIMIT')===0)return 'BUY LIMIT '+lvl+' - fills when price drops to the level';
+ if(t.indexOf('BUY STOP')===0) return 'BUY STOP '+lvl+' - fills when price rises to the level';
+ if(t.indexOf('SELL LIMIT')===0)return 'SELL LIMIT '+lvl+' - fills when price rises to the level';
+ if(t.indexOf('SELL STOP')===0) return 'SELL STOP '+lvl+' - fills when price drops to the level';
+ return ''}
+function orderModalHTML(n){
+ return '<div class="modal-head"><h3>Place pending order · account '+n+'</h3>'+
+  '<button class="closex" onclick="closeModal()">×</button></div>'+
+  '<div class="frow">'+
+   '<div class="fgroup" style="grid-column:span 2"><label>Pair</label>'+
+    '<select id="osym'+n+'"></select></div>'+
+   '<div class="fgroup" style="grid-column:span 2"><label>Order type</label>'+
+    '<select id="otyp'+n+'">'+['BUY LIMIT','BUY STOP','SELL LIMIT','SELL STOP']
+      .map(t=>'<option>'+t+'</option>').join('')+'</select></div>'+
+   '<div class="fgroup"><label>Lot size</label>'+
+    '<input type="number" id="olot'+n+'" step="0.01" min="0.01" value="0.01"></div>'+
+   '<div class="fgroup"><label>Level · whole</label>'+
+    '<input type="number" id="owl'+n+'" step="1" min="0" inputmode="numeric" placeholder="e.g. 1"></div>'+
+   '<div class="fgroup"><label>Level · decimal</label>'+
+    '<input type="text" id="ofr'+n+'" inputmode="numeric" autocomplete="off" placeholder="e.g. 12165"></div>'+
+  '</div>'+
+  '<div class="secthint" id="ohint'+n+'">level = whole + decimal, with as many digits as the pair quotes</div>'+
+  '<div style="margin-top:14px;display:flex;gap:10px;align-items:center;justify-content:center">'+
+   '<button class="btn order-mini" id="oBtn'+n+'" onclick="submitOrder('+n+')">◌ PLACE ORDER</button>'+
+   '<span class="feedback" style="margin:0" id="ofb'+n+'">GTC · sits on the broker until it triggers</span>'+
+  '</div>'}
+function openOrderModal(n){
+ MODAL_ACC=n;
+ $id('modalBody').innerHTML=orderModalHTML(n);
+ const sel=$id('osym'+n);
+ const fromPanel=(((P||{}).accounts||{})['1']||{}).spreads||{};
+ const paint=function(keys){
+  const cur=sel.value;
+  sel.innerHTML=keys.map(k=>'<option'+(k===cur?' selected':'')+'>'+esc(k)+'</option>').join('');
+  if(cur&&keys.includes(cur))sel.value=cur;
+ };
+ paint(Object.keys(fromPanel));
+ $id('modalBg').classList.add('open');
+ const fill=function(){
+  const sym=sel.value;if(!sym)return;
+  api('/api/spots').then(function(j){
+   const row=(j.spots||{})[sym];if(!row||!row.bid)return;
+   const wf=splitLevel(row.bid);
+   const w=$id('owl'+n),f=$id('ofr'+n);
+   if(w)w.value=wf[0];if(f)f.value=wf[1];
+   $id('ohint'+n).innerHTML=otypeHint(n)+'  ·  <b>live bid '+esc(row.bid)+
+    '</b> ask '+esc(row.ask);
+  }).catch(function(){})};
+ // working even when the panel cache is stale: top up the pair list live
+ api('/api/spots').then(function(j){
+  const keys=Object.keys(j.spots||{}).filter(k=>j.spots[k]&&j.spots[k].bid);
+  if(keys.length)paint(keys);
+  fill();
+ }).catch(function(){fill()});
+ sel.onchange=fill;
+ $id('otyp'+n).onchange=function(){$id('ohint'+n).innerHTML=otypeHint(n)};
+ fill()}
+async function submitOrder(n){
+ if(INFLIGHT['o'+n])return;INFLIGHT['o'+n]=true;
+ const b=$id('oBtn'+n),f=$id('ofb'+n);
+ if(b){asmrPop(b);b.disabled=true}
+ asmrTap(1900);
+ const sym=($id('osym'+n)||{}).value||'',typ=($id('otyp'+n)||{}).value||'';
+ const lot=parseFloat(($id('olot'+n)||{}).value);
+ const whole=($id('owl'+n)||{}).value,frac=($id('ofr'+n)||{}).value;
+ if(!(lot>0)){f.className='feedback err';f.textContent='lot must be > 0';
+  toast('lot must be > 0',false);if(b)b.disabled=false;delete INFLIGHT['o'+n];return}
+ f.className='feedback';f.textContent='placing '+typ+' '+sym+' ...';
+ try{const j=await post('/api/order',{account:+n,symbol:sym,type:typ,lot:lot,
+   level_whole:whole,level_frac:frac});
+  asmrTap(2200);
+  f.className='feedback ok';
+  f.textContent='PLACED #'+j.ticket+' '+typ+' '+sym+' @ '+j.price+' ('+j.ms+' ms)';
+  toast(typ+' '+sym+' @ '+j.price+' placed - ticket '+j.ticket,true);
+  setTimeout(closeModal,900);refresh()}
+ catch(e){f.className='feedback err';f.textContent=e.message;toast(e.message,false)}
+ finally{if(b)b.disabled=false;delete INFLIGHT['o'+n]}}
+
 /* ---------- future-trade modal (shared dial-picker version in COMMON_JS) ---------- */
 function openModal(n){MODAL_ACC=n;openSchedModal(n)}
 function closeModal(){$id('modalBg').classList.remove('open');MODAL_ACC=null}
@@ -1030,14 +1213,56 @@ async function engRestart(t){await engAct('/api/engine/restart',{terminal:t})}
 async function engLogout(t){
  if(!confirm('Log terminal '+t+' out and scrub its stored credentials?'))return;
  await engAct('/api/engine/logout',{terminal:t})}
-async function engLogin(t){
- const login=prompt('MT5 account number for terminal '+t+':');
- if(!login)return;
- const password=prompt('Password:');
- if(password===null)return;
- const server=prompt('Server (e.g. HFM-Real, MetaQuotes-Demo):');
- if(server===null)return;
- await engAct('/api/engine/login',{terminal:t,login:login,password:password,server:server})}
+/* inline login form: replaces the old blocking prompt() chain so the
+   operator can pick a saved account, see the server, and keep the whole
+   panel responsive while the terminal restarts into the new account. */
+let ENGFORM_T=null;
+async function engFillKnown(){
+ const sel=$id('engKnownIn');if(!sel)return;
+ try{const j=await api('/api/engine/accounts');
+  const accs=(j.accounts||[]);
+  sel.innerHTML='<option value="">- pick a saved account -</option>'+
+   accs.map(a=>'<option value="'+esc(a.login)+'" data-server="'+esc(a.server||'')+'" '+
+     'data-pw="'+(a.has_password?'1':'0')+'">'+esc(a.login)+
+     (a.server?' \u00b7 '+esc(a.server):'')+(a.has_password?' \u00b7 saved pw':' \u00b7 no pw')+
+     (a.label?' \u00b7 '+esc(a.label):'')+'</option>').join('');
+ }catch(e){/* keep an empty picker if the book is unavailable */}}
+function engPickKnown(){
+ const sel=$id('engKnownIn');const o=sel.options[sel.selectedIndex];
+ if(!o||!o.value)return;
+ $id('engLoginIn').value=o.value;
+ $id('engServerIn').value=o.getAttribute('data-server')||'';
+ $id('engPassIn').value='';
+ const fb=$id('engFeedback');
+ fb.textContent=(o.getAttribute('data-pw')==='1')
+  ?'saved password will be used - leave the password blank'
+  :'no saved password - type the password to log in';
+ fb.className='feedback'}
+function engOpenForm(t){
+ ENGFORM_T=t;
+ $id('engFormT').textContent=String(t);
+ $id('engForm').style.display='';
+ $id('engFeedback').textContent='';
+ $id('engFeedback').className='feedback';
+ engFillKnown();
+ const f=$id('engLoginIn');if(f)f.focus()}
+function engCloseForm(){
+ ENGFORM_T=null;$id('engForm').style.display='none'}
+async function engSubmitLogin(){
+ if(ENGFORM_T==null)return;
+ const login=($id('engLoginIn').value||'').trim();
+ const server=($id('engServerIn').value||'').trim();
+ const password=$id('engPassIn').value||'';
+ const fb=$id('engFeedback');
+ if(!login){fb.textContent='account number is required';
+  fb.className='feedback err';return}
+ if(!server){fb.textContent='server is required (e.g. HFM-Real or MetaQuotes-Demo)';
+  fb.className='feedback err';return}
+ fb.textContent='logging in...';fb.className='feedback';
+ const j=await engAct('/api/engine/login',{terminal:ENGFORM_T,login:login,
+  password:password,server:server});
+ if(j){fb.textContent='';fb.className='feedback ok';engCloseForm()}}
+function engLogin(t){engOpenForm(t)}
 engPoll();setInterval(engPoll,2000);
 """
 

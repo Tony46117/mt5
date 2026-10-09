@@ -52,7 +52,7 @@ _NOTAB_RES = {
 def read_accounts() -> dict[int, dict[str, str]]:
     return session.load()
 
-def data_roots() -> list[Path]:
+def _scan_data_roots() -> list[Path]:
     roots: list[Path] = []
     pf = WINEPREFIX / "drive_c" / "Program Files"
     for term_dir in sorted(pf.glob("MetaTrader 5*")):
@@ -63,6 +63,25 @@ def data_roots() -> list[Path]:
             if (term / "MQL5").is_dir():
                 roots.append(term / "MQL5")
     return roots
+
+_DATA_ROOTS_CACHE: tuple[float, list[Path]] | None = None
+DATA_ROOTS_TTL_S = 5.0
+
+def data_roots() -> list[Path]:
+    """Every MQL5 data tree under the prefix (memoized).
+
+    This used to walk two directory trees on EVERY call, and the exec
+    path resolution calls it several times per order - pure overhead in
+    the hot path.  A 5 s memo removes that cost while still picking up a
+    freshly created terminal almost immediately.
+    """
+    global _DATA_ROOTS_CACHE
+    now = time.monotonic()
+    if _DATA_ROOTS_CACHE and now - _DATA_ROOTS_CACHE[0] < DATA_ROOTS_TTL_S:
+        return list(_DATA_ROOTS_CACHE[1])
+    roots = _scan_data_roots()
+    _DATA_ROOTS_CACHE = (now, roots)
+    return list(roots)
 
 def spots_csv_paths() -> list[Path]:
     return [root / "Files" / "spots.csv" for root in data_roots()]
@@ -79,13 +98,34 @@ def exec_in_path(inst: int = 1) -> Path:
 def exec_out_path(inst: int = 1) -> Path:
     return _exec_dir(inst) / "exec_out.csv"
 
+_EXEC_DIR_CACHE: dict[int, tuple[float, tuple, Path]] = {}
+EXEC_DIR_TTL_S = 2.0
+
 def _exec_dir(inst: int) -> Path:
-    login = read_accounts().get(inst, {}).get("login", "")
+    """Resolve the MQL5\\Files directory the EA of `inst` writes to.
+
+    pick_terminal() walks every terminal tree, and this was resolved on
+    EVERY command (open/close/ping) - measurable per-order latency.  The
+    answer only changes when the session login changes, which the cache
+    keys on, plus a short TTL as a safety net.
+    """
+    hint = TERMINALS[inst]["dir"] / "MQL5" / "Files"
+    login = str(read_accounts().get(inst, {}).get("login", "")).strip()
+    try:
+        stamp = (login, session.file_stamp())
+    except Exception:
+        stamp = (login, None)
+    now = time.monotonic()
+    cached = _EXEC_DIR_CACHE.get(inst)
+    if cached and cached[1] == stamp and now < cached[0]:
+        return cached[2]
+    resolved = hint
     if login:
         term = pick_terminal(login)
         if term:
-            return term["root"] / "Files"
-    return TERMINALS[inst]["dir"] / "MQL5" / "Files"
+            resolved = term["root"] / "Files"
+    _EXEC_DIR_CACHE[inst] = (now + EXEC_DIR_TTL_S, stamp, resolved)
+    return resolved
 
 def compiled_paths(inst: int | None = None) -> list[Path]:
     if inst:
@@ -93,8 +133,18 @@ def compiled_paths(inst: int | None = None) -> list[Path]:
     return [root / "Experts" / "SpotDump.ex5" for root in data_roots()]
 
 _SPOTS_CACHE: tuple[float, dict] | None = None
-_HEADER_CACHE: dict[Path, tuple[float, int, int, dict]] = {}
+# (expiry_monotonic, mtime, size, header)
+#
+# The expiry MUST be compared against time.monotonic(), never against the
+# file's st_mtime.  The old code stored time.monotonic()+0.05 and compared
+# that with st_mtime (a wall-clock epoch ~1.7e9), so `cached[0] > mtime` was
+# false on every single call: read_header() re-opened and re-parsed the whole
+# trades.csv hundreds of times a second.  That was the single biggest source
+# of the UI/bridge/executor lag.
+_HEADER_CACHE: dict[Path, tuple[float, float, int, dict]] = {}
 _TERM_RUNNING_CACHE: dict[int, tuple[float, bool]] = {}
+HEADER_CACHE_TTL_S = 0.04
+HEADER_MISS_TTL_S = 0.01
 
 def read_header(path: Path) -> dict:
     try:
@@ -103,16 +153,24 @@ def read_header(path: Path) -> dict:
     except OSError:
         return {}
     cached = _HEADER_CACHE.get(path)
-    if cached and cached[0] > mtime and cached[1] == mtime and cached[2] == size:
-        return cached[3]
+    if cached:
+        expiry, c_mtime, c_size, h = cached
+        if c_mtime == mtime and c_size == size and time.monotonic() < expiry:
+            return h
     h = _read_header_uncached(path)
-    _HEADER_CACHE[path] = (time.monotonic() + 0.05, mtime, size, h)
+    # negative results are cached too (very briefly) so a torn read during an
+    # EA rewrite does not stampede the file on every caller
+    ttl = HEADER_CACHE_TTL_S if h else HEADER_MISS_TTL_S
+    _HEADER_CACHE[path] = (time.monotonic() + ttl, mtime, size, h)
     return h
 
 def _read_header_uncached(path: Path) -> dict:
     if not path.exists():
         return {}
-    for _ in range(5):
+    # a couple of quick re-reads only: a torn read (EA mid-rewrite) is
+    # retried almost immediately, and a genuinely absent header is now
+    # negative-cached by read_header() so we never block in this loop
+    for _ in range(3):
         try:
             raw = path.read_text(encoding="cp1252", errors="replace")
         except OSError:
@@ -128,22 +186,22 @@ def _read_header_uncached(path: Path) -> dict:
                     h["balance"] = parts[4]
                     h["equity"] = parts[5]
                 if len(parts) > 15:
-                    h["currency"] = parts[6]
-                    h["leverage"] = parts[7]
-                    h["margin"] = parts[8]
-                    h["margin_free"] = parts[9]
-                    h["margin_level"] = parts[10]
-                    h["profit"] = parts[11]
-                    h["broker"] = parts[12]
-                    h["holder"] = parts[13]
-                    h["margin_mode"] = parts[14]
-                    h["trade_mode"] = parts[15]
+                    h["currency"] = parts[6] or ""
+                    h["leverage"] = parts[7] or ""
+                    h["margin"] = parts[8] or ""
+                    h["margin_free"] = parts[9] or ""
+                    h["margin_level"] = parts[10] or ""
+                    h["profit"] = parts[11] or ""
+                    h["broker"] = parts[12] or ""
+                    h["holder"] = parts[13] or ""
+                    h["margin_mode"] = parts[14] or ""
+                    h["trade_mode"] = parts[15] or ""
                 if len(parts) > 18:
-                    h["trade_allowed"] = parts[16]
-                    h["mql_allowed"] = parts[17]
-                    h["account_trade_allowed"] = parts[18]
+                    h["trade_allowed"] = parts[16] or ""
+                    h["mql_allowed"] = parts[17] or ""
+                    h["account_trade_allowed"] = parts[18] or ""
                 return h
-        time.sleep(0.05)
+        time.sleep(0.01)
     return {}
 
 def scan_terminals() -> list[dict]:
@@ -199,13 +257,21 @@ def wait_for_bridge(inst: int = 1, timeout: float = 120) -> bool:
         time.sleep(1)
     return False
 
+
+def _any_bridge_fresh(timeout_s: float = 5.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if any(feed_age(inst) < 5 for inst in (1, 2)):
+            return True
+        time.sleep(0.25)
+    return False
+
 def feed_age(inst: int = 1) -> float:
     now = time.time()
     cached = _FEED_AGE_CACHE.get(inst)
     if cached and now - cached[0] < 1.0:
         return cached[1]
-    other_root = (TERMINALS[2] if inst == 1 else TERMINALS[1])["dir"] / "MQL5"
-    roots = [r for r in data_roots() if r != other_root]
+    roots = data_roots()
     files: list[Path] = []
     for root in roots:
         files += [root / "Files" / "spots.csv", root / "Files" / "trades.csv",
@@ -257,6 +323,9 @@ def term_running(inst: int = 1, max_age: float = 1.0) -> bool:
 def check_terminal_running() -> bool:
     return term_running(1)
 
+# Legacy XML chart form.  Unused (MT5 .chr/.tpl files use the key=value text
+# format, see MINIMAL_TPL in make_bridge_tpl.py) - kept only so nothing that
+# references the name breaks.
 MINIMAL_CHART_XML = """<chart>
   <chart_settings>
     <symbol>EURUSD</symbol>
@@ -328,6 +397,38 @@ def sanitize_charts(inst: int = 1) -> None:
         except OSError as exc:
             log.debug(f"terminal {inst}: chart sanitize skipped ({charts_root}): {exc}")
 
+def ensure_minimal_profile(inst: int) -> None:
+    """Force the boot profile SpotBridgeN to be ONE clean EURUSD chart.
+
+    This is the actual reason terminal 1 could come up cluttered while
+    terminal 2 came up minimal: MT5 silently rebuilds a default (busy)
+    profile whenever the profile folder is missing or holds no chart
+    files, and that state is sticky per install.  We write exactly one
+    chart file (chart01.chr) from the same minimalist text the Bridge
+    template uses, so BOTH terminals boot identically - one EURUSD chart
+    with the SpotDump EA attached and nothing else.
+    """
+    try:
+        import make_bridge_tpl
+        tpl = make_bridge_tpl.minimal_chart_text()
+    except Exception as exc:
+        log.debug(f"terminal {inst}: minimal profile skipped: {exc}")
+        return
+    for charts_root in (TERMINALS[inst]["dir"] / "Profiles" / "Charts",
+                        TERMINALS[inst]["dir"] / "MQL5" / "Profiles" / "Charts"):
+        prof = charts_root / f"SpotBridge{inst}"
+        try:
+            prof.mkdir(parents=True, exist_ok=True)
+            for old in prof.glob("chart*.chr"):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            (prof / "chart01.chr").write_text(tpl, encoding="utf-16")
+        except OSError as exc:
+            log.debug(f"terminal {inst}: minimal profile write skipped "
+                      f"({prof}): {exc}")
+
 def force_profile(inst: int = 1) -> None:
     ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
     want = f"SpotBridge{inst}"
@@ -356,19 +457,31 @@ def _write_start_cfg(inst: int, with_login: bool = True) -> None:
                             f"plausible account - booting WITHOUT the login block")
                 with_login = False
         if with_login:
+            # A server MT5 has never seen must be given as an access point
+            # (host:port); booting it by bare name silently never connects
+            # and the terminal falls back to whatever account it had last.
+            server_name = str(a.get("server", ""))
+            ap = config.access_point_for(server_name)
+            server_field = ap or server_name
+            if ap:
+                log.info(f"terminal {inst}: booting {server_name} via access "
+                         f"point {ap} (server not in MT5's list)")
             common = ("[Common]\r\n"
                       f"Login={a.get('login', '')}\r\n"
                       f"Password={a.get('password', '')}\r\n"
-                      f"Server={a.get('server', '')}\r\n"
+                      f"Server={server_field}\r\n"
                       f"Profile=SpotBridge{inst}\r\n")
+        # NOTE: no Symbol/Period under [StartUp] on purpose.  MT5 opens an
+        # ADDITIONAL chart for [StartUp] Symbol, which is exactly why the
+        # terminals came up with two charts instead of one.  With no Symbol,
+        # MT5 opens no extra chart and starts the EA on the first (and only)
+        # chart of the profile - one clean chart, no clutter.
         body = ("[Experts]\r\n"
                 "AllowLiveTrading=1\r\n"
                 "Enabled=1\r\n"
                 "Account=0\r\n"
                 f"Profile=SpotBridge{inst}\r\n"
                 "[StartUp]\r\nExpert=SpotDump.ex5\r\n"
-                "Template=Bridge\r\n"
-                "Symbol=EURUSD\r\nPeriod=H1\r\n"
                 f"Profile=SpotBridge{inst}\r\n")
         fd = os.open(str(ini), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -394,9 +507,21 @@ _INI_LOCK = threading.Lock()
 
 def _read_ini(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-16", errors="replace")
-    except (OSError, UnicodeError):
+        raw = path.read_bytes()
+    except OSError:
         return ""
+    # MT5 commonly writes UTF-16LE with a single BOM. Some installs/patches
+    # double the BOM bytes, which makes raw.decode("utf-16") silently include
+    # an extra U+FEFF inside the file and corrupt key/value matching.
+    if raw[:2] == b"\xff\xfe":
+        body = raw[2:]
+        if body[:2] == b"\xff\xfe":
+            body = body[2:]
+        return body.decode("utf-16-le", errors="replace")
+    try:
+        return raw.decode("utf-16", errors="replace")
+    except (UnicodeError, ValueError):
+        return raw.decode("utf-8", errors="replace")
 
 def _write_ini_atomic(path: Path, text: str) -> None:
     with _INI_LOCK:
@@ -425,8 +550,14 @@ def scrub_terminal2_credentials() -> None:
     if not text:
         return
     cleaned = _drop_ini_lines(text, ("login=", "server="))
+    if not cleaned.strip():
+        return
+    cleaned_text = cleaned
+    if cleaned_text.startswith("\ufeff"):
+        cleaned_text = cleaned_text[len("\ufeff"):]
+    cleaned_text = "\ufeff" + cleaned_text
     if cleaned != text:
-        _write_ini_atomic(ini, cleaned)
+        _write_ini_atomic(ini, cleaned_text)
 
 def scrub_common_ini_login(inst: int) -> None:
     ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
@@ -436,8 +567,14 @@ def scrub_common_ini_login(inst: int) -> None:
     if not text:
         return
     cleaned = _drop_ini_lines(text, ("login=", "password=", "server="))
+    if not cleaned.strip():
+        return
+    cleaned_text = cleaned
+    if cleaned_text.startswith("\ufeff"):
+        cleaned_text = cleaned_text[len("\ufeff"):]
+    cleaned_text = "\ufeff" + cleaned_text
     if cleaned != text:
-        _write_ini_atomic(ini, cleaned)
+        _write_ini_atomic(ini, cleaned_text)
 
 def repair_common_ini(inst: int) -> None:
     ini = TERMINALS[inst]["dir"] / "Config" / "common.ini"
@@ -477,8 +614,8 @@ def repair_common_ini(inst: int) -> None:
         body = re.sub(r"(?im)^ProfileLast\s*=\S*", f"ProfileLast={want}", body)
     else:
         body += f"\r\n[Charts]\r\nProfileLast={want}\r\n"
-    repaired = "\ufeff" + body + "\r\n"
-    if repaired != text:
+    repaired = body + "\r\n"
+    if repaired.strip() + "\r\n" != text.strip() + "\r\n":
         _write_ini_atomic(ini, repaired)
         log.info(f"terminal {inst}: repaired corrupted {ini.name}")
 
@@ -506,9 +643,20 @@ def ensure_bridge_template(inst: int) -> None:
     except Exception as exc:
         log.debug(f"terminal {inst}: Bridge template ensure skipped: {exc}")
 
+# Small-window geometry for both terminals (side by side, never fullscreen).
+# T1 -> (10,10)-(460,340)  ~= 450x330, T2 -> (480,10)-(930,340).
+# Terminal 1 was coming up maximized (Type=3, RSave=1924) while terminal 2
+# stayed small (Type=1) - Type/Maximized were never pinned, so the maximized
+# state was sticky across restarts.
+WIN_GEOM = {1: (10, 10, 460, 340), 2: (480, 10, 930, 340)}
+
+def window_geom(inst: int) -> tuple[int, int, int, int]:
+    return WIN_GEOM.get(inst, WIN_GEOM[1])
+
 def pin_window_geometry(inst: int) -> None:
     ini = TERMINALS[inst]["dir"] / "Config" / "terminal.ini"
-    L, T, R, B = 10 + (inst - 1) * 30, 10 + (inst - 1) * 24, 460, 330
+    L, T, R, B = window_geom(inst)
+    W, H = R - L, B - T
     try:
         text = _read_ini(ini)
         if not text:
@@ -516,8 +664,14 @@ def pin_window_geometry(inst: int) -> None:
         lines = text.splitlines()
         out: list[str] = []
         in_win = False
+        # Force everything that can maximize/fullscreen the window off,
+        # and pin a small geometry.  Type=3 is MT5's maximized marker
+        # (observed: T1 Type=3 = fullscreen 1920x1054, T2 Type=1 = small).
         replaced = {"Left": False, "Top": False, "Right": False,
-                    "Bottom": False, "Fullscreen": False}
+                    "Bottom": False, "Fullscreen": False, "Type": False,
+                    "Maximized": False, "Minimized": False,
+                    "LSave": False, "TSave": False,
+                    "RSave": False, "BSave": False}
         for ln in lines:
             if ln.strip().startswith("["):
                 in_win = ln.strip().lower() == "[window]"
@@ -529,19 +683,49 @@ def pin_window_geometry(inst: int) -> None:
                     out.append("Fullscreen=0")
                     replaced["Fullscreen"] = True
                     continue
-                if key == "LSave" or key == "TSave" or key == "RSave" or key == "BSave":
-                    out.append(ln)
+                if key == "Type":
+                    out.append("Type=1")
+                    replaced["Type"] = True
                     continue
-                if key in replaced and not replaced[key]:
-                    if key == "Left":
-                        out.append(f"Left={L}")
-                    elif key == "Top":
-                        out.append(f"Top={T}")
-                    elif key == "Right":
-                        out.append(f"Right={R}")
-                    elif key == "Bottom":
-                        out.append(f"Bottom={B}")
-                    replaced[key] = True
+                if key == "Maximized":
+                    out.append("Maximized=0")
+                    replaced["Maximized"] = True
+                    continue
+                if key == "Minimized":
+                    out.append("Minimized=0")
+                    replaced["Minimized"] = True
+                    continue
+                if key == "Left":
+                    out.append(f"Left={L}")
+                    replaced["Left"] = True
+                    continue
+                if key == "Top":
+                    out.append(f"Top={T}")
+                    replaced["Top"] = True
+                    continue
+                if key == "Right":
+                    out.append(f"Right={R}")
+                    replaced["Right"] = True
+                    continue
+                if key == "Bottom":
+                    out.append(f"Bottom={B}")
+                    replaced["Bottom"] = True
+                    continue
+                if key == "LSave":
+                    out.append(f"LSave={L}")
+                    replaced["LSave"] = True
+                    continue
+                if key == "TSave":
+                    out.append(f"TSave={T}")
+                    replaced["TSave"] = True
+                    continue
+                if key == "RSave":
+                    out.append(f"RSave={R}")
+                    replaced["RSave"] = True
+                    continue
+                if key == "BSave":
+                    out.append(f"BSave={B}")
+                    replaced["BSave"] = True
                     continue
             out.append(ln)
         if not all(replaced.values()):
@@ -552,6 +736,10 @@ def pin_window_geometry(inst: int) -> None:
                 if not injected and ln.strip().lower() == "[window]":
                     if not replaced["Fullscreen"]:
                         new_lines.append("Fullscreen=0")
+                    if not replaced["Type"]:
+                        new_lines.append("Type=1")
+                    if not replaced["Maximized"]:
+                        new_lines.append("Maximized=0")
                     if not replaced["Left"]:
                         new_lines.append(f"Left={L}")
                     if not replaced["Top"]:
@@ -560,10 +748,28 @@ def pin_window_geometry(inst: int) -> None:
                         new_lines.append(f"Right={R}")
                     if not replaced["Bottom"]:
                         new_lines.append(f"Bottom={B}")
+                    if not replaced["LSave"]:
+                        new_lines.append(f"LSave={L}")
+                    if not replaced["TSave"]:
+                        new_lines.append(f"TSave={T}")
+                    if not replaced["RSave"]:
+                        new_lines.append(f"RSave={R}")
+                    if not replaced["BSave"]:
+                        new_lines.append(f"BSave={B}")
                     injected = True
+            # no [Window] section at all - append one
+            if not injected:
+                new_lines.append("[Window]")
+                new_lines.append("Fullscreen=0")
+                new_lines.append("Type=1")
+                new_lines.append("Maximized=0")
+                new_lines.append(f"Left={L}")
+                new_lines.append(f"Top={T}")
+                new_lines.append(f"Right={R}")
+                new_lines.append(f"Bottom={B}")
             out = new_lines
         _write_ini_atomic(ini, "\r\n".join(out) + "\r\n")
-        log.debug(f"terminal {inst}: window pinned to {R - L}x{B - T} at ({L},{T})")
+        log.debug(f"terminal {inst}: window pinned to {W}x{H} at ({L},{T}) Type=1")
     except OSError as exc:
         log.debug(f"terminal {inst}: window pin skipped: {exc}")
 
@@ -580,6 +786,195 @@ def purge_exec_channel(inst: int) -> None:
                     pass
     except OSError as exc:
         log.debug(f"terminal {inst}: exec purge skipped: {exc}")
+
+def _xdo_env() -> tuple[str | None, dict]:
+    xdo = shutil.which("xdotool")
+    if not xdo:
+        return None, {}
+    display = (os.environ.get("MT5_DISPLAY")
+               or os.environ.get("DISPLAY") or "").strip()
+    if not display:
+        display = ":1"
+    return xdo, dict(os.environ, DISPLAY=display)
+
+
+def _xdo(wid: str, *args: str, env: dict, timeout: float = 3.0) -> bool:
+    xdo, _ = _xdo_env()
+    if not xdo:
+        return False
+    try:
+        subprocess.run([xdo, *args, wid],
+                       capture_output=True, timeout=timeout, env=env)
+        return True
+    except Exception:
+        return False
+
+
+def _list_window_ids(env: dict) -> list[str]:
+    xdo, _ = _xdo_env()
+    if not xdo:
+        return []
+    try:
+        out = subprocess.run([xdo, "search", "--name", ""],
+                             capture_output=True, text=True,
+                             timeout=5, env=env).stdout.split()
+        return out
+    except Exception:
+        return []
+
+
+def _window_name(wid: str, env: dict) -> str:
+    xdo, _ = _xdo_env()
+    if not xdo:
+        return ""
+    try:
+        return subprocess.run([xdo, "getwindowname", wid],
+                              capture_output=True, text=True,
+                              timeout=3, env=env).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _is_mt5_name(name: str) -> bool:
+    if not name:
+        return False
+    keys = ("MetaTrader", "MetaQuotes", "HFMarkets", "HFM ", " - Hedge",
+            "Demo Account", "Live")
+    return any(k in name for k in keys)
+
+
+def shrink_mt5_window(wid: str, L: int, T: int, W: int, H: int,
+                      env: dict, do_minimize: bool = True) -> bool:
+    """Force one window small: unmaximize -> resize -> move -> minimize.
+
+    Returns True if any step succeeded.  Never raises.
+    """
+    xdo, _ = _xdo_env()
+    if not xdo:
+        return False
+    ok = False
+    try:
+        subprocess.run([xdo, "windowunmaximize", wid],
+                       capture_output=True, timeout=3, env=env)
+        ok = True
+    except Exception:
+        pass
+    for args in (["windowsize", wid, str(W), str(H)],
+                 ["windowmove", wid, str(L), str(T)]):
+        try:
+            subprocess.run([xdo, *args],
+                           capture_output=True, timeout=3, env=env)
+            ok = True
+        except Exception:
+            pass
+    if do_minimize:
+        try:
+            subprocess.run([xdo, "windowminimize", wid],
+                           capture_output=True, timeout=3, env=env)
+            ok = True
+        except Exception:
+            pass
+    return ok
+
+
+def _enforce_small_windows_once(inst: int, do_minimize: bool = True) -> int:
+    """One pass: shrink terminal `inst`'s window(s) to its small geometry.
+
+    Matches by login/server title first so T1 and T2 get their own
+    side-by-side slots.  Falls back to any MT5 window when the title does
+    not carry the login yet (still booting).  Returns windows handled.
+    """
+    xdo, env = _xdo_env()
+    if not xdo:
+        return 0
+    L, T, R, B = window_geom(inst)
+    W, H = R - L, B - T
+    slot = read_accounts().get(inst, {})
+    needles = [str(slot.get(k, "")).strip()
+               for k in ("login", "server") if str(slot.get(k, "")).strip()]
+    handled = 0
+    for wid in _list_window_ids(env):
+        name = _window_name(wid, env)
+        if not name:
+            continue
+        match = any(n in name for n in needles) if needles else False
+        if not match:
+            continue
+        if shrink_mt5_window(wid, L, T, W, H, env, do_minimize):
+            handled += 1
+    if handled:
+        return handled
+    # boot-phase fallback: no login in the title yet - shrink any MT5
+    # window so it never sits fullscreen while we wait for login
+    for wid in _list_window_ids(env):
+        name = _window_name(wid, env)
+        if _is_mt5_name(name):
+            if shrink_mt5_window(wid, L, T, W, H, env, do_minimize):
+                handled += 1
+                break  # one per pass; next pass catches the other terminal
+    return handled
+
+
+def _minimize_mt5_windows(inst: int) -> int:
+    """Kept for compatibility - now shrinks to small AND minimizes."""
+    keep = os.getenv("MT5_KEEP_WINDOWS", "") == "1"
+    return _enforce_small_windows_once(inst, do_minimize=not keep)
+
+
+def shrink_all_mt5_windows(do_minimize: bool = True) -> int:
+    """Shrink EVERY MT5 window to small side-by-side slots.
+
+    Used as a safety net after boot: T1 -> slot 1, T2 -> slot 2, so even
+    windows we could not attribute by title end up small, never fullscreen.
+    """
+    xdo, env = _xdo_env()
+    if not xdo:
+        return 0
+    wids = [w for w in _list_window_ids(env) if _is_mt5_name(_window_name(w, env))]
+    # stable order so T1/T2 mapping does not flip between passes
+    wids.sort(key=int, reverse=False)
+    handled = 0
+    for i, wid in enumerate(wids[:2]):
+        inst = i + 1
+        L, T, R, B = window_geom(inst)
+        if shrink_mt5_window(wid, L, T, R - L, B - T, env, do_minimize):
+            handled += 1
+    return handled
+
+def minimize_terminal(inst: int, tries: int = 45,
+                      delay: float = 1.0) -> None:
+    """Shrink terminal `inst` to its small slot as soon as it appears.
+
+    The MT5 window shows up seconds after launch and can re-maximize on
+    login, so this retries for ~45 s and re-pins a few times even after
+    the first hit.  Purely cosmetic - never raises, never blocks.
+    """
+    keep = os.getenv("MT5_KEEP_WINDOWS", "") == "1"
+
+    def _worker() -> None:
+        hits = 0
+        for i in range(max(1, tries)):
+            try:
+                if _enforce_small_windows_once(inst, do_minimize=not keep):
+                    hits += 1
+                    log.debug(f"terminal {inst}: window shrunk small "
+                              f"({hits}x)")
+                    if hits >= 3:
+                        return
+                elif hits:
+                    # window was small, disappeared (restart?) - keep watching
+                    pass
+            except Exception:
+                pass
+            time.sleep(delay)
+        # final safety net: make sure BOTH terminals are small, never
+        # fullscreen, even if title matching missed one
+        try:
+            shrink_all_mt5_windows(do_minimize=not keep)
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True,
+                     name=f"minimize-t{inst}").start()
 
 def launch_terminal(inst: int = 1, jitter: float | None = None,
                     with_login: bool = True) -> None:
@@ -601,6 +996,7 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     ensure_autotrading(inst)
     scrub_terminal2_credentials()
     sanitize_charts(inst)
+    ensure_minimal_profile(inst)
     force_profile(inst)
     ensure_bridge_template(inst)
     pin_window_geometry(inst)
@@ -623,6 +1019,10 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # ALWAYS enforce the small window (both terminals).  MT5_KEEP_WINDOWS=1
+    # only skips the minimize step - the resize-to-small still runs so no
+    # terminal ever sits fullscreen covering the screen.
+    minimize_terminal(inst)
 
 def ensure_terminal(inst: int = 1) -> bool:
     exe = TERMINALS[inst]["dir"] / "terminal64.exe"

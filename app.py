@@ -394,6 +394,74 @@ def api_trade():
     return _ok({"detail": detail, "price": price, "ticket": ticket,
                 "ms": round(order_ms, 1)})
 
+@app.post("/api/order")
+@rate_limit(max_requests=30, window=60)
+def api_order():
+    """Place a PENDING order: BUY LIMIT / BUY STOP / SELL LIMIT / SELL STOP.
+
+    The level is given the way the panel collects it - a whole number plus
+    the decimal digits - so `1` + `12165` is 1.12165 on a 5-digit pair.
+    """
+    d = request.get_json(silent=True) or {}
+    try:
+        account = int(d.get("account", 0))
+    except (TypeError, ValueError):
+        return _fail("bad account")
+    if account not in (1, 2):
+        return _fail("account must be 1 or 2")
+    symbol = str(d.get("symbol", "")).strip()
+    ptype = (str(d.get("type", "")).upper()
+             .replace(" ", "").replace("_", "").replace("-", ""))
+    if ptype not in ("BUYLIMIT", "BUYSTOP", "SELLLIMIT", "SELLSTOP"):
+        return _fail("type must be BUY LIMIT, BUY STOP, SELL LIMIT or SELL STOP")
+    try:
+        lot = float(d.get("lot", 0))
+    except (TypeError, ValueError):
+        return _fail("bad lot")
+    if lot <= 0 or lot > 100:
+        return _fail("lot out of range")
+    spots = read_spots()
+    if symbol not in spots or not spots[symbol][0]:
+        return _fail("no live quote for " + symbol)
+    try:
+        price = float(d.get("price", 0) or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0:
+        # whole + decimal, exactly like the panel/scheduling inputs
+        try:
+            whole = float(d.get("level_whole", 0) or 0)
+        except (TypeError, ValueError):
+            return _fail("bad level (whole)")
+        frac_s = str(d.get("level_frac", "")).strip().lstrip(".")
+        try:
+            frac = float("0." + frac_s) if frac_s else 0.0
+        except ValueError:
+            return _fail("bad level (decimal)")
+        price = whole + frac
+    bid = float(spots[symbol][0])
+    digits = len(f"{bid}".split(".")[1]) if "." in f"{bid}" else 0
+    if price <= 0:
+        return _fail("level required (whole number + decimal)")
+    price = round(price, digits)
+    t0 = time.perf_counter()
+    try:
+        ok, detail = sender_for(account).open_pending(symbol, ptype, lot,
+                                                      price, timeout=8.0)
+    except Exception as exc:
+        return _fail(str(exc))
+    order_ms = (time.perf_counter() - t0) * 1000.0
+    ticket = detail.split("|")[1] if "|" in detail else ""
+    fill_price = detail.split("|")[0] if "|" in detail else ""
+    threading.Thread(target=db.log_fired,
+                     args=(0, account, symbol, ptype, lot, "pending", ticket,
+                           ok, detail), kwargs={"ms": order_ms},
+                     daemon=True, name="pending-order-log").start()
+    if not ok:
+        return _fail(detail)
+    return _ok({"detail": detail, "price": fill_price, "ticket": ticket,
+                "type": ptype, "ms": round(order_ms, 1)})
+
 @app.post("/api/close")
 @rate_limit(max_requests=30, window=60)
 def api_close():
@@ -424,6 +492,26 @@ def api_close():
         return _ok(resp) if ok else _fail(detail)
     except Exception as exc:
         return _fail(str(exc))
+
+@app.post("/api/close-all")
+@rate_limit(max_requests=12, window=60)
+def api_close_all():
+    """Close ALL positions on BOTH terminals concurrently (close.py)."""
+    d = request.get_json(silent=True) or {}
+    pair = str(d.get("symbol") or d.get("pair") or "ALL").strip().upper() or "ALL"
+    try:
+        import close as closer
+        res = closer.close_all_accounts_results(None if pair == "ALL" else pair)
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    accs = res.get("accounts", {})
+    detail = "  |  ".join(
+        f"A{n}: {'OK' if v.get('ok') else v.get('detail', 'failed')}"
+        for n, v in sorted(accs.items()))
+    payload = {"detail": detail, "wall_ms": res.get("wall_ms", 0.0),
+               "accounts": accs}
+    return _ok(payload) if any(v.get("ok") for v in accs.values()) \
+        else _fail(detail or "nothing closed")
 
 @app.post("/api/restart")
 @rate_limit(max_requests=6, window=60)
@@ -682,40 +770,6 @@ def server_error(e):
 
 _scheduler = None
 
-def _warmup_first_orders() -> None:
-    if os.getenv("MT5_WARMUP", "1") != "1":
-        log.info("deploy warm-up disabled (MT5_WARMUP=0)")
-        return
-    symbol = os.getenv("MT5_WARMUP_SYMBOL", "XAUUSD247")
-    try:
-        lot = float(os.getenv("MT5_WARMUP_LOT", "0.01"))
-    except ValueError:
-        lot = 0.01
-    log.info(f"deploy warm-up armed: one {symbol} {lot} open+close per "
-             f"terminal in 20 s (MT5_WARMUP=0 disables)")
-
-    def _warm(inst: int) -> None:
-        try:
-            time.sleep(20.0)
-            from executor import _close_one
-            ok, det = sender_for(inst).open_trade(symbol, "BUY", lot,
-                                                  magic=777099,
-                                                  comment="warmup")
-            if ok:
-                time.sleep(0.4)
-                _close_one(inst, symbol)
-                log.info(f"terminal {inst}: deploy warm-up trade done")
-            else:
-                log.warning(f"terminal {inst}: warm-up open failed ({det}) - "
-                            f"first scheduled trade may still hit the "
-                            f"cold-symbol path")
-        except Exception as exc:
-            log.warning(f"terminal {inst}: warm-up skipped ({exc})")
-
-    for inst in (1, 2):
-        threading.Thread(target=_warm, args=(inst,), daemon=True,
-                         name=f"warmup-{inst}").start()
-
 def main() -> int:
     global _scheduler
     ap = argparse.ArgumentParser(description="MT5 web trading terminal (Flask)")
@@ -733,7 +787,6 @@ def main() -> int:
 
     db.init_db()
     _scheduler = start_scheduler()
-    _warmup_first_orders()
     metrics.start_observer()
 
     broker_prober.start_prober()

@@ -45,6 +45,11 @@ def _session_accounts() -> dict[int, dict[str, str]]:
 LOGIN_VERIFY_TIMEOUT_S = 90.0
 SCRUB_AFTER_LIVE_S = 8.0
 SYNC_DEAD_S = 45.0
+# After the session file changes, an intentional login is in flight and the
+# terminal is restarting.  trades.csv still holds the PREVIOUS account for a
+# while, so following it here would adopt the old account back and undo the
+# login.  Stay hands-off for this long after any session change.
+ADOPT_QUIET_S = 150.0
 
 def wait_for_login_feed(inst: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
@@ -220,6 +225,7 @@ class Supervisor:
         self._live_since: dict[int, float] = {}
         self._scrubbed_for_start: dict[int, float] = {}
         self._sess_stamp = session.file_stamp()
+        self._sess_changed_at = 0.0
         self._fast_frame = False
 
     def log(self, text: str) -> None:
@@ -335,6 +341,7 @@ class Supervisor:
                 if st.sync_dead_since == 0.0:
                     st.sync_dead_since = time.monotonic()
                 if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
+                        and time.monotonic() - self._sess_changed_at > ADOPT_QUIET_S
                         and time.monotonic() - st.last_start > GRACE_S
                         and time.monotonic() - st.last_heal > COOLDOWN_S):
                     self.log(f"{YELLOW}terminal {inst} feed live but LOGGED OUT "
@@ -368,6 +375,10 @@ class Supervisor:
                         self.log(f"{RED}terminal {inst} is in account {login}, "
                                  f"expected {expected}{RESET}")
                     st.login = login
+
+                fresh_session = session.file_stamp() != self._sess_stamp
+                if fresh_session:
+                    self._sess_changed_at = time.monotonic()
 
                 if login == expected:
                     st.ever_session = True
@@ -404,8 +415,8 @@ class Supervisor:
                     st.ever_session = True
                     self._fast_frame = True
                 elif expected and login:
-                    fresh_session = session.file_stamp() != self._sess_stamp
-                    if st.ever_session and not fresh_session:
+                    if (st.ever_session and not fresh_session
+                            and time.monotonic() - self._sess_changed_at > ADOPT_QUIET_S):
                         accs = _session_accounts()
                         a = accs.get(inst, {})
                         if a.get("login") and a["login"] != login:
@@ -435,6 +446,7 @@ class Supervisor:
                             self._fast_frame = True
                     elif (expected not in ("", "?")
                           and known_accounts.has_credentials(expected)
+                          and time.monotonic() - self._sess_changed_at > ADOPT_QUIET_S
                           and time.monotonic() - st.last_start > GRACE_S
                           and time.monotonic() - st.last_heal > COOLDOWN_S):
                         self.log(f"{YELLOW}terminal {inst} is in {login} - "

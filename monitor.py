@@ -11,7 +11,7 @@ import datetime as dt
 from config import setup_logging
 
 from spot import (
-    BOLD, DIM, RESET, GREEN, RED, read_accounts, pick_terminal, read_header, scan_terminals,
+    BOLD, DIM, RESET, GREEN, RED, YELLOW, read_accounts, pick_terminal, read_header, scan_terminals,
     ensure_terminal, restart_terminal, install_script, setup_terminal2,
     compiled_paths, wait_for_bridge, term_running, feed_age, WINEPREFIX, MT5_DIR2,
 )
@@ -21,6 +21,8 @@ log = setup_logging(__name__)
 HEADER = (f"{'TICKET':<11} {'SYMBOL':<8} {'SIDE':<5} {'VOL':>6} "
           f"{'OPEN':>10} {'CUR':>10} {'P/L':>10} {'SWAP':>8} {'NET':>10} "
           f"{'OPENED':>20}  MAGIC      COMMENT")
+
+TRADE_MODES = {0: "demo", 1: "contest", 2: "real"}
 
 SEP = "=" * 100
 
@@ -62,7 +64,9 @@ def account_info(inst: int) -> dict:
     if not term or read_header(term["trades_path"]).get("login") != login:
         return {"login": login or "", "server": "", "balance": 0.0, "equity": 0.0,
                 "profit": 0.0, "margin": 0.0, "margin_free": 0.0,
-                "margin_level": 0.0, "positions": 0}
+                "margin_level": 0.0, "positions": 0,
+                "trade_allowed": "1", "mql_allowed": "1",
+                "holder": "", "broker": "", "leverage": ""}
     head = read_header(term["trades_path"])
     return {"login": head.get("login", ""), "server": head.get("server", ""),
             "balance": f(head.get("balance", "")),
@@ -71,7 +75,12 @@ def account_info(inst: int) -> dict:
             "margin": f(head.get("margin", "")),
             "margin_free": f(head.get("margin_free", "")),
             "margin_level": f(head.get("margin_level", "")),
-            "positions": head.get("positions", 0)}
+            "positions": head.get("positions", 0),
+            "trade_allowed": head.get("account_trade_allowed", "1"),
+            "mql_allowed": head.get("mql_allowed", "1"),
+            "holder": head.get("holder", "") or "",
+            "broker": head.get("broker", "") or "",
+            "leverage": head.get("leverage", "") or ""}
 
 def TERMINAL_DIR(inst: int):
     from spot import TERMINALS
@@ -216,6 +225,27 @@ class Monitor:
         else:
             out.append(f"{DIM}balance/equity need SpotDump v1.20 "
                        f"(python monitor.py --restart {self.inst} recompiles it){RESET}")
+        # Trading permission warnings
+        trade_allowed = head.get("account_trade_allowed", "1")
+        mql_allowed = head.get("mql_allowed", "1")
+        if trade_allowed == "0":
+            out.append("")
+            out.append(f"  {RED}{BOLD}[!] ACCOUNT TRADE DISABLED{RESET}")
+            out.append(f"  {RED}    The MT5 server has blocked trading on this account.{RESET}")
+            out.append(f"  {RED}    Contact HF Markets to enable trading rights.{RESET}")
+        elif mql_allowed == "0":
+            out.append("")
+            out.append(f"  {YELLOW}[!] MQL TRADE DISABLED{RESET}")
+            out.append(f"  {YELLOW}    EA/automated trading is blocked on this account.{RESET}")
+        # Missing holder/broker warning for live accounts
+        if not head.get("holder") and not head.get("broker"):
+            tmode = head.get("trade_mode", "")
+            try:
+                tmode_name = TRADE_MODES.get(int(tmode), "")
+            except (ValueError, TypeError):
+                tmode_name = ""
+            if tmode_name == "real":
+                out.append(f"  {YELLOW}[!] Holder and Broker not reported by live server{RESET}")
         out.append("")
 
         if not trades:
@@ -342,6 +372,18 @@ def run(once: bool, interval: float, restart: int | None) -> int:
             if not ok[inst]:
                 log.error(f"bridge of terminal {inst} is not producing data - SpotDump EA is not attached.")
                 log.error(f"Run:  python monitor.py --restart {inst}")
+                print()
+                print(f"{RED}terminal {inst} EA feed missing:{RESET}"
+                      f" the EA is not writing trades.csv, or the terminal is not running.")
+                print(f"  terminal {inst} exe: {(TERMINALS[inst]['dir'] / 'terminal64.exe').exists()}")
+                print(f"  terminal {inst} running (pgrep): {term_running(inst)}")
+                print(f"  terminal {inst} feed_age: {feed_age(inst):.1f} s")
+                for p in compiled_paths(inst):
+                    print(f"  {p}: exists={p.exists()}  mtime={p.stat().st_mtime if p.exists() else '-'}")
+                for p in [TERMINALS[inst]['dir'] / 'MQL5' / 'Files' / f
+                          for f in ('spots.csv', 'trades.csv', 'candles.csv')]:
+                    print(f"  {p.name}: exists={p.exists()}  mtime={p.stat().st_mtime if p.exists() else '-'}")
+                print()
                 return 1
 
     monitors = {1: Monitor(1), 2: Monitor(2)}
@@ -364,6 +406,8 @@ def run(once: bool, interval: float, restart: int | None) -> int:
             time.sleep(max(interval, 0.02))
     except KeyboardInterrupt:
         sys.stdout.write("\033[?25h\nbye!\n")
+    finally:
+        sys.stdout.write("\033[?25h\n")
     return 0
 
 def main() -> int:

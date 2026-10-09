@@ -84,7 +84,7 @@ def snapshot() -> dict:
         age = feed_age(inst)
         out["feeds"][f"age_{inst}"] = round(age, 2)
         out["feeds"][f"running_{inst}"] = term_running(inst)
-        cur = head.get("currency", "") or "USD"
+        cur = head.get("currency", "") or ""
         login_got = head.get("login", "") or ""
         bal, eq = f(head.get("balance", "")), f(head.get("equity", ""))
         profit = f(head.get("profit", ""))
@@ -96,14 +96,19 @@ def snapshot() -> dict:
             mmode = MARGIN_MODES.get(int(head.get("margin_mode", "")), "hedging")
         except ValueError:
             mmode = "hedging"
+        holder = head.get("holder", "")
+        broker = head.get("broker", "")
+        lev_raw = head.get("leverage", "")
+        trade_allowed = head.get("account_trade_allowed", "1")
+        mql_allowed = head.get("mql_allowed", "1")
         out["accounts"][str(inst)] = {
             "terminal": inst,
             "login": login_got or expected,
-            "holder": head.get("holder", "") or "?",
-            "broker": head.get("broker", "") or "?",
+            "holder": holder or ("? (not reported by live server)" if tmode == "real" and not holder else "?"),
+            "broker": broker or ("? (not reported by live server)" if tmode == "real" and not broker else "?"),
             "server": head.get("server", "") or accs.get(inst, {}).get("server", "?"),
-            "currency": cur,
-            "leverage": f"1:{head.get('leverage', '') or '?'}",
+            "currency": cur or ("USD" if bal > 0 else "?"),
+            "leverage": f"1:{lev_raw}" if lev_raw and lev_raw != "0" else "not reported (ECN/raw)",
             "trade_mode": tmode,
             "margin_mode": mmode,
             "balance": round(bal, 2),
@@ -114,10 +119,12 @@ def snapshot() -> dict:
             "margin_level": round(f(head.get("margin_level", "")), 2),
             "positions": head.get("positions", 0),
             "algo_allowed": head.get("trade_allowed", ""),
-            "mql_allowed": head.get("mql_allowed", ""),
+            "mql_allowed": mql_allowed,
+            "account_trade_allowed": trade_allowed,
             "identity_ok": bool(login_got) and login_got == expected,
             "live": age < 5,
             "age_s": round(age, 2),
+            "trade_disabled": trade_allowed == "0",
             "spreads": {sym: spread_pts(sym, spots) for sym in spots},
             "fillings": {sym: _probed_filling(inst, sym) for sym in spots},
         }
@@ -133,11 +140,11 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
         link = f"{RED}stale ({age:.0f} s){RESET}"
 
     login = head.get("login", "") or "-"
-    name = head.get("holder", "") or "?"
-    broker = head.get("broker", "") or "?"
+    name = head.get("holder", "") or ""
+    broker = head.get("broker", "") or ""
     server = head.get("server", "") or "?"
-    cur = head.get("currency", "") or "?"
-    lev = head.get("leverage", "") or "?"
+    cur = head.get("currency", "") or ""
+    lev = head.get("leverage", "") or ""
     bal, eq = head.get("balance", ""), head.get("equity", "")
     marg, mfree = head.get("margin", ""), head.get("margin_free", "")
     mlevel = head.get("margin_level", "")
@@ -151,6 +158,8 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     except ValueError:
         mmode = "?"
     npos = head.get("positions", 0)
+    trade_allowed = head.get("account_trade_allowed", "1")
+    mql_allowed = head.get("mql_allowed", "1")
 
     eq_c = GREEN if f(eq) > f(bal) else (RED if f(eq) < f(bal) else "")
     pf_c = GREEN if f(profit) > 0 else (RED if f(profit) < 0 else "")
@@ -162,25 +171,45 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     out = [f"{BOLD}TERMINAL {inst}  -  ACCOUNT {login}{RESET}  {link}  "
            f"{DIM}{dt.datetime.now():%H:%M:%S}{RESET}"]
     out.append(acc_line("Identity", f"{id_s}"))
-    out.append(acc_line("Holder", name))
-    out.append(acc_line("Broker", broker))
+    # Holder/broker warning for live accounts where server doesn't report these
+    if not name and not broker and tmode == "real":
+        out.append(acc_line("Holder", f"{YELLOW}? (not reported by live server){RESET}"))
+        out.append(acc_line("Broker", f"{YELLOW}? (not reported by live server){RESET}"))
+    else:
+        out.append(acc_line("Holder", name or "?"))
+        out.append(acc_line("Broker", broker or "?"))
     out.append(acc_line("Server", server))
     out.append(acc_line("Trade mode", tmode,
                         YELLOW if tmode == "real" else ""))
     out.append(acc_line("Margin mode", mmode))
-    out.append(acc_line("Leverage", f"1:{lev}"))
+    # Leverage: 0 means not reported (common on ECN/raw live accounts)
+    if lev == "0" or not lev:
+        out.append(acc_line("Leverage", f"{YELLOW}not reported (ECN/raw account){RESET}"))
+    else:
+        out.append(acc_line("Leverage", f"1:{lev}"))
     out.append("")
-    out.append(acc_line("Balance", f"{bal} {cur}"))
-    out.append(acc_line("Equity", f"{eq_c}{eq} {cur}{RESET}"))
-    out.append(acc_line("Floating P/L", f"{pf_c}{profit} {cur}{RESET}"))
-    out.append(acc_line("Margin used", f"{marg} {cur}"))
-    out.append(acc_line("Margin free", f"{mfree} {cur}"))
+    cur_display = cur or ("USD" if f(bal) > 0 else "?")
+    out.append(acc_line("Balance", f"{bal} {cur_display}"))
+    out.append(acc_line("Equity", f"{eq_c}{eq} {cur_display}{RESET}"))
+    out.append(acc_line("Floating P/L", f"{pf_c}{profit} {cur_display}{RESET}"))
+    out.append(acc_line("Margin used", f"{marg} {cur_display}"))
+    out.append(acc_line("Margin free", f"{mfree} {cur_display}"))
     if mlevel and f(mlevel) > 0:
         ml_c = RED if f(mlevel) < 100 else (YELLOW if f(mlevel) < 300 else GREEN)
         out.append(acc_line("Margin level", f"{ml_c}{mlevel} %{RESET}"))
     else:
         out.append(acc_line("Margin level", f"{DIM}n/a (no open positions){RESET}"))
     out.append(acc_line("Open positions", str(npos)))
+    # Trading permission warnings
+    if trade_allowed == "0":
+        out.append("")
+        out.append(f"  {RED}{BOLD}[!] ACCOUNT TRADE DISABLED{RESET}")
+        out.append(f"  {RED}    The MT5 server has blocked trading on this account.{RESET}")
+        out.append(f"  {RED}    Contact your broker to enable trading rights.{RESET}")
+    elif mql_allowed == "0":
+        out.append("")
+        out.append(f"  {YELLOW}[!] MQL TRADE DISABLED{RESET}")
+        out.append(f"  {YELLOW}    EA/automated trading is blocked on this account.{RESET}")
     out.append("")
     quoted = [s for s in spots if s in ("EURUSD", "GBPUSD", "XAUUSD")]
     quoted += sorted(s for s in spots if s not in quoted)

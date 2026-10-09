@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import CONFIG, setup_logging
+from config import setup_logging
 from spot import TERMINALS
 
 log = setup_logging(__name__)
@@ -58,48 +58,41 @@ period_flags=0
 </chart>
 """
 
-def _candidate_sources() -> list[Path]:
-    out: list[Path] = []
-    src = CONFIG.spot_dump_src.parent / "Profiles" / "Templates" / "ADX.tpl"
-    out.append(src)
-    for inst in (1, 2):
-        out.append(TERMINALS[inst]["dir"] / "Profiles" / "Templates" / "ADX.tpl")
-        out.append(TERMINALS[inst]["dir"] / "MQL5" / "Profiles" / "Templates" / "ADX.tpl")
-    return [p for p in out if p.exists()]
-
 def _read_text_utf16(path: Path) -> str:
     return path.read_text(encoding="utf-16", errors="replace")
 
-def build_tpl_text() -> str:
-    for src in _candidate_sources():
-        try:
-            text = _read_text_utf16(src)
-        except OSError as exc:
-            log.warning(f"cannot read {src}: {exc}")
-            continue
-        text = text.replace("\r\n", "\n").replace("\n", "\r\n")
-        lines: list[str] = []
-        seen_expertmode = False
-        for line in text.splitlines():
-            s = line.strip().lower()
-            if s.startswith("expertmode"):
-                lines.append("expertmode=1")
-                seen_expertmode = True
-            else:
-                lines.append(line)
-        if not seen_expertmode:
-            lines.append("expertmode=1")
-        return "\r\n".join(lines) + "\r\n"
-    log.info("no base template found - writing minimal Bridge.tpl")
+def minimal_chart_text() -> str:
+    """The canonical minimalist chart body (CRLF, ready for UTF-16).
+
+    Shared by the Bridge template and by spot.ensure_minimal_profile(),
+    so a chart opened from the template and a chart opened from the boot
+    profile are byte-identical - which is what makes the terminals come
+    up the same, minimal way.
+    """
     return MINIMAL_TPL.replace("\r\n", "\n").replace("\n", "\r\n")
+
+def build_tpl_text() -> str:
+    """Canonical minimal Bridge template - deliberately deterministic.
+
+    The old version preferred copying a pre-existing ADX.tpl (often a
+    busy, indicator-laden broker template).  That is why terminal 1 could
+    open cluttered while terminal 2 opened minimal.  The minimal text is
+    also what guarantees the SpotDump EA is attached to the chart.
+    """
+    return minimal_chart_text()
 
 def needs_install(dst: Path, tpl_text: str) -> bool:
     if not dst.exists():
         return True
     try:
-        return "expertmode=1" not in _read_text_utf16(dst).lower()
+        current = _read_text_utf16(dst)
     except OSError:
         return True
+    # compare CONTENT, not just a marker: an install that already carried
+    # the old (non-minimal) template would otherwise never be upgraded,
+    # so terminal 1 stayed cluttered forever
+    return (current.replace("\r\n", "\n")
+            != tpl_text.replace("\r\n", "\n"))
 
 def install() -> bool:
     tpl_text = build_tpl_text()
@@ -112,9 +105,9 @@ def install() -> bool:
             dst = tpl_dir / TPL_NAME
             if needs_install(dst, tpl_text):
                 dst.write_text(tpl_text, encoding="utf-16")
-                log.info(f"terminal {inst}: wrote {dst}")
+                log.info(f"terminal {inst}: wrote minimal {TPL_NAME}")
             else:
-                log.info(f"terminal {inst}: {TPL_NAME} already has expertmode=1")
+                log.debug(f"terminal {inst}: {TPL_NAME} already minimal")
             legacy_dir.mkdir(parents=True, exist_ok=True)
             legacy_dst = legacy_dir / TPL_NAME
             if needs_install(legacy_dst, tpl_text):

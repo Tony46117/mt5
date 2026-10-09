@@ -9,7 +9,7 @@ import uuid
 import datetime as dt
 import os
 
-from config import CONFIG, setup_logging
+from config import CONFIG, setup_logging, map_symbol, classic_pairs_for
 
 from pathlib import Path
 
@@ -62,11 +62,85 @@ TRADING_DAYS = tuple(int(x) for x in
 
 EXEC_NEXT_FILE = "exec_next.txt"
 
+class _OutReader:
+    """Incremental reader for the EA's exec_out.csv.
+
+    The file grows all day and the old code slurped the WHOLE thing on
+    every poll inside a sub-millisecond loop - cost proportional to file
+    size, forever.  This reads only the bytes appended since the previous
+    poll and stitches a partial line across reads.
+    """
+
+    __slots__ = ("path", "offset", "carry")
+
+    def __init__(self, path, offset: int = 0):
+        self.path = path
+        self.offset = max(0, int(offset))
+        self.carry = b""
+
+    def poll(self) -> list[bytes]:
+        """Return the complete lines appended since the last poll."""
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return []
+        if size < self.offset:            # truncated / rotated by the EA
+            self.offset, self.carry = 0, b""
+        if size == self.offset:
+            return []
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read()
+        except OSError:
+            return []
+        self.offset = size
+        data = self.carry + chunk
+        cut = data.rfind(b"\n")
+        if cut == -1:                     # partial line - hold it over
+            self.carry = data
+            return []
+        self.carry = data[cut + 1:]
+        return data[:cut].split(b"\n")
+
+def _poll_sleep(elapsed: float) -> None:
+    """Adaptive backoff for the exec poll loop.
+
+    A flat 0.2 ms sleep is effectively a busy-wait: it burns a whole CPU
+    core for the entire order round-trip and steals cycles from wine/MT5
+    running on the same box.  Broker fills land in tens of milliseconds,
+    so a tight first ~2 ms catches essentially everything, then we back
+    off so the rest of the software stays responsive.
+    """
+    if elapsed < 0.002:
+        time.sleep(0)
+    elif elapsed < 0.05:
+        time.sleep(0.0005)
+    elif elapsed < 0.5:
+        time.sleep(0.002)
+    else:
+        time.sleep(0.01)
+
 def _current_exec_dir(inst: int):
     return exec_in_path(inst)
 
 def _current_out_path(inst: int):
     return exec_out_path(inst)
+
+_MKDIR_DONE: set = set()
+_MKDIR_LOCK = threading.Lock()
+
+def _ensure_files_dir(files_dir) -> None:
+    key = str(files_dir)
+    with _MKDIR_LOCK:
+        if key in _MKDIR_DONE:
+            return
+    try:
+        files_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise
+    with _MKDIR_LOCK:
+        _MKDIR_DONE.add(key)
 
 class SendCommand:
 
@@ -99,7 +173,11 @@ class SendCommand:
         cid = uuid.uuid4().hex[:12]
         cmd_file = files_dir / f"exec_in.{cid}.txt"
         line = ("\t".join((cid, *parts)) + "\n").encode("ascii")
-        fd = os.open(str(cmd_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_SYNC, 0o644)
+        # NOTE: no O_SYNC - forcing an fsync on every order cost real
+        # milliseconds of latency per trade.  The file name carries a
+        # unique uuid, so there is no torn-write risk; a plain close is
+        # enough and the EA picks the file up from the directory listing.
+        fd = os.open(str(cmd_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             os.write(fd, line)
         finally:
@@ -107,12 +185,12 @@ class SendCommand:
         return cid, cmd_file
 
     def _await_result(self, cid: str, cmd_file, files_dir, out_path,
-                      ptr_file, deadline: float) -> tuple[bool, str]:
+                      ptr_file, deadline: float,
+                      start_offset: int = 0) -> tuple[bool, str]:
         t0 = time.monotonic()
         next_assert = 0.0
-        last_mtime = 0.0
-        last_size = -1
         ptr_tmp = files_dir / f"exec_next.{cid}.tmp"
+        reader = _OutReader(out_path, start_offset)
         try:
             while time.monotonic() < deadline:
                 now = time.monotonic()
@@ -124,39 +202,102 @@ class SendCommand:
                         ptr_tmp.unlink(missing_ok=True)
                     next_assert = now + EXEC_REASSERT_INTERVAL
 
-                try:
-                    st = out_path.stat()
-                    if st.st_mtime != last_mtime or st.st_size != last_size:
-                        last_mtime, last_size = st.st_mtime, st.st_size
-                        raw = out_path.read_bytes()
-                        res = self._parse_out(raw, cid)
-                        if res is not None:
-                            return res[0] == "OK", res[1]
-                except OSError:
-                    pass
+                lines = reader.poll()
+                if lines:
+                    res = self._parse_out(b"\n".join(lines), cid)
+                    if res is not None:
+                        return res[0] == "OK", res[1]
 
-                if now - t0 < 0.0015:
-                    continue
-                time.sleep(EXEC_POLL_SLEEP)
+                _poll_sleep(now - t0)
         finally:
             ptr_tmp.unlink(missing_ok=True)
-        return False, (f"terminal {self.inst} not responding "
-                       f"(is the terminal running with the SpotDump EA attached?)")
+        return self._not_responding(cid)
+
+    def _not_responding(self, cid: str) -> tuple[bool, str]:
+        return False, self._diagnose_unresponsive(cid)
+
+    def _diagnose_unresponsive(self, cid: str) -> str:
+        out_path = self._current_out_path()
+        msg = [f"terminal {self.inst} not responding "
+               f"(is the terminal running with the SpotDump EA attached?)"]
+        if out_path.exists():
+            try:
+                with open(out_path, "rb") as fh:
+                    try:
+                        fh.seek(0, 2)
+                        size = fh.tell()
+                        fh.seek(max(0, size - 8192))
+                    except OSError:
+                        pass
+                    raw = fh.read()
+                if raw:
+                    nuls = sum(1 for b in raw if b == 0)
+                    ratio = nuls / len(raw)
+                    if ratio > 0.5:
+                        msg.append(f" -- exec_out.csv is corrupted "
+                                   f"({nuls}/{len(raw)} bytes are NUL, "
+                                   f"ratio {ratio:.0%}); "
+                                   f"the EA may have crashed or written binary data")
+                    ascii_lines = [l for l in raw.splitlines()
+                                   if l and not l.startswith(b'\x00')]
+                    if ascii_lines:
+                        tail = b'\n'.join(ascii_lines[-3:]).decode('ascii', errors='replace')
+                        msg.append(f" -- last readable lines in exec_out.csv:\n"
+                                   f"    {tail.replace(chr(10), chr(10) + '    ')}")
+            except OSError:
+                pass
+        try:
+            from spot import read_accounts
+            accs = read_accounts()
+            login = accs.get(self.inst, {}).get('login', '?')
+            if login and login != '?':
+                from spot import pick_terminal, read_header, read_spots
+                term = pick_terminal(login)
+                if term:
+                    head = read_header(term['trades_path'])
+                    trade_allowed = head.get('account_trade_allowed', '1')
+                    mql_allowed = head.get('mql_allowed', '1')
+                    if trade_allowed == '0':
+                        msg.append(f" -- account_trade_allowed=0 "
+                                   f"(server blocked trading on this account)")
+                    if mql_allowed == '0':
+                        msg.append(f" -- mql_allowed=0 "
+                                   f"(EA/automated trading blocked on this account)")
+                    # If the error was "unknown symbol", list available symbols
+                    spots = read_spots()
+                    known = sorted(s for s, v in spots.items() if v[0])
+                    if known:
+                        msg.append(f" -- broker feed has {len(known)} symbols; "
+                                   f"first 12: {', '.join(known[:12])}")
+        except Exception:
+            pass
+        return ' '.join(msg)
+
+    def _current_out_path(self) -> Path:
+        return _current_out_path(self.inst)
 
     def send(self, *parts: str, timeout: float | None = None) -> tuple[bool, str]:
         to = self.timeout if timeout is None else timeout
         with self.lock:
             files_dir, out_path, ptr_file = self._get_paths()
             try:
-                files_dir.mkdir(parents=True, exist_ok=True)
+                _ensure_files_dir(files_dir)
             except OSError as exc:
                 return False, f"terminal {self.inst} files dir unavailable: {exc}"
+            try:
+                # remember where the result file ended BEFORE we place the
+                # command: our answer can only ever be appended after this,
+                # so we never have to scan old output
+                start_offset = out_path.stat().st_size
+            except OSError:
+                start_offset = 0
             try:
                 cid, cmd_file = self._write_cmd(files_dir, parts)
             except OSError as exc:
                 return False, f"cannot write command file: {exc}"
             return self._await_result(cid, cmd_file, files_dir, out_path,
-                                      ptr_file, time.monotonic() + to)
+                                      ptr_file, time.monotonic() + to,
+                                      start_offset)
 
     def send_batch(self, *commands: tuple[str, ...],
                    timeout: float | None = None) -> list[tuple[bool, str]]:
@@ -167,10 +308,14 @@ class SendCommand:
         with self.lock:
             files_dir, out_path, ptr_file = self._get_paths()
             try:
-                files_dir.mkdir(parents=True, exist_ok=True)
+                _ensure_files_dir(files_dir)
             except OSError as exc:
                 return ([(False, f"terminal {self.inst} files dir unavailable: {exc}")]
                         * len(commands))
+            try:
+                start_offset = out_path.stat().st_size
+            except OSError:
+                start_offset = 0
             queued: list[tuple[str | None, object, OSError | None]] = []
             for parts in commands:
                 try:
@@ -182,9 +327,9 @@ class SendCommand:
             deadline = time.monotonic() + to
             t0 = time.monotonic()
             next_assert = 0.0
-            last_mtime, last_size = 0.0, -1
             got: list[tuple[bool, str] | None] = [None] * len(queued)
             ptr_tmp = files_dir / f"exec_next.batch.{uuid.uuid4().hex[:6]}.tmp"
+            reader = _OutReader(out_path, start_offset)
             try:
                 while time.monotonic() < deadline and any(r is None for r in got):
                     now = time.monotonic()
@@ -197,21 +342,19 @@ class SendCommand:
                         except OSError:
                             pass
                         next_assert = now + EXEC_REASSERT_INTERVAL
-                    try:
-                        st = out_path.stat()
-                        if st.st_mtime != last_mtime or st.st_size != last_size:
-                            last_mtime, last_size = st.st_mtime, st.st_size
-                            raw = out_path.read_bytes()
-                            for i, (cid, cf, err) in enumerate(queued):
-                                if got[i] is None and cid:
-                                    res = self._parse_out(raw, cid)
-                                    if res is not None:
-                                        got[i] = (res[0] == "OK", res[1])
-                    except OSError:
-                        pass
-                    if now - t0 < 0.0015:
-                        continue
-                    time.sleep(EXEC_POLL_SLEEP)
+
+                    for fields in reader.poll():
+                        if len(fields) < 3:
+                            continue
+                        done_cid = fields[0].decode(errors="replace")
+                        for i, (cid, cf, err) in enumerate(queued):
+                            if got[i] is None and cid == done_cid:
+                                got[i] = (fields[1].decode() == "OK",
+                                          fields[2].decode())
+                                break
+                    if not any(r is None for r in got):
+                        break
+                    _poll_sleep(time.monotonic() - t0)
             finally:
                 ptr_tmp.unlink(missing_ok=True)
 
@@ -221,14 +364,25 @@ class SendCommand:
                 elif err is not None:
                     results[i] = (False, f"cannot write command file: {err}")
                 else:
-                    results[i] = (False, f"terminal {self.inst} not responding "
-                                           f"(is the terminal running with the SpotDump EA attached?)")
+                    results[i] = (False, self._diagnose_unresponsive(cid))
         return results
 
     def open_trade(self, symbol: str, side: str, lot: float,
                    magic: int = 777001, comment: str = "py",
                    timeout: float | None = None) -> tuple[bool, str]:
-        return self.send("OPEN", symbol.upper(), side.upper(), f"{lot:.2f}",
+        mapped = map_symbol(symbol.upper(), self.inst)
+        return self.send("OPEN", mapped, side.upper(), f"{lot:.2f}",
+                         "0", "0", str(magic), comment, timeout=timeout)
+
+    def open_pending(self, symbol: str, ptype: str, lot: float, price: float,
+                     magic: int = 777002, comment: str = "pend",
+                     timeout: float | None = None) -> tuple[bool, str]:
+        """Place a pending order: type is BUYLIMIT / BUYSTOP / SELLLIMIT /
+        SELLSTOP and `price` is the trigger level.  The result detail is
+        `price|order_ticket|volume`, same shape as a market fill."""
+        mapped = map_symbol(symbol.upper(), self.inst)
+        p = ptype.upper().replace(" ", "").replace("_", "")
+        return self.send("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
                          "0", "0", str(magic), comment, timeout=timeout)
 
     def close_position(self, ticket: str) -> tuple[bool, str]:
@@ -236,8 +390,8 @@ class SendCommand:
 
     def close_all(self, symbol: str | None = None,
                   timeout: float | None = None) -> tuple[bool, str]:
-        return self.send("CLOSEALL", symbol.upper() if symbol else "ALL",
-                         timeout=timeout)
+        mapped = map_symbol(symbol.upper(), self.inst) if symbol else "ALL"
+        return self.send("CLOSEALL", mapped, timeout=timeout)
 
     def ping(self) -> tuple[bool, str]:
         return self.send("PING", timeout=1.0)
@@ -247,6 +401,81 @@ CMD2 = SendCommand(2, timeout=CONFIG.exec_timeout_seconds)
 
 def sender_for(account: int) -> SendCommand:
     return CMD1 if account == 1 else CMD2
+
+
+def diagnose_terminal(inst: int) -> dict:
+    """Return a structured diagnostic of why a terminal may not be responding."""
+    from spot import (read_accounts, pick_terminal, read_header, read_spots,
+                     term_running, feed_age, exec_out_path)
+    accs = read_accounts()
+    login = accs.get(inst, {}).get('login', '')
+    result: dict = {
+        'inst': inst,
+        'login': login,
+        'running': term_running(inst),
+        'feed_age_s': feed_age(inst),
+        'issues': [],
+    }
+    if not login or login in ('0', '?', ''):
+        result['issues'].append('no login configured for this terminal')
+        return result
+    if not result['running']:
+        result['issues'].append('terminal process is not running')
+    if result['feed_age_s'] > 5:
+        result['issues'].append(f"feed is stale ({result['feed_age_s']:.1f}s old)")
+    term = pick_terminal(login)
+    if term:
+        head = read_header(term['trades_path'])
+        trade_allowed = head.get('account_trade_allowed', '1')
+        mql_allowed = head.get('mql_allowed', '1')
+        if trade_allowed == '0':
+            result['issues'].append(
+                'account_trade_allowed=0: the MT5 server has blocked trading '
+                'on this account (contact your broker)')
+        if mql_allowed == '0':
+            result['issues'].append(
+                'mql_allowed=0: EA/automated trading is blocked on this account')
+        if head.get('login') != login:
+            result['issues'].append(
+                f"EA reports login {head.get('login')!r} but session expects "
+                f"{login!r} - account mismatch")
+    fout = exec_out_path(inst)
+    if fout.exists():
+        try:
+            raw = fout.read_bytes()
+            if raw:
+                nuls = sum(1 for b in raw if b == 0)
+                if nuls / len(raw) > 0.5:
+                    result['issues'].append(
+                        f"exec_out.csv is corrupted "
+                        f"({nuls}/{len(raw)} bytes are NUL, "
+                        f"{nuls/len(raw):.0%})")
+        except OSError:
+            pass
+    spots = read_spots()
+    known = sorted(s for s, v in spots.items() if v[0])
+    if known:
+        result['known_symbols'] = known
+    return result
+
+
+def print_diagnosis(inst: int) -> None:
+    d = diagnose_terminal(inst)
+    print(f"\n{BOLD}TERMINAL {inst} DIAGNOSTIC{RESET}")
+    print(f"  login: {d['login'] or '-'}")
+    print(f"  running: {d['running']}")
+    print(f"  feed_age: {d['feed_age_s']:.2f}s")
+    if d['issues']:
+        print(f"  ISSUES ({len(d['issues'])}):")
+        for iss in d['issues']:
+            print(f"    - {iss}")
+    if 'known_symbols' in d:
+        syms = d['known_symbols']
+        print(f"  broker feed has {len(syms)} symbols; first 12: "
+              f"{', '.join(syms[:12])}")
+    else:
+        print(f"  broker feed: no symbols available")
+    print()
 
 def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, str]:
     ok, detail = False, ""
@@ -375,12 +604,35 @@ class FutureTradeScheduler(threading.Thread):
                         pass
             except OSError:
                 pass
+            # Check exec_out.csv for NUL corruption
+            try:
+                out_path = exec_out_path(inst)
+                if out_path.exists():
+                    raw = out_path.read_bytes()
+                    if raw:
+                        nuls = sum(1 for b in raw if b == 0)
+                        if nuls / len(raw) > 0.5:
+                            log.error(f"terminal {inst}: exec_out.csv is "
+                                      f"corrupted ({nuls}/{len(raw)} bytes NUL) "
+                                      f"- purging and restarting")
+                            try:
+                                out_path.unlink()
+                            except OSError:
+                                pass
+                            for p in d.glob("exec_in.*.txt"):
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
+                            stalled.append(inst)
+            except OSError:
+                pass
         for inst in set(stalled):
             if (now_m - self._boot_ts < HEAL_BOOT_GRACE_S
                     or now_m - self._heal_ts.get(inst, 0.0) < HEAL_COOLDOWN_S):
                 continue
             self._heal_ts[inst] = now_m
-            log.error(f"terminal {inst} exec channel stalled - "
+            log.error(f"terminal {inst} exec channel stalled/corrupted - "
                       f"auto-restarting it")
             _restart_terminal_async(inst)
 
@@ -458,6 +710,29 @@ class FutureTradeScheduler(threading.Thread):
         pair, side, lot = sch["pair"], sch["side"], sch["lot"]
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
+
+        # Pre-flight: check account trading permission from the EA header
+        try:
+            from spot import read_accounts, pick_terminal, read_header
+            accs = read_accounts()
+            login = accs.get(acc, {}).get('login', '')
+            if login:
+                term = pick_terminal(login)
+                if term:
+                    head = read_header(term['trades_path'])
+                    trade_allowed = head.get('account_trade_allowed', '1')
+                    mql_allowed = head.get('mql_allowed', '1')
+                    if trade_allowed == '0' or mql_allowed == '0':
+                        reason = ("account_trade_allowed=0 (server blocked)"
+                                  if trade_allowed == '0'
+                                  else "mql_allowed=0 (EA trading blocked)")
+                        log.error(f"schedule #{sch['id']} acc{acc} {pair}: "
+                                  f"NOT firing - {reason}")
+                        db.log_fired(sch["id"], acc, pair, side, lot, "open",
+                                     "", False, f"blocked: {reason}", ms=0.0)
+                        return
+        except Exception as exc:
+            log.warning(f"schedule #{sch['id']}: pre-flight permission check failed: {exc}")
 
         commands = [("OPEN", pair, side, f"{lot:.2f}", "0", "0",
                      str(777000 + acc), f"sch#{sch['id']}")
@@ -570,9 +845,18 @@ class FutureTradeScheduler(threading.Thread):
                         val = self._nearest_fire_seconds_uncached()
                         if val is not None and val <= FIRE_SPIN_WINDOW:
                             target = time.time() + max(0.0, val)
+                            # SLEEP until the last ~2 ms, then spin.  A full
+                            # busy-wait for the whole spin window pegged a
+                            # CPU core right before every fire - exactly when
+                            # the broker round-trip needs that CPU.
+                            while not self.stop_flag.is_set():
+                                left = target - time.time()
+                                if left <= 0.002:
+                                    break
+                                time.sleep(min(max(left - 0.002, 0.0), 0.005))
                             while (not self.stop_flag.is_set()
                                    and time.time() < target):
-                                pass
+                                time.sleep(0)
                         sleep = 0.0
                     else:
                         sleep = SCHEDULER_POLL_NEAR
@@ -621,6 +905,9 @@ def main() -> int:
             feed = feed_age(acc)
             print(f"terminal {acc}: {'OK' if ok else 'FAIL'} ({detail})"
                   f"  feed {feed:.1f}s")
+        print()
+        for acc in (1, 2):
+            print_diagnosis(acc)
         return 0
 
     if args.open:

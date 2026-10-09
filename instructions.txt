@@ -1,0 +1,12 @@
+you are to investigate why this software is not incorpoarating the live cent account in terminal 1
+the cent account is live and functioning i even made multiple trades yesterday 
+but for some reason it just wont even read on the monitor let alone show the cent qoutes
+now you are to fix the cent quotes issue and the whole account incorporation issue
+the software should be able to incorporate live accounts with ease whether cent or standard
+the software should also be able to probe all the available quotes the account has access to through the broker
+like different brokers offer different quotes with letters added to the standerd quotes and the software should be able to probe that through thr broker_prober and spot modules
+so you will fix that the cent account has a balance of 0.32 cents i dont know if that can open positions for testing if it can do so so also execution is fine
+use the python312 venv with 400+ packages for development and testing
+yes good luck and i hope you do well
+
+

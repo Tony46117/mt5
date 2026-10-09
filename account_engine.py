@@ -36,7 +36,10 @@ import accounts as known_accounts
 log = setup_logging(__name__)
 
 WAIT_LOGIN_TIMEOUT_S = 90.0
-POLL_S = 0.5
+FAST_POLL_S = 0.15
+SLOW_POLL_S = 0.4
+FAST_POLL_WINDOW_S = 15.0
+STATUS_CACHE_TTL_S = 1.0
 MAX_OPS_KEPT = 40
 
 TRADE_MODE_LABELS = {"0": "demo", "1": "contest", "2": "live"}
@@ -143,13 +146,15 @@ class TerminalWorker(threading.Thread):
     def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S) -> dict:
         """Wait until the EA feed is live and reports `want` as its login."""
         br = _bridge()
-        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        deadline = t0 + timeout
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
             got = str(h.get("login", ""))
             if got and got == want and h.get("currency"):
                 return h
-            time.sleep(POLL_S)
+            elapsed = time.monotonic() - t0
+            time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
         h = br.header_for(self.inst)
         got = str(h.get("login", ""))
         raise EngineError(f"login not verified within {timeout:.0f}s "
@@ -194,8 +199,15 @@ class TerminalWorker(threading.Thread):
             raise EngineError(f"terminal {self.inst} is not logged into any "
                               f"account in MT5 - nothing to adopt")
         if not h.get("currency"):
-            raise EngineError(f"terminal {self.inst} account {login} has not "
-                              f"synchronized yet - try again shortly")
+            for _ in range(6):
+                time.sleep(0.3)
+                h = br.header_for(self.inst)
+                login = str(h.get("login", ""))
+                if login and login not in ("0", "?") and h.get("currency"):
+                    break
+            else:
+                raise EngineError(f"terminal {self.inst} account {login} has not "
+                                  f"synchronized yet - try again shortly")
         server = str(h.get("server", "")) or "MetaQuotes-Demo"
         known = known_accounts.get(login)
         password = (known or {}).get("password", "")
@@ -291,11 +303,22 @@ class AccountEngine:
                       server: str) -> dict:
         if terminal not in (1, 2):
             raise EngineError("terminal must be 1 or 2")
+        login = str(login or "").strip()
+        server = str(server or "").strip()
+        password = str(password or "")
+        # convenient quick-switch: if the operator picked a saved account
+        # without retyping, reuse the remembered password/server.
+        if not password or not server:
+            known = known_accounts.get(login) or {}
+            if not password:
+                password = known.get("password", "")
+            if not server:
+                server = known.get("server", "")
         validate_credentials(login, password, server)
         return self._enqueue(Op(self._next_id(), "login", terminal,
-                                {"login": str(login).strip(),
-                                 "password": str(password),
-                                 "server": str(server).strip()})).public()
+                                {"login": login,
+                                 "password": password,
+                                 "server": server})).public()
 
     def request_adopt(self, terminal: int) -> dict:
         if terminal not in (1, 2):
@@ -315,7 +338,11 @@ class AccountEngine:
     # ---- status ----
 
     def status(self) -> dict:
-        # degrade gracefully: no Wine/bridge must not break the status feed
+        now = time.monotonic()
+        with self._lock:
+            cached = getattr(self, "_status_cache", None)
+            if cached and now - cached[0] < STATUS_CACHE_TTL_S:
+                return cached[1]
         try:
             br = _bridge()
             header_for = br.header_for
@@ -327,6 +354,17 @@ class AccountEngine:
         except Exception:
             feed_age_fn = lambda inst: None
         accs = session.load()
+        try:
+            age1 = feed_age_fn(1)
+        except Exception:
+            age1 = None
+        age2 = age1
+        try:
+            if age1 is None:
+                age2 = feed_age_fn(2)
+        except Exception:
+            age2 = None
+        ages = {1: age1, 2: age2}
         slots = []
         for inst in (1, 2):
             stored = accs.get(inst, {})
@@ -339,10 +377,7 @@ class AccountEngine:
             if got == "0":
                 got = ""
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "") if h else ""
-            try:
-                age = feed_age_fn(inst)
-            except Exception:
-                age = None
+            age = ages.get(inst)
             with self._lock:
                 active = self._active.get(inst)
                 running = (active.public() if active
@@ -364,7 +399,10 @@ class AccountEngine:
             })
         with self._lock:
             ops = [o.public() for o in self._ops[:15]]
-        return {"ok": True, "ts": _now_iso(), "slots": slots, "ops": ops}
+        out = {"ok": True, "ts": _now_iso(), "slots": slots, "ops": ops}
+        with self._lock:
+            self._status_cache = (now, out)
+        return out
 
     # ---- book helpers ----
 
@@ -412,7 +450,7 @@ def get_engine() -> AccountEngine:
 def _await_op(op: dict) -> dict:
     eng = get_engine()
     while op["state"] in ("queued", "running"):
-        time.sleep(0.4)
+        time.sleep(0.25)
         for o in eng.status()["ops"]:
             if o["id"] == op["id"]:
                 op = o

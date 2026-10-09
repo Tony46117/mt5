@@ -50,8 +50,15 @@ MS_CANDLE_SECONDS = int(os.getenv("MT5_MS_CANDLE", "15"))
 MS_MAX_BARS = int(os.getenv("MT5_MS_BARS", "200"))
 DEFAULT_SYMBOL = os.getenv("MT5_DEFAULT_SYMBOL", "EURUSD")
 MS_WINDOW = int(os.getenv("MT5_MS_WINDOW", "5"))
+SYMBOL_SUFFIX_1 = os.getenv("MT5_SYMBOL_SUFFIX_1", "").strip()
+SYMBOL_SUFFIX_2 = os.getenv("MT5_SYMBOL_SUFFIX_2", "").strip()
 
-CLASSIC_PAIRS = (
+def _apply_suffix(pairs: tuple[str, ...], suffix: str) -> tuple[str, ...]:
+    if not suffix:
+        return pairs
+    return tuple(f"{p}{suffix}" for p in pairs)
+
+CLASSIC_PAIRS_RAW = (
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
     "USDCHF", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY",
     "AUDJPY", "CHFJPY", "EURCHF", "EURAUD", "GBPCHF",
@@ -60,8 +67,56 @@ CLASSIC_PAIRS = (
     "NZDCHF", "CADCHF", "XAUUSD", "XAGUSD",
 )
 
+CLASSIC_PAIRS = _apply_suffix(CLASSIC_PAIRS_RAW, SYMBOL_SUFFIX_1) if SYMBOL_SUFFIX_1 else CLASSIC_PAIRS_RAW
+
 EXEC_TIMEOUT_SECONDS = float(os.getenv("MT5_EXEC_TIMEOUT", "3.0"))
 EXEC_PING_TIMEOUT_SECONDS = 1.0
+
+def map_symbol(symbol: str, inst: int) -> str:
+    """Map a base symbol to the broker-specific symbol for a terminal."""
+    suffix = SYMBOL_SUFFIX_1 if inst == 1 else SYMBOL_SUFFIX_2
+    if not suffix:
+        return symbol
+    return f"{symbol}{suffix}"
+
+def unmap_symbol(symbol: str, inst: int) -> str:
+    """Map a broker-specific symbol back to base symbol."""
+    suffix = SYMBOL_SUFFIX_1 if inst == 1 else SYMBOL_SUFFIX_2
+    if not suffix or not symbol.endswith(suffix):
+        return symbol
+    return symbol[:-len(suffix)]
+
+def classic_pairs_for(inst: int) -> tuple[str, ...]:
+    """Get classic pairs with correct suffix for a terminal."""
+    suffix = SYMBOL_SUFFIX_1 if inst == 1 else SYMBOL_SUFFIX_2
+    if not suffix:
+        return CLASSIC_PAIRS_RAW
+    return _apply_suffix(CLASSIC_PAIRS_RAW, suffix)
+
+# Some trade servers are missing from a fresh MT5 install's server list, so
+# logging in by NAME silently never connects (MT5 just keeps the last
+# account).  For those the boot config must carry an ACCESS POINT
+# (host:port) instead - MT5 resolves it to the real server name and reports
+# that name back through the EA header.
+# Source: https://www.hfm.com/ke/en/platforms/mt5-how-to-connect
+SERVER_ACCESS_POINTS: dict[str, str] = {
+    "HFMarketsKE-Live2": os.getenv("MT5_AP_HFM_LIVE2",
+                                   "mt5-europe2.dcglobalfarm.com:1952"),
+    "HFMarketsKE-Live10": os.getenv("MT5_AP_HFM_LIVE10",
+                                    "mt5-global10.dcglobalfarm.com:21001"),
+    "HFMarketsKE-Live11": os.getenv("MT5_AP_HFM_LIVE11",
+                                    "mt5-global11.dcglobalfarm.com:21101"),
+    "HFMarketsKE-Live15": os.getenv("MT5_AP_HFM_LIVE15",
+                                    "mt5-ga-8.dcglobalfarm.com:21501"),
+}
+
+def access_point_for(server: str) -> str:
+    """Access point (host:port) to boot a server NAME with, or ''.
+
+    Only servers that a stock MT5 cannot resolve by name need an entry
+    here; anything else keeps using its plain server name.
+    """
+    return SERVER_ACCESS_POINTS.get(str(server or "").strip(), "")
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -98,6 +153,9 @@ class Config:
     default_symbol: str = DEFAULT_SYMBOL
 
     classic_pairs: tuple = CLASSIC_PAIRS
+    classic_pairs_raw: tuple = CLASSIC_PAIRS_RAW
+    symbol_suffix_1: str = SYMBOL_SUFFIX_1
+    symbol_suffix_2: str = SYMBOL_SUFFIX_2
 
     exec_timeout_seconds: float = EXEC_TIMEOUT_SECONDS
 

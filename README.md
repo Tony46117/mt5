@@ -41,7 +41,7 @@ One command starts everything; Ctrl+C stops everything.
 | `spot.py`       | Terminal lifecycle (launch, stop, restart, minimal one-chart boot), start-config generation and credential scrubbing, feed readers. |
 | `bridge.py`     | Supervisor screen. Concurrent boot of both terminals, feed/watchdog auto-heal, hot account switching, antidetect scrubbing. |
 | `executor.py`   | The only way Python trades. `SendCommand` file protocol, batched concurrent orders, `FutureTradeScheduler` with CAS claims, fire-latency control, 500 ms retries. |
-| `app.py`        | Flask web panel (port 8000): manual trading buttons, schedule management, health endpoint. Also runs the scheduler and a deploy warm-up trade per terminal so the first scheduled order never hits the broker's cold-symbol path. |
+| `app.py`        | Flask web panel (port 8000): manual trading buttons, pending-order ticket, schedule management, health endpoint. Also runs the scheduler. The app never places a trade on its own - orders only ever come from an explicit click or a schedule. |
 | `close.py`      | Database-free concurrent close of all positions (one atomic `CLOSEALL` per terminal). |
 | `monitor.py`    | Dual-account live dashboard: open positions only, strict identity checks, no event log. |
 | `session.py`    | Obfuscated credential store (`session.json`), stat-validated on every read so account changes propagate live across all processes. |
@@ -204,9 +204,6 @@ python monitor.py                                  # live dual-account book
 | `MT5_TRADING_DAYS` | `0,1,2,3,4` | Weekdays (0=Mon) schedules may fire on |
 | `MT5_NO_LAUNCH_JITTER` | unset | Set to `1` to disable anti-detect launch jitter |
 | `MT5_RUN_KEEP_TERMINALS` | unset | Set to `1` so `run.sh` Ctrl+C keeps terminals running |
-| `MT5_WARMUP` | `1` | Set to `0` to skip the real open+close trade fired on each terminal at startup |
-| `MT5_WARMUP_SYMBOL` | `XAUUSD247` | Symbol used for that warm-up trade |
-| `MT5_WARMUP_LOT` | `0.01` | Lot used for that warm-up trade |
 | `MT5_CORS_ORIGIN` | unset | Exact origin allowed to call the API cross-origin (see Security) |
 | `MT5_WEB_HOST` / `MT5_WEB_PORT` | `127.0.0.1` / `8000` | Web panel bind address |
 | `DATABASE_URL` | unset | PostgreSQL DSN; SQLite (`trades.db`) is used when unset |
@@ -221,17 +218,17 @@ and `/api/schedule` call moves real money, so:
 - cross-origin requests are refused. Set `MT5_CORS_ORIGIN` to one exact
   origin only if an external dashboard genuinely needs it - never `*`.
 
-Starting `app.py` also places and closes one real warm-up trade per
-terminal (see `MT5_WARMUP`).
+Starting `app.py` never places a trade by itself: every order originates
+from an explicit panel click or a schedule.
 
 ## Troubleshooting
 
 - **Terminal ping fails but the feed is live** - the EA is detached from
   the exec channel; the supervisor auto-heals after its cooldown, or
   force it with `python monitor.py --restart 1`.
-- **First order after a boot is slow** - the app performs a warm-up
-  trade per terminal at startup; if a terminal was restarted manually,
-  the first order may hit the broker's cold-symbol sync once.
+- **First order after a boot is slow** - the first order on a symbol can
+  hit the broker's cold-symbol sync once; there is no startup warm-up
+  trade (orders are only ever fired by a click or a schedule).
 - **Web port busy** - another `app.py` instance is running; `bash run.sh stop`
   clears it.
 - **Double-boot race** - resolved automatically: `run.sh` clears any

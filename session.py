@@ -6,6 +6,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -32,8 +33,36 @@ _OVERRIDE = None
 
 _INVALID_LOGINS = frozenset({"0", "?", "LOGIN"})
 
+# MT5 logs in by SERVER NAME (e.g. HFMarketsKE-Live2), never by an access
+# point (host:port).  An earlier broker-prober wrote the fastest access
+# point into the login server, which silently broke every later login.
+_ACCESS_POINT_RE = re.compile(r"^[\w.-]+:\d+$")
+
 def _valid_login(login: str) -> bool:
     return bool(login) and login not in _INVALID_LOGINS and login.isdigit()
+
+def _looks_like_access_point(server: str) -> bool:
+    server = str(server or "").strip()
+    return bool(_ACCESS_POINT_RE.match(server)) or "/" in server
+
+def _sanitize_server(login: str, server: str) -> str:
+    """Never carry a host:port access point as an MT5 login server."""
+    server = str(server or "").strip()
+    if not server or not _looks_like_access_point(server):
+        return server
+    fixed = ""
+    try:
+        import accounts as _accounts
+        fixed = str((_accounts.get(login) or {}).get("server", "")).strip()
+    except Exception:
+        fixed = ""
+    if fixed and not _looks_like_access_point(fixed):
+        log.warning(f"session: server {server!r} for {login} is an access "
+                    f"point - using the known server name {fixed!r} instead")
+        return fixed
+    log.warning(f"session: dropping access-point server {server!r} for "
+                f"{login} - MT5 needs the server NAME")
+    return ""
 
 def _machine_key() -> bytes:
     import platform
@@ -101,7 +130,15 @@ def _file_accounts() -> dict[int, dict[str, str]]:
         text = SESSION_FILE.read_text()
     except OSError:
         return {}
-    return _decode(text)
+    accounts = _decode(text)
+    # repair any access-point server an older prober left behind, so the
+    # terminal is never launched with an unusable server value
+    for inst, acc in accounts.items():
+        server = acc.get("server", "")
+        fixed = _sanitize_server(acc.get("login", ""), server)
+        if fixed != server:
+            acc["server"] = fixed
+    return accounts
 
 def load() -> dict[int, dict[str, str]]:
     if _OVERRIDE is not None:
@@ -159,7 +196,8 @@ def set_accounts(accounts: dict[int, dict[str, str]], persist: bool = True) -> N
             continue
         clean[inst] = {"login": lg,
                        "password": str(a.get("password", "")),
-                       "server": str(a.get("server", "MetaQuotes-Demo"))}
+                       "server": (_sanitize_server(lg, a.get("server", ""))
+                                  or "MetaQuotes-Demo")}
     with _LOCK:
         _MEM = clean
         _CACHE_STAT = None

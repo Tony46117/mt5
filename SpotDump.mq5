@@ -10,6 +10,7 @@
 #define EXEC_NEXT    "exec_next.txt"
 #define SPOT_DUMP_MS 50
 #define ASYNC_MAX    64
+#define MAX_SYM_DUMP 300
 
 int        g_interval_ms = 1;
 
@@ -235,6 +236,16 @@ int OnInit()
           " account_trade_mode=", AccountInfoInteger(ACCOUNT_TRADE_MODE),
           " terminal_trade_allowed=", TerminalInfoInteger(TERMINAL_TRADE_ALLOWED),
           " mql_trade_allowed=", MQLInfoInteger(MQL_TRADE_ALLOWED));
+    Print("SpotDump: balance=", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2),
+          " equity=", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+          " currency=", AccountInfoString(ACCOUNT_CURRENCY),
+          " leverage=", AccountInfoInteger(ACCOUNT_LEVERAGE),
+          " margin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2),
+          " margin_free=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
+          " profit=", DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2),
+          " company=", AccountInfoString(ACCOUNT_COMPANY),
+          " name=", AccountInfoString(ACCOUNT_NAME),
+          " margin_mode=", AccountInfoInteger(ACCOUNT_MARGIN_MODE));
     EventSetMillisecondTimer(IntervalMs);
     DumpSpots();
     DumpTrades();
@@ -282,21 +293,60 @@ void OnTimer()
       s_since_dump++;
   }
 
+bool IsClassicPair(string name)
+  {
+   static string bases[] = {
+      "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD",
+      "EURGBP","EURJPY","GBPJPY","AUDJPY","CHFJPY","EURCHF","EURAUD",
+      "GBPCHF","CADJPY","AUDNZD","GBPAUD","EURNZD","AUDCAD","NZDJPY",
+      "GBPNZD","EURCAD","GBPCAD","AUDCHF","NZDCHF","CADCHF",
+      "XAUUSD","XAGUSD"};
+   int n = ArraySize(bases);
+   for(int i = 0; i < n; i++)
+      if(StringFind(name, bases[i]) == 0)
+         return(true);
+   return(false);
+  }
+
+void SymAdd(string s)
+  {
+   if(StringLen(s) == 0 || g_nsymbols >= MAX_SYM_DUMP)
+      return;
+   for(int i = 0; i < g_nsymbols; i++)
+      if(g_sym_names[i] == s)
+         return;
+   if(SymbolInfoDouble(s, SYMBOL_BID) <= 0.0)
+      return;
+   if(!SymbolSelect(s, true))
+      return;
+   g_sym_names[g_nsymbols] = s;
+   g_nsymbols++;
+  }
+
 void RefreshSymbols()
   {
+   ArrayResize(g_sym_names, MAX_SYM_DUMP);
    g_nsymbols = 0;
-   ArrayResize(g_sym_names, 0);
-   int total = SymbolsTotal(false);
-   ArrayResize(g_sym_names, MathMin(total, 40));
-   for(int i = 0; i < total && g_nsymbols < 40; i++)
+
+   // 1) every symbol the operator already watches (Market Watch) first
+   int mw = SymbolsTotal(true);
+   for(int i = 0; i < mw && g_nsymbols < MAX_SYM_DUMP; i++)
+      SymAdd(SymbolName(i, true));
+
+   // 2) then EVERY broker variant of the classic pairs, whatever letters the
+   //    broker appends (EURUSDc, EURUSD.raw, XAUUSD247, EURUSD#, ...).  This
+   //    is what a cent/ECN/standard feed needs: the panel and the broker
+   //    prober see each account's own quotes instead of only Market Watch.
+   int all = SymbolsTotal(false);
+   for(int i = 0; i < all && g_nsymbols < MAX_SYM_DUMP; i++)
      {
       string s = SymbolName(i, false);
-      if(SymbolInfoDouble(s, SYMBOL_BID) > 0.0)
-        {
-         g_sym_names[g_nsymbols] = s;
-         g_nsymbols++;
-        }
+      string up = s;
+      StringToUpper(up);
+      if(IsClassicPair(up))
+         SymAdd(s);
      }
+
    ArrayResize(g_sym_names, g_nsymbols);
    g_last_rescan_min = (long)(TimeCurrent() / 60);
   }
@@ -438,18 +488,36 @@ void AppendOut(string id, string status, string detail)
       old = CharArrayToString(buf, 0, (int)size, CP_UTF8);
       if(StringLen(old) > 4000)
         {
-         int cut = StringFind(old, "\n", StringLen(old) - 4000);
-         if(cut >= 0)
-            old = StringSubstr(old, cut + 1);
+         // Do NOT trim.  Trimming shifts every byte, so the Python reader's
+         // byte offset no longer points at fresh data and every result after
+         // the trim is missed.  Dropping the history makes the file much
+         // smaller - a shrink the reader detects and re-reads from scratch.
+         old = "";
         }
      }
    string line = id + "\t" + status + "\t" + detail + "\n";
    string all  = old + line;
    uchar out[];
    int nb = StringToCharArray(all, out, 0, WHOLE_ARRAY, CP_UTF8);
-   FileSeek(h, 0, SEEK_SET);
-   FileWriteArray(h, out, 0, nb);
+   // StringToCharArray appends a terminating zero.  Writing it put a NUL
+   // byte after every line, which shifted each later line one byte left
+   // relative to the reader's byte offset - so results were appended but
+   // never seen.  Write the text only.
+   if(nb > 0)
+      nb -= 1;
+   // MQL5 cannot truncate a file, so an in-place rewrite left stale bytes
+   // behind whenever the content got shorter - that eventually corrupted
+   // this file and stalled every command on it.  Recreate the file instead:
+   // its size always matches its content, and a shrink is exactly the signal
+   // the reader uses to reset its byte offset.
    FileClose(h);
+   FileDelete(EXEC_OUT);
+   int hw = FileOpen(EXEC_OUT, FILE_BIN | FILE_WRITE |
+                     FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(hw == INVALID_HANDLE)
+      return;
+   FileWriteArray(hw, out, 0, nb);
+   FileClose(hw);
   }
 
 void ProcessExecIn()
@@ -605,6 +673,87 @@ void ExecuteLine(string line)
          return;
         }
       AsyncTrack(ares.request_id, id, true, sym, req.volume, digits, (long)f, req);
+      return;
+     }
+
+   // PENDING\tsym\tBUYLIMIT|BUYSTOP|SELLLIMIT|SELLSTOP\tvol\tprice\t[sl]\t[tp]\t[magic]\t[comment]
+   // Placed synchronously (no async tracking) so the ticket comes straight
+   // back to the caller - a pending ticket is the whole point of the reply.
+   if(cmd == "PENDING" && k >= 6)
+     {
+      string sym = p[2];
+      if(!SymbolSelect(sym, true))
+        {
+         AppendOut(id, "ERR", "unknown symbol " + sym);
+         return;
+        }
+      string tstr = p[3];
+      StringToUpper(tstr);
+      long ptype = -1;
+      if(tstr == "BUYLIMIT")        ptype = ORDER_TYPE_BUY_LIMIT;
+      else if(tstr == "BUYSTOP")    ptype = ORDER_TYPE_BUY_STOP;
+      else if(tstr == "SELLLIMIT")  ptype = ORDER_TYPE_SELL_LIMIT;
+      else if(tstr == "SELLSTOP")   ptype = ORDER_TYPE_SELL_STOP;
+      if(ptype < 0)
+        {
+         AppendOut(id, "ERR", "bad pending type " + tstr);
+         return;
+        }
+      double vol   = StringToDouble(p[4]);
+      double price = StringToDouble(p[5]);
+      double sl    = (k > 6) ? StringToDouble(p[6]) : 0.0;
+      double tp    = (k > 7) ? StringToDouble(p[7]) : 0.0;
+      long   mg    = (k > 8) ? StringToInteger(p[8]) : MAGIC_PY;
+      string cm    = (k > 9) ? p[9] : "pend";
+      int digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
+      double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
+      price        = NormalizeDouble(price, digits);
+      if(vol <= 0.0 || price <= 0.0 || ask <= 0.0 || bid <= 0.0)
+        {
+         AppendOut(id, "ERR", "bad volume or no quote");
+         return;
+        }
+      double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+      double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+      double gap    = MathMax(stops, freeze);
+      string why = "";
+      if(ptype == ORDER_TYPE_BUY_LIMIT  && price > ask - gap) why = "buy limit must sit BELOW the ask";
+      if(ptype == ORDER_TYPE_BUY_STOP   && price < ask + gap) why = "buy stop must sit ABOVE the ask";
+      if(ptype == ORDER_TYPE_SELL_LIMIT && price < bid + gap) why = "sell limit must sit ABOVE the bid";
+      if(ptype == ORDER_TYPE_SELL_STOP  && price > bid - gap) why = "sell stop must sit BELOW the bid";
+      if(why != "")
+        {
+         AppendOut(id, "ERR", why + " (bid " + DoubleToString(bid, digits) +
+                   " ask " + DoubleToString(ask, digits) + ")");
+         return;
+        }
+      MqlTradeRequest req;
+      MqlTradeResult  res;
+      ZeroMemory(req);
+      ZeroMemory(res);
+      req.action       = TRADE_ACTION_PENDING;
+      req.symbol       = sym;
+      req.volume       = NormalizeVolume(sym, vol);
+      req.type         = (ENUM_ORDER_TYPE)ptype;
+      req.price        = price;
+      req.sl           = (sl > 0.0) ? NormalizeDouble(sl, digits) : 0.0;
+      req.tp           = (tp > 0.0) ? NormalizeDouble(tp, digits) : 0.0;
+      req.magic        = (ulong)mg;
+      req.comment      = cm;
+      req.type_time    = ORDER_TIME_GTC;
+      req.type_filling = ORDER_FILLING_RETURN;
+      if(!OrderSend(req, res) ||
+         (res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED))
+        {
+         AppendOut(id, "ERR", "retcode " + IntegerToString((long)res.retcode) +
+                   " " + res.comment);
+         return;
+        }
+      AppendOut(id, "OK", DoubleToString(req.price, digits) + "|" +
+                IntegerToString((long)res.order) + "|" +
+                DoubleToString(req.volume, 2));
       return;
      }
 

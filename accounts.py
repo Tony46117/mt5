@@ -22,16 +22,33 @@ _INVALID_LOGINS = frozenset({"0", "?", "LOGIN"})
 def _valid_login(login: str) -> bool:
     return bool(login) and login not in _INVALID_LOGINS and login.isdigit()
 
+_BOOK_CACHE: tuple[float, tuple[int, int] | None, dict] | None = None
+_BOOK_TTL_S = 5.0
+
 def _load() -> dict:
+    import time
+    global _BOOK_CACHE
+    now = time.monotonic()
+    try:
+        st = BOOK_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if _BOOK_CACHE and now - _BOOK_CACHE[0] < _BOOK_TTL_S and _BOOK_CACHE[1] == key:
+        return _BOOK_CACHE[2]
     try:
         doc = json.loads(BOOK_FILE.read_text())
         if isinstance(doc, dict) and isinstance(doc.get("accounts"), list):
+            _BOOK_CACHE = (now, key, doc)
             return doc
     except (OSError, ValueError):
         pass
-    return {}
+    doc = {}
+    _BOOK_CACHE = (now, key, doc)
+    return doc
 
 def _save(doc: dict) -> None:
+    global _BOOK_CACHE
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(BOOK_FILE.parent),
                                         prefix=".known.", suffix=".tmp")
     try:
@@ -39,6 +56,7 @@ def _save(doc: dict) -> None:
             json.dump(doc, fh, separators=(",", ":"))
         os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, BOOK_FILE)
+        _BOOK_CACHE = None
     finally:
         if os.path.exists(tmp_name):
             try:
