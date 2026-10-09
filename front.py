@@ -1368,10 +1368,10 @@ function engSavedRender(){
    '<span class="sub" style="color:'+(a.has_password?'#22c55e':'#eab308')+'">'+
     (a.has_password?'● pw saved':'○ no pw')+'</span>'+
    '<span class="spacer" style="flex:1"></span>'+
-   '<button class="btn mini blue" onclick="engSavedLogin(\''+esc(a.login)+'\',1)">T1 LOGIN</button>'+
-   '<button class="btn mini blue" onclick="engSavedLogin(\''+esc(a.login)+'\',2)">T2 LOGIN</button>'+
-   '<button class="btn mini" onclick="engSavedEdit(\''+esc(a.login)+'\')">EDIT</button>'+
-   '<button class="btn mini danger" onclick="engSavedDel(\''+esc(a.login)+'\')">DEL</button>'+
+   '<button class="btn mini blue" onclick="engSavedLogin(\\''+esc(a.login)+'\\',1)">T1 LOGIN</button>'+
+   '<button class="btn mini blue" onclick="engSavedLogin(\\''+esc(a.login)+'\\',2)">T2 LOGIN</button>'+
+   '<button class="btn mini" onclick="engSavedEdit(\\''+esc(a.login)+'\\')">EDIT</button>'+
+   '<button class="btn mini danger" onclick="engSavedDel(\\''+esc(a.login)+'\\')">DEL</button>'+
   '</div>').join('')}
 async function engPollSaved(){
  try{const j=await api('/api/engine/accounts');
