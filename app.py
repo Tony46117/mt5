@@ -15,7 +15,7 @@ from typing import Callable
 
 from flask import Flask, jsonify, request
 
-from config import CONFIG, setup_logging, validate_config
+from config import CONFIG, map_symbol, setup_logging, validate_config
 
 import front
 import database as db
@@ -374,24 +374,74 @@ def api_trade():
         return _fail("bad lot")
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
+    try:
+        _raw_n = d.get("n", d.get("count",
+                       d.get("n_positions", d.get("orders", 1))))
+        if _raw_n is None or (isinstance(_raw_n, str) and not _raw_n.strip()):
+            n = 1
+        else:
+            n = int(_raw_n)
+    except (TypeError, ValueError):
+        return _fail("bad order count")
+    if not 1 <= n <= 50:
+        return _fail("orders must be 1..50")
     spots = read_spots()
     if symbol not in spots or not spots[symbol][0]:
         return _fail("no live quote for " + symbol)
+    sender = sender_for(account)
+    if n == 1:
+        t0 = time.perf_counter()
+        ok, detail = sender.open_trade(symbol, side, lot, timeout=8.0)
+        order_ms = (time.perf_counter() - t0) * 1000.0
+        ticket = detail.split("|")[1] if "|" in detail else ""
+        price = detail.split("|")[0] if "|" in detail else ""
+        threading.Thread(target=db.log_fired,
+                         args=(0, account, symbol, side, lot, "manual", ticket,
+                               ok, detail), kwargs={"ms": order_ms},
+                         daemon=True, name="manual-trade-log").start()
+        if not ok:
+            if "10027" in detail:
+                detail = ("terminal has ALGO TRADING OFF (retcode 10027) - "
+                          "restart it via bridge.py (launches with algo trading ON)")
+            return _fail(detail)
+        return _ok({"detail": detail, "price": price, "ticket": ticket,
+                    "n": 1, "ms": round(order_ms, 1)})
+    mapped = map_symbol(symbol.upper(), account)
+    commands = [("OPEN", mapped, side, f"{lot:.2f}", "0", "0",
+                 str(777001), "py") for _ in range(n)]
     t0 = time.perf_counter()
-    ok, detail = sender_for(account).open_trade(symbol, side, lot, timeout=8.0)
+    try:
+        results = list(sender.send_batch(*commands, timeout=20.0))
+    except Exception as exc:
+        return _fail(str(exc))
     order_ms = (time.perf_counter() - t0) * 1000.0
-    ticket = detail.split("|")[1] if "|" in detail else ""
-    price = detail.split("|")[0] if "|" in detail else ""
-    threading.Thread(target=db.log_fired,
-                     args=(0, account, symbol, side, lot, "manual", ticket,
-                           ok, detail), kwargs={"ms": order_ms},
-                     daemon=True, name="manual-trade-log").start()
-    if not ok:
+    tickets: list[str] = []
+    ok_cnt = 0
+    first_price = ""
+    first_detail = ""
+    for ok, detail in results:
+        ticket = detail.split("|")[1] if ok and "|" in detail else ""
+        price = detail.split("|")[0] if "|" in detail else ""
+        if not first_detail:
+            first_detail, first_price = detail, price
+        if ok:
+            ok_cnt += 1
+            if ticket:
+                tickets.append(ticket)
+        threading.Thread(target=db.log_fired,
+                         args=(0, account, symbol, side, lot, "manual", ticket,
+                               ok, detail), kwargs={"ms": order_ms},
+                         daemon=True, name="manual-trade-log").start()
+    if ok_cnt == 0:
+        detail = first_detail or "all orders rejected"
         if "10027" in detail:
             detail = ("terminal has ALGO TRADING OFF (retcode 10027) - "
                       "restart it via bridge.py (launches with algo trading ON)")
         return _fail(detail)
-    return _ok({"detail": detail, "price": price, "ticket": ticket,
+    return _ok({"detail": f"{ok_cnt}/{n} filled"
+                           f"{' - ' + first_detail if first_detail else ''}",
+                "price": first_price, "ticket": tickets[0] if tickets else "",
+                "tickets": tickets, "ok": ok_cnt, "n": n,
                 "ms": round(order_ms, 1)})
 
 @app.post("/api/order")
@@ -420,6 +470,17 @@ def api_order():
         return _fail("bad lot")
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
+    try:
+        _raw_n = d.get("n", d.get("count",
+                       d.get("n_positions", d.get("orders", 1))))
+        if _raw_n is None or (isinstance(_raw_n, str) and not _raw_n.strip()):
+            n = 1
+        else:
+            n = int(_raw_n)
+    except (TypeError, ValueError):
+        return _fail("bad order count")
+    if not 1 <= n <= 50:
+        return _fail("orders must be 1..50")
     spots = read_spots()
     if symbol not in spots or not spots[symbol][0]:
         return _fail("no live quote for " + symbol)
@@ -444,22 +505,58 @@ def api_order():
     if price <= 0:
         return _fail("level required (whole number + decimal)")
     price = round(price, digits)
+    sender = sender_for(account)
+    if n == 1:
+        t0 = time.perf_counter()
+        try:
+            ok, detail = sender.open_pending(symbol, ptype, lot,
+                                             price, timeout=8.0)
+        except Exception as exc:
+            return _fail(str(exc))
+        order_ms = (time.perf_counter() - t0) * 1000.0
+        ticket = detail.split("|")[1] if "|" in detail else ""
+        fill_price = detail.split("|")[0] if "|" in detail else ""
+        threading.Thread(target=db.log_fired,
+                         args=(0, account, symbol, ptype, lot, "pending", ticket,
+                               ok, detail), kwargs={"ms": order_ms},
+                         daemon=True, name="pending-order-log").start()
+        if not ok:
+            return _fail(detail)
+        return _ok({"detail": detail, "price": fill_price, "ticket": ticket,
+                    "type": ptype, "n": 1, "ms": round(order_ms, 1)})
+    mapped = map_symbol(symbol.upper(), account)
+    p = ptype.upper().replace(" ", "").replace("_", "")
+    commands = [("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
+                 "0", "0", str(777002), "pend") for _ in range(n)]
     t0 = time.perf_counter()
     try:
-        ok, detail = sender_for(account).open_pending(symbol, ptype, lot,
-                                                      price, timeout=8.0)
+        results = list(sender.send_batch(*commands, timeout=20.0))
     except Exception as exc:
         return _fail(str(exc))
     order_ms = (time.perf_counter() - t0) * 1000.0
-    ticket = detail.split("|")[1] if "|" in detail else ""
-    fill_price = detail.split("|")[0] if "|" in detail else ""
-    threading.Thread(target=db.log_fired,
-                     args=(0, account, symbol, ptype, lot, "pending", ticket,
-                           ok, detail), kwargs={"ms": order_ms},
-                     daemon=True, name="pending-order-log").start()
-    if not ok:
-        return _fail(detail)
-    return _ok({"detail": detail, "price": fill_price, "ticket": ticket,
+    tickets: list[str] = []
+    ok_cnt = 0
+    first_detail = ""
+    first_price = ""
+    for ok, detail in results:
+        ticket = detail.split("|")[1] if ok and "|" in detail else ""
+        fill_price = detail.split("|")[0] if "|" in detail else ""
+        if not first_detail:
+            first_detail, first_price = detail, fill_price
+        if ok:
+            ok_cnt += 1
+            if ticket:
+                tickets.append(ticket)
+        threading.Thread(target=db.log_fired,
+                         args=(0, account, symbol, ptype, lot, "pending", ticket,
+                               ok, detail), kwargs={"ms": order_ms},
+                         daemon=True, name="pending-order-log").start()
+    if ok_cnt == 0:
+        return _fail(first_detail or "all orders rejected")
+    return _ok({"detail": f"{ok_cnt}/{n} placed"
+                          f"{' - ' + first_detail if first_detail else ''}",
+                "price": first_price, "ticket": tickets[0] if tickets else "",
+                "tickets": tickets, "ok": ok_cnt, "n": n,
                 "type": ptype, "ms": round(order_ms, 1)})
 
 @app.post("/api/close")

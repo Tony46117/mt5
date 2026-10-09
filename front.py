@@ -910,8 +910,13 @@ function buildPanel(n){
     '<div class="lotrow"><button type="button" onclick="stepLot('+n+',-0.01)">-</button>'+
     '<input id="lot'+n+'" type="number" step="0.01" min="0.01" value="0.01">'+
     '<button type="button" onclick="stepLot('+n+',0.01)">+</button></div></div>'+
+   '<div class="fgroup"><label>Orders</label>'+
+    '<div class="lotrow"><button type="button" onclick="stepOrd('+n+',-1)">-</button>'+
+    '<input id="ordn'+n+'" type="number" step="1" min="1" max="50" value="1">'+
+    '<button type="button" onclick="stepOrd('+n+',1)">+</button></div></div>'+
   '</div>'+
   '<div class="chiprow" id="lchips'+n+'"></div>'+
+  '<div class="chiprow" id="ochips'+n+'"></div>'+
   '<div class="tradebtns" style="margin-top:12px">'+
    '<button class="tbtn tsell" onclick="doTrade('+n+',\\'SELL\\')">SELL</button>'+
    '<button class="tbtn tbuy" onclick="doTrade('+n+',\\'BUY\\')">BUY</button>'+
@@ -942,22 +947,33 @@ function setLot(n,v){$id('lot'+n).value=v.toFixed(2);markChip(n)}
 function markChip(n){const v=(parseFloat($id('lot'+n).value)||0).toFixed(2);
  for(const c of document.querySelectorAll('#lchips'+n+' .lchip'))
   c.className='lchip'+(c.textContent==v?' on':'')}
+function stepOrd(n,d){const el=$id('ordn'+n);if(!el)return;
+ let v=Math.max(1,Math.min(50,(parseInt(el.value,10)||1)+d));el.value=v;markOrdChip(n)}
+function setOrd(n,v){$id('ordn'+n).value=Math.max(1,Math.min(50,v|0||1));markOrdChip(n)}
+function markOrdChip(n){const v=String(parseInt(($id('ordn'+n)||{}).value,10)||1);
+ for(const c of document.querySelectorAll('#ochips'+n+' .lchip'))
+  c.className='lchip'+(c.textContent==v?' on':'')}
+function ordCount(n){const el=$id('ordn'+n);if(!el)return 1;
+ const v=parseInt(el.value,10);return (v>=1&&v<=50)?v:1}
 async function doTrade(n,side){
  if(INFLIGHT['t'+n])return;                    // one click = one order
  const symEl=$id('sym'+n),lotEl=$id('lot'+n),fb=$id('fb'+n);
  if(!symEl||!lotEl||!fb)return;                // panel not built yet
  const sym=(symEl.value||'').trim();   // case-sensitive MT5 symbol name
  const lot=parseFloat(lotEl.value);
+ const cnt=ordCount(n);
  if(!sym){fb.className='feedback err';fb.textContent='no symbol - waiting for the feed';return}
  if(!(lot>0)){fb.className='feedback err';fb.textContent='lot must be greater than 0';return}
  INFLIGHT['t'+n]=true;setBusy(n,true);
- fb.className='feedback';fb.textContent=side+' '+sym+' '+lot+' ... sending';
+ fb.className='feedback';fb.textContent=side+' '+sym+' '+lot+(cnt>1?' x'+cnt:'')+' ... sending';
  const t0=performance.now();
- try{const j=await post('/api/trade',{account:+n,symbol:sym,side:side,lot:lot});
+ try{const j=await post('/api/trade',{account:+n,symbol:sym,side:side,lot:lot,n:cnt});
   const ms=Math.round(performance.now()-t0);
+  const got=(j.n||j.ok||1), tk=j.tickets||(j.ticket?[j.ticket]:[]);
   fb.className='feedback ok';
-  fb.textContent='FILLED '+j.detail+' @ '+j.price+' ('+ms+' ms)';
-  toast(side+' '+sym+' '+lot+' filled @ '+j.price+' in '+ms+' ms',true);
+  fb.textContent='FILLED '+(got>1?got+'/'+cnt+' ':'')+j.detail+' @ '+j.price+' ('+ms+' ms)';
+  toast(side+' '+sym+' '+lot+(cnt>1?' x'+cnt:'')+' filled @ '+j.price+
+   (tk.length>1?' ('+tk.length+' tickets)':'')+' in '+ms+' ms',true);
   refresh()}
  catch(e){fb.className='feedback err';
   fb.textContent='REJECTED: '+e.message;toast(e.message,false)}
@@ -1022,16 +1038,25 @@ function orderModalHTML(n){
       .map(t=>'<option>'+t+'</option>').join('')+'</select></div>'+
    '<div class="fgroup"><label>Lot size</label>'+
     '<input type="number" id="olot'+n+'" step="0.01" min="0.01" value="0.01"></div>'+
+   '<div class="fgroup"><label>Orders</label>'+
+    '<input type="number" id="onum'+n+'" step="1" min="1" max="50" value="1"></div>'+
    '<div class="fgroup"><label>Level · whole</label>'+
     '<input type="number" id="owl'+n+'" step="1" min="0" inputmode="numeric" placeholder="e.g. 1"></div>'+
    '<div class="fgroup"><label>Level · decimal</label>'+
     '<input type="text" id="ofr'+n+'" inputmode="numeric" autocomplete="off" placeholder="e.g. 12165"></div>'+
+  '</div>'+
+  '<div class="chiprow" id="ochipm'+n+'">'+
+   [1,2,3,5,10].map(v=>'<button type="button" class="lchip'+(v===1?' on':'')+'" onclick="setONum('+n+','+v+')">'+v+'</button>').join('')+
   '</div>'+
   '<div class="secthint" id="ohint'+n+'">level = whole + decimal, with as many digits as the pair quotes</div>'+
   '<div style="margin-top:14px;display:flex;gap:10px;align-items:center;justify-content:center">'+
    '<button class="btn order-mini" id="oBtn'+n+'" onclick="submitOrder('+n+')">◌ PLACE ORDER</button>'+
    '<span class="feedback" style="margin:0" id="ofb'+n+'">GTC · sits on the broker until it triggers</span>'+
   '</div>'}
+function setONum(n,v){const el=$id('onum'+n);if(!el)return;
+ el.value=Math.max(1,Math.min(50,v|0||1));
+ for(const c of document.querySelectorAll('#ochipm'+n+' .lchip'))
+  c.className='lchip'+(c.textContent==String(el.value)?' on':'')}
 function openOrderModal(n){
  MODAL_ACC=n;
  $id('modalBody').innerHTML=orderModalHTML(n);
@@ -1062,6 +1087,8 @@ function openOrderModal(n){
  }).catch(function(){fill()});
  sel.onchange=fill;
  $id('otyp'+n).onchange=function(){$id('ohint'+n).innerHTML=otypeHint(n)};
+ const onm=$id('onum'+n);
+ if(onm)onm.oninput=function(){setONum(n,parseInt(onm.value,10)||1)};
  fill()}
 async function submitOrder(n){
  if(INFLIGHT['o'+n])return;INFLIGHT['o'+n]=true;
@@ -1071,15 +1098,19 @@ async function submitOrder(n){
  const sym=($id('osym'+n)||{}).value||'',typ=($id('otyp'+n)||{}).value||'';
  const lot=parseFloat(($id('olot'+n)||{}).value);
  const whole=($id('owl'+n)||{}).value,frac=($id('ofr'+n)||{}).value;
+ let cnt=parseInt((($id('onum'+n)||{}).value||'1'),10);
+ if(!(cnt>=1&&cnt<=50))cnt=1;
  if(!(lot>0)){f.className='feedback err';f.textContent='lot must be > 0';
   toast('lot must be > 0',false);if(b)b.disabled=false;delete INFLIGHT['o'+n];return}
- f.className='feedback';f.textContent='placing '+typ+' '+sym+' ...';
+ f.className='feedback';f.textContent='placing '+typ+' '+sym+(cnt>1?' x'+cnt:'')+' ...';
  try{const j=await post('/api/order',{account:+n,symbol:sym,type:typ,lot:lot,
-   level_whole:whole,level_frac:frac});
+   level_whole:whole,level_frac:frac,n:cnt});
   asmrTap(2200);
   f.className='feedback ok';
-  f.textContent='PLACED #'+j.ticket+' '+typ+' '+sym+' @ '+j.price+' ('+j.ms+' ms)';
-  toast(typ+' '+sym+' @ '+j.price+' placed - ticket '+j.ticket,true);
+  const got=(j.n||j.ok||1), tk=j.tickets||(j.ticket?[j.ticket]:[]);
+  f.textContent='PLACED '+(got>1?got+'/'+cnt+' ':'#'+j.ticket+' ')+typ+' '+sym+' @ '+j.price+' ('+j.ms+' ms)';
+  toast(typ+' '+sym+(cnt>1?' x'+cnt:'')+' @ '+j.price+' placed'+
+   (tk.length>1?' - '+tk.length+' tickets':' - ticket '+j.ticket),true);
   setTimeout(closeModal,900);refresh()}
  catch(e){f.className='feedback err';f.textContent=e.message;toast(e.message,false)}
  finally{if(b)b.disabled=false;delete INFLIGHT['o'+n]}}
@@ -1145,10 +1176,14 @@ function renderSchedCount(n){const rows=(SCH||[]).filter(s=>String(s.account)===
  if(cnt)cnt.textContent=String(rows.filter(s=>s.active).length)}
 function render(){if(!P)return;
   if(!BUILT){buildPanel('1');buildPanel('2');fillSymbols();
-   for(const n of ['1','2'])
+   for(const n of ['1','2']){
     $id('lchips'+n).innerHTML=[0.01,0.05,0.10,0.50,1.00]
      .map(v=>'<button class="lchip" onclick="setLot('+n+','+v.toFixed(2)+')">'
       +v.toFixed(2)+'</button>').join('');
+    $id('ochips'+n).innerHTML=[1,2,3,5,10]
+     .map(v=>'<button class="lchip'+(v===1?' on':'')+'" onclick="setOrd('+n+','+v+')">'
+      +v+'</button>').join('');
+    const oe=$id('ordn'+n);if(oe)oe.oninput=function(){markOrdChip(n)}}
    BUILT=true}
   fillSymbols();updAcc('1');updAcc('2');
   renderSchedCount('1');renderSchedCount('2');
