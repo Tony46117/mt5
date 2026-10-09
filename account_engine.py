@@ -39,6 +39,14 @@ WAIT_LOGIN_TIMEOUT_S = 90.0
 FAST_POLL_S = 0.15
 SLOW_POLL_S = 0.4
 FAST_POLL_WINDOW_S = 15.0
+# Phase 2 of verification: the EA already reports the wanted login, but MT5
+# has not delivered the trade-account details yet (ACCOUNT_CURRENCY empty,
+# balance 0.00 - typical right after logging into a new trade server such
+# as FxPro-MT5, which can take a while to synchronize).  Bounded and short:
+# the switch itself already happened, so we report success-with-sync-pending
+# instead of burning the whole login timeout and failing.
+SYNC_TIMEOUT_S = 45.0
+SYNC_POLL_S = 0.5
 STATUS_CACHE_TTL_S = 1.0
 MAX_OPS_KEPT = 40
 
@@ -103,8 +111,11 @@ class Op:
         self.done_ts = ""
 
     def public(self) -> dict:
+        args = dict(self.args)
+        if args.get("password"):
+            args["password"] = "***"   # never leak credentials via status
         return {"id": self.id, "op": self.op, "terminal": self.terminal,
-                "args": self.args, "state": self.state, "detail": self.detail,
+                "args": args, "state": self.state, "detail": self.detail,
                 "ts": self.ts, "done_ts": self.done_ts}
 
 
@@ -143,23 +154,56 @@ class TerminalWorker(threading.Thread):
     def _execute(self, op: Op) -> str:
         return getattr(self, f"_do_{op.op}")(**op.args)
 
-    def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S) -> dict:
-        """Wait until the EA feed is live and reports `want` as its login."""
+    def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S
+                    ) -> tuple[dict, float, bool]:
+        """Two-phase verification that the terminal is in `want`.
+
+        Phase 1 waits for the EA feed to report `want` as its login
+        (usually seconds after a restart).  Phase 2 waits, bounded by
+        SYNC_TIMEOUT_S, for the broker to deliver the trade-account
+        details (currency non-empty).  Returns (header, matched_in_s,
+        synced).
+
+        Only a phase-1 timeout raises: the terminal never reached the
+        wanted account.  A matched-but-unsynced login is a *successful
+        switch* with the broker sync still pending (seen with FxPro-MT5,
+        where MT5 can take minutes to synchronize a fresh login) - the
+        caller reports it as success-with-sync-pending instead of
+        burning the whole timeout and failing.
+        """
         br = _bridge()
         t0 = time.monotonic()
         deadline = t0 + timeout
+        h: dict = {}
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
-            got = str(h.get("login", ""))
-            if got and got == want and h.get("currency"):
-                return h
+            if str(h.get("login", "")) == want:
+                break
             elapsed = time.monotonic() - t0
             time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
-        h = br.header_for(self.inst)
+        else:
+            h = br.header_for(self.inst)
+        matched_in = time.monotonic() - t0
         got = str(h.get("login", ""))
-        raise EngineError(f"login not verified within {timeout:.0f}s "
-                          f"(terminal reports {got or 'logged out'}, "
-                          f"wanted {want})")
+        if got != want:
+            raise EngineError(f"terminal did not reach {want} within "
+                              f"{timeout:.0f}s (reports {got or 'logged out'})")
+        if h.get("currency"):
+            return h, matched_in, True
+        sync_deadline = time.monotonic() + SYNC_TIMEOUT_S
+        while time.monotonic() < sync_deadline:
+            time.sleep(SYNC_POLL_S)
+            h = br.header_for(self.inst)
+            if str(h.get("login", "")) != want:
+                break              # terminal moved away - re-check below
+            if h.get("currency"):
+                return h, matched_in, True
+        h = br.header_for(self.inst)
+        if str(h.get("login", "")) != want:
+            raise EngineError(f"terminal left {want} while waiting for the "
+                              f"broker sync (now reports "
+                              f"{h.get('login', '') or 'logged out'})")
+        return h, matched_in, False
 
     def _do_login(self, login: str, password: str, server: str) -> str:
         login, password, server = validate_credentials(login, password, server)
@@ -185,11 +229,17 @@ class TerminalWorker(threading.Thread):
             raise EngineError(f"terminal {self.inst} could not be restarted "
                               f"for the login")
 
-        h = self._wait_login(login)
+        h, matched_in, synced = self._wait_login(login)
         mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "unknown")
-        return (f"logged into {login} @ {server} "
+        base = (f"logged into {login} @ {server} "
                 f"[{mode}] bal {h.get('balance', '-')} "
-                f"{h.get('currency', '')}".rstrip())
+                f"{h.get('currency', '')}".rstrip()
+                + f" (login matched in {matched_in:.0f}s)")
+        if synced:
+            return base
+        return (base + " - broker still syncing account details "
+                "(no currency yet); balances fill in once MT5 finishes "
+                "syncing")
 
     def _do_adopt(self) -> str:
         br = _bridge()
@@ -249,9 +299,13 @@ class TerminalWorker(threading.Thread):
             raise EngineError(f"terminal {self.inst} could not be restarted")
         want = session.expected_login(self.inst)
         if want:
-            h = self._wait_login(want)
+            h, matched_in, synced = self._wait_login(want)
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "unknown")
-            return f"restarted, logged into {want} [{mode}]"
+            base = (f"restarted, logged into {want} [{mode}] "
+                    f"(matched in {matched_in:.0f}s)")
+            if synced:
+                return base
+            return base + " - broker sync pending (no currency yet)"
         return "restarted (no session account for this slot)"
 
 
@@ -376,6 +430,8 @@ class AccountEngine:
             got = str(h.get("login", "")) if h else ""
             if got == "0":
                 got = ""
+            synced_acct = bool(h and h.get("currency"))
+            verified = bool(want and got == want)
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "") if h else ""
             age = ages.get(inst)
             with self._lock:
@@ -394,7 +450,8 @@ class AccountEngine:
                 "balance": h.get("balance", "") if h else "",
                 "equity": h.get("equity", "") if h else "",
                 "feed_age_s": round(age, 1) if age is not None else None,
-                "verified": bool(want and got == want),
+                "verified": verified,
+                "syncing": bool(verified and not synced_acct),
                 "running": running,
             })
         with self._lock:
@@ -466,8 +523,11 @@ def _finish(op: dict) -> int:
 def _print_status() -> None:
     st = get_engine().status()
     for s in st["slots"]:
-        if s["verified"]:
+        if s["verified"] and not s.get("syncing"):
             state = f"verified in {s['login']}"
+        elif s["verified"]:
+            state = (f"in {s['login']} - login matched, broker SYNCING "
+                     f"(no currency yet, balances pending)")
         elif s["login"]:
             state = f"in {s['login']} (session wants {s['want_login']})"
         else:
