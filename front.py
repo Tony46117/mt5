@@ -141,9 +141,7 @@ a{color:var(--blue);text-decoration:none}
   box-shadow:0 0 6px rgba(255,92,92,.35),inset 0 1px 0 rgba(255,92,92,.3)}
 .btn.close-top:disabled{opacity:.55;cursor:progress;transform:none}
 /* big solid-red CLOSE bar above the ACCOUNT 1 panel */
-.closebar{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;
-  margin-bottom:10px;align-items:center}
-.closebar .cell{min-width:0}
+.closebar{display:flex;justify-content:flex-start;margin-bottom:10px}
 .btn.close-main{display:inline-flex;align-items:center;justify-content:center;
   gap:8px;padding:10px 30px;font-size:13px;font-weight:800;
   letter-spacing:.16em;line-height:1.2;
@@ -156,7 +154,6 @@ a{color:var(--blue);text-decoration:none}
   transform:translateY(-1px)}
 .btn.close-main:active{transform:scale(.95)}
 .btn.close-main:disabled{opacity:.6;cursor:progress;transform:none}
-@media(max-width:1180px){.closebar{grid-template-columns:1fr}}
 @keyframes pop{0%{transform:scale(1)}40%{transform:scale(.9)}100%{transform:scale(1)}}
 /* small cool ORDER button (replaces the old full-width block) */
 .btn.order-mini{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;
@@ -839,19 +836,11 @@ PANEL_TMPL = """<!doctype html>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
-      <div class="closebar">
-        <div class="cell"><button class="btn close-main" id="closeMainBtn1"
-          onclick="asmrTap(1400);asmrPop(this);closeAll('1',this)"
-          title="close every position on account 1">✕ CLOSE</button></div>
-        <div class="cell"></div>
-        <div class="cell"></div>
-      </div>
-      <div class="grid accounts mid">
+      <div class="closebar"><button class="btn close-main" id="closeAllTopBtn"
+        onclick="closeAllBoth(this)"
+        title="close every position on ALL accounts at once">✕ CLOSE</button></div>
+      <div class="grid accounts">
         <section class="panel acc" id="acc1"></section>
-        <div class="midclose">
-          <button class="btn big" id="closeBothBtn" onclick="closeAllBoth()"
-            title="close every position on BOTH accounts at once (close.py)">✕&nbsp;CLOSE ALL</button>
-        </div>
         <section class="panel acc" id="acc2"></section>
       </div>
       <section class="panel" id="engineCard">
@@ -1031,13 +1020,13 @@ async function closeAll(n,el){
   toast(j.detail||'close all sent',j.ok);refresh()}
  catch(e){toast(e.message,false)}
  finally{delete INFLIGHT['ca'+n];if(b)b.disabled=false}}
-/* the small pill between ACCOUNT 1 and ACCOUNT 2: closes everything on
-   BOTH terminals at once via close.py (one thread per terminal - wall time
+/* the red CLOSE bar above the panels: closes everything on BOTH
+   terminals at once via close.py (one thread per terminal - wall time
    is the slowest terminal, not the sum). Fast: instant ASMR tap + pop,
    immediate "closing..." toast, no artificial waits. */
-async function closeAllBoth(){
+async function closeAllBoth(el){
  if(INFLIGHT['caall'])return;INFLIGHT['caall']=true;
- const b=$id('closeBothBtn');if(b){b.disabled=true;asmrPop(b)}
+ const b=el||$id('closeAllTopBtn');if(b){b.disabled=true;asmrPop(b)}
  asmrTap(1400);
  toast('closing ALL (both accounts)...',true);
  try{const j=await post('/api/close-all',{symbol:'ALL'});
