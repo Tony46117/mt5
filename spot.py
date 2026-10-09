@@ -1084,6 +1084,53 @@ def server_known(inst: int, server: str) -> bool:
     except OSError:
         return True                      # cannot tell - do not block
 
+def _bases_dirs() -> list:
+    """All per-install Bases dirs (case differs between installs)."""
+    out = []
+    for inst in (1, 2):
+        try:
+            d = TERMINALS[inst]["dir"]
+        except (KeyError, TypeError):
+            continue
+        for cand in (d / "Bases", d / "bases"):
+            try:
+                if cand.is_dir():
+                    out.append(cand)
+                    break
+            except OSError:
+                continue
+    return out
+
+def server_known_anywhere(server: str) -> bool:
+    """Has ANY terminal install on this box ever seen `server`?
+
+    Used to grade unknown-server logins: known here -> go; known only
+    on the sibling install -> attempt anyway with a warning (MT5 may
+    still resolve it); known nowhere and no access point -> fail fast.
+    """
+    name = str(server or "").strip()
+    if not name:
+        return False
+    try:
+        if session._looks_like_access_point(name):
+            return True
+    except Exception:
+        pass
+    low = name.lower()
+    try:
+        for bases in _bases_dirs():
+            try:
+                if (bases / name).is_dir():
+                    return True
+                if any(p.name.lower() == low
+                       for p in bases.iterdir() if p.is_dir()):
+                    return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
 def ensure_terminal(inst: int = 1) -> bool:
     exe = TERMINALS[inst]["dir"] / "terminal64.exe"
     if not exe.exists():

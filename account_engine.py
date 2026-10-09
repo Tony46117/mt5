@@ -240,20 +240,31 @@ class TerminalWorker(threading.Thread):
         exe = sp.TERMINALS[self.inst]["dir"] / "terminal64.exe"
         if not exe.exists():
             raise EngineError(f"terminal {self.inst} is not installed ({exe})")
-        # fail BEFORE touching anything: booting a server this MT5 install
-        # has never seen silently never connects (terminal keeps its last
-        # account) - a restart plus a 90 s burn for nothing.  An access
-        # point (host:port) resolves without prior knowledge.
+        # Grade the server BEFORE touching anything: booting a server
+        # no install on this box has ever seen silently never connects
+        # (the terminal keeps its last account) - a restart plus a long
+        # burn for nothing.  A server only the SIBLING install knows is
+        # attempted anyway with a warning (MT5 may still resolve it); a
+        # server known nowhere needs an access point or one manual login.
         from config import access_point_for
+        new_here_note = ""
         if (not sp.server_known(self.inst, server)
                 and not access_point_for(server)):
-            raise EngineError(
-                f"terminal {self.inst} has never seen server {server!r} - "
-                f"MT5 cannot log into it by name yet (it would just keep "
-                f"the current account). Log in once manually inside MT5 "
-                f"(File -> Login to Trade Account), then press ADOPT - "
-                f"after that one-click logins work. (Alternatively set "
-                f"MT5_AP_{server.upper()} to the broker's host:port.)")
+            if sp.server_known_anywhere(server):
+                new_here_note = (f" (server {server} is new to terminal "
+                                 f"{self.inst} - attempting anyway)")
+                log.info(f"terminal {self.inst}: server {server} known to "
+                         f"sibling install only - attempting login anyway")
+            else:
+                raise EngineError(
+                    f"terminal {self.inst} has never seen server {server!r} - "
+                    f"MT5 cannot log into it by name yet (it would just keep "
+                    f"the current account). Double-check the exact spelling "
+                    f"against your broker's account email, or log in once "
+                    f"manually inside MT5 (File -> Login to Trade Account), "
+                    f"then press ADOPT - after that one-click logins work. "
+                    f"(Alternatively set MT5_AP_{server.upper()} to the "
+                    f"broker's host:port.)")
 
         # write the slot (the other terminal's slot stays untouched)
         prev = session.load()
@@ -286,7 +297,8 @@ class TerminalWorker(threading.Thread):
         base = (f"logged into {login} @ {server} "
                 f"[{mode}] bal {h.get('balance', '-')} "
                 f"{h.get('currency', '')}".rstrip()
-                + f" (login matched in {matched_in:.0f}s)")
+                + f" (login matched in {matched_in:.0f}s)"
+                + new_here_note)
         if synced:
             return base
         return (base + " - broker still syncing account details "
