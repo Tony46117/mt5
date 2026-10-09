@@ -217,13 +217,18 @@ class Monitor:
 
         out = [f"{BOLD}ACCOUNT {login}  ({server}){RESET}  {link}  "
                f"{DIM}{dt.datetime.now():%H:%M:%S}{RESET}"]
+        syncing = bool(head.get("login") and head.get("login") == a.get("login")
+                       and not head.get("currency"))
         if bal or eq:
             out.append(f"{BOLD}BAL {bal:>10.2f}{RESET}   "
                        f"{BOLD}EQUITY {eq_c}{eq:>10.2f}{RESET}   "
                        f"{BOLD}FLOAT {pl_c}{pl:>+10.2f}{RESET}   "
                        f"{BOLD}NET {net_c}{net:>+10.2f}{RESET}")
         else:
-            out.append(f"{DIM}balance/equity need SpotDump v1.20 "
+            out.append(f"{YELLOW}broker sync pending - login verified, "
+                       f"balances fill in shortly{RESET}"
+                       if syncing else
+                       f"{DIM}balance/equity need SpotDump v1.20 "
                        f"(python monitor.py --restart {self.inst} recompiles it){RESET}")
         # Trading permission warnings
         trade_allowed = head.get("account_trade_allowed", "1")

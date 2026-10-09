@@ -141,6 +141,7 @@ def snapshot() -> dict:
             "mql_allowed": mql_allowed,
             "account_trade_allowed": trade_allowed,
             "identity_ok": bool(login_got) and login_got == expected,
+            "syncing": bool(login_got) and login_got == expected and not cur,
             "live": age < 5,
             "age_s": round(age, 2),
             "trade_disabled": trade_allowed == "0",
@@ -201,8 +202,12 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     out.append(acc_line("Trade mode", tmode,
                         YELLOW if tmode == "real" else ""))
     out.append(acc_line("Margin mode", mmode))
-    # Leverage: 0 means not reported (common on ECN/raw live accounts)
-    if lev == "0" or not lev:
+    # Leverage: 0/empty means not reported - but right after a login switch
+    # with no currency yet the broker simply hasn't synced (not ECN/raw).
+    syncing = bool(login and login == expected and not cur)
+    if syncing:
+        out.append(acc_line("Leverage", f"{YELLOW}syncing...{RESET}"))
+    elif lev == "0" or not lev:
         out.append(acc_line("Leverage", f"{YELLOW}not reported (ECN/raw account){RESET}"))
     else:
         out.append(acc_line("Leverage", f"1:{lev}"))

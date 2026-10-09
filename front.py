@@ -738,8 +738,9 @@ function card(n){const a=S.accounts[n]||{};const st=a.stats||{};
   '<span class="sub">'+esc(a.server||'-')+'</span>'+
   '<span class="sub">'+esc(a.broker||'-')+'</span>'+
   '<span class="sub">'+esc(a.trade_mode||'').toUpperCase()+'</span>'+
-  '<span class="spacer"></span><span class="sub mono">'+esc(a.currency||'')+'</span></div>'+
- '<div style="padding:13px 13px 0"><div class="kv">'+
+   '<span class="spacer"></span><span class="sub mono">'+esc(a.currency||'')+'</span></div>'+
+  (a.syncing?'<div class="sect"><h4 style="color:var(--yellow)">Broker sync pending - balances fill in shortly</h4></div>':'')+
+  '<div style="padding:13px 13px 0"><div class="kv">'+
   kv('Balance',fmt(a.balance),'')+kv('Equity',fmt(a.equity),cls(a.equity-a.balance))+
   kv('Floating P/L',signed(a.profit),cls(a.profit))+
   kv('Margin level',a.margin_level>0?fmt(a.margin_level,1)+'%':'-','')+
@@ -1203,7 +1204,8 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
  if(!$id('live'+n))return;                     // panel not built yet
  /* login 0 = MT5's logged-out marker: show LOGOUT, never fake LIVE + 0.00 */
  const loggedOut=(String(a.login||'')===''||String(a.login||'')==='0');
- $id('live'+n).className=dot(a.live&&!loggedOut,num(a.age_s)>0&&num(a.age_s)<60);
+ const syncing=!!a.syncing;
+ $id('live'+n).className=syncing?'dot warn':dot(a.live&&!loggedOut,num(a.age_s)>0&&num(a.age_s)<60);
  $id('login'+n).textContent=a.login||'-';
  $id('server'+n).textContent=a.server||'-';
  $id('broker'+n).textContent=a.broker||'-';
@@ -1217,9 +1219,9 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
  $id('mg'+n).textContent=fmt(a.margin);
  $id('mgf'+n).textContent=fmt(a.margin_free);
  $id('mgl'+n).textContent=num(a.margin_level)>0?fmt(a.margin_level,1)+'%':'-';
- $id('lev'+n).textContent=a.leverage||'-';
+ $id('lev'+n).textContent=syncing?'syncing...':(a.leverage||'-');
  const sp=a.spreads||{};
- $id('spread'+n).innerHTML=['EURUSD','GBPUSD','XAUUSD']
+ $id('spread'+n).innerHTML=(syncing?'<span class="chip" style="border-color:var(--yellow);color:var(--yellow)">SYNC <b>PENDING</b></span>':'')+['EURUSD','GBPUSD','XAUUSD']
   .filter(k=>sp[k]!=null)
   .map(k=>'<span class="chip">'+k+' <b>'+fmt(sp[k],0)+' pts</b></span>').join('')+
   '<span class="chip">FEED <b>'+(a.live?'LIVE':'STALE')+'</b></span>';
