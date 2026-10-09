@@ -343,14 +343,15 @@ class SendCommand:
                             pass
                         next_assert = now + EXEC_REASSERT_INTERVAL
 
-                    for fields in reader.poll():
-                        if len(fields) < 3:
+                    for line in reader.poll():
+                        parts = line.split(b"\t")
+                        if len(parts) < 3:
                             continue
-                        done_cid = fields[0].decode(errors="replace")
+                        done_cid = parts[0].decode(errors="replace")
                         for i, (cid, cf, err) in enumerate(queued):
                             if got[i] is None and cid == done_cid:
-                                got[i] = (fields[1].decode() == "OK",
-                                          fields[2].decode())
+                                got[i] = (parts[1].decode() == "OK",
+                                          parts[2].decode(errors="replace"))
                                 break
                     if not any(r is None for r in got):
                         break
@@ -604,11 +605,21 @@ class FutureTradeScheduler(threading.Thread):
                         pass
             except OSError:
                 pass
-            # Check exec_out.csv for NUL corruption
+            # Check exec_out.csv for NUL corruption.  Only the recent tail
+            # matters (same 8 KB window _diagnose_unresponsive uses): the
+            # file grows all day, so a whole-file read gets slower every
+            # hour, and ancient bytes say nothing about channel health now.
             try:
                 out_path = exec_out_path(inst)
                 if out_path.exists():
-                    raw = out_path.read_bytes()
+                    with open(out_path, "rb") as fh:
+                        try:
+                            fh.seek(0, 2)
+                            size = fh.tell()
+                            fh.seek(max(0, size - 8192))
+                        except OSError:
+                            pass
+                        raw = fh.read()
                     if raw:
                         nuls = sum(1 for b in raw if b == 0)
                         if nuls / len(raw) > 0.5:
@@ -710,6 +721,18 @@ class FutureTradeScheduler(threading.Thread):
         pair, side, lot = sch["pair"], sch["side"], sch["lot"]
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
+        # same broker-symbol mapping as every other order path
+        # (open_trade / open_pending / close_all all map_symbol)
+        mapped = map_symbol(pair.upper(), acc)
+        try:
+            from spot import read_spots
+            spots = read_spots()
+            if mapped not in spots or not spots[mapped][0]:
+                log.warning(f"schedule #{sch['id']} acc{acc} {pair}: no live "
+                            f"quote for {mapped} - firing anyway, the broker "
+                            f"decides (manual orders would reject here)")
+        except Exception as exc:
+            log.warning(f"schedule #{sch['id']}: quote pre-check failed: {exc}")
 
         # Pre-flight: check account trading permission from the EA header
         try:
@@ -734,7 +757,7 @@ class FutureTradeScheduler(threading.Thread):
         except Exception as exc:
             log.warning(f"schedule #{sch['id']}: pre-flight permission check failed: {exc}")
 
-        commands = [("OPEN", pair, side, f"{lot:.2f}", "0", "0",
+        commands = [("OPEN", mapped, side, f"{lot:.2f}", "0", "0",
                      str(777000 + acc), f"sch#{sch['id']}")
                     for _ in range(n)]
         t0 = time.perf_counter()

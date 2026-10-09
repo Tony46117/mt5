@@ -29,7 +29,7 @@ SEP = "=" * 100
 def f(v: str) -> float:
     try:
         return float(v)
-    except ValueError:
+    except (ValueError, TypeError):
         return 0.0
 
 def read_positions(inst: int) -> list[dict]:

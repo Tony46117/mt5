@@ -267,10 +267,33 @@ def _any_bridge_fresh(timeout_s: float = 5.0) -> bool:
     return False
 
 def feed_age(inst: int = 1) -> float:
+    """Seconds since THIS terminal's EA last wrote a feed file.
+
+    Scoped to the terminal's own install tree.  The old version scanned
+    every terminal's files and returned the global newest, so a dead
+    terminal still read LIVE while its sibling was up - the supervisor,
+    the health endpoint and the dashboard could not see a one-sided
+    feed death.  Falls back to the global scan when the install tree
+    holds no feed files at all (e.g. a non-portable setup).
+    """
     now = time.time()
     cached = _FEED_AGE_CACHE.get(inst)
     if cached and now - cached[0] < 1.0:
         return cached[1]
+    try:
+        own = TERMINALS[inst]["dir"] / "MQL5" / "Files"
+        newest = 0.0
+        for name in ("spots.csv", "trades.csv", "candles.csv"):
+            try:
+                newest = max(newest, (own / name).stat().st_mtime)
+            except OSError:
+                pass
+        if newest:
+            age = now - newest
+            _FEED_AGE_CACHE[inst] = (now, age)
+            return age
+    except (KeyError, TypeError):
+        pass
     roots = data_roots()
     files: list[Path] = []
     for root in roots:

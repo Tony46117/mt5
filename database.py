@@ -126,9 +126,10 @@ def _migrate() -> None:
 
         ph = "%s" if USE_POSTGRES else "?"
         act = "TRUE" if USE_POSTGRES else "1"
+        deact = "FALSE" if USE_POSTGRES else "0"
         grp = ("account, pair, side, lot, n_positions, "
                "exec_h, exec_m, exec_s, close_h, close_m, close_s")
-        cur.execute(f"""UPDATE future_trades SET active={act if USE_POSTGRES else '0'}
+        cur.execute(f"""UPDATE future_trades SET active={deact}
                      WHERE active={act} AND id NOT IN
                      (SELECT MIN(id) FROM future_trades WHERE active={act}
                       GROUP BY {grp})""")

@@ -39,7 +39,10 @@ class MetricsObserver(threading.Thread):
         super().__init__(daemon=True, name="metrics-observer")
         self.stop_flag = threading.Event()
         self._open: dict[int, dict[str, dict]] = {1: {}, 2: {}}
-        self._last_sample = 0.0
+        # per-account sample clocks: a single shared stamp made the two
+        # accounts take turns, so each equity curve sampled every ~20 s
+        # instead of the documented 10 s (and the accounts interleaved).
+        self._last_sample: dict[int, float] = {1: 0.0, 2: 0.0}
 
     def _read(self, inst: int) -> tuple[dict, list[dict]]:
         login = read_accounts().get(inst, {}).get("login", "")
@@ -96,8 +99,8 @@ class MetricsObserver(threading.Thread):
                                        "lot": f(r["volume"]), "pl": f(r["pl"]),
                                        "swap": f(r["swap"]), "time": r["time"]}
 
-        if head and time.monotonic() - self._last_sample >= SAMPLE_EVERY:
-            self._last_sample = time.monotonic()
+        if head and time.monotonic() - self._last_sample[inst] >= SAMPLE_EVERY:
+            self._last_sample[inst] = time.monotonic()
             curve = _load(f"equity_curve_{inst}", [])
             curve.append([int(time.time()),
                           f(head.get("balance", "")),

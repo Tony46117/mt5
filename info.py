@@ -48,14 +48,33 @@ def _ensure_probed() -> None:
 def f(v: str) -> float:
     try:
         return float(v)
-    except ValueError:
+    except (ValueError, TypeError):
         return 0.0
+
+def _digits_for(sym: str, price: str = "") -> int:
+    """Quote digits for a symbol, read off a live price when available.
+
+    The old hardcoded table (XAUUSD->2, XAGUSD->3, else 5) mis-measured
+    every broker-suffixed variant (XAUUSD247, EURUSDm, ...) by orders of
+    magnitude.  A quoted price always carries its own precision.
+    """
+    if price and "." in str(price):
+        try:
+            return max(0, len(str(price).split(".")[1]))
+        except (IndexError, ValueError):
+            pass
+    s = sym.upper()
+    if s.startswith("XAU"):
+        return 2
+    if s.startswith("XAG"):
+        return 3
+    return 5
 
 def spread_pts(sym: str, spots: dict) -> float | None:
     bid, ask, _ = spots.get(sym, ("", "", ""))
     if not bid or not ask:
         return None
-    digits = 2 if sym.upper() == "XAUUSD" else (3 if sym.upper() == "XAGUSD" else 5)
+    digits = _digits_for(sym, bid)
     try:
         return (float(ask) - float(bid)) * (10 ** digits)
     except ValueError:
@@ -216,7 +235,7 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     out.append(f"  {DIM}{'SYMBOL':<8}{'BID':>11}{'ASK':>11}{'SPREAD':>10}{'FILLING':>9}{RESET}")
     for sym in quoted:
         bid, ask, _ = spots.get(sym, ("", "", ""))
-        digits = 2 if sym == "XAUUSD" else 5
+        digits = _digits_for(sym, bid)
         try:
             b = f"{float(bid):.{digits}f}" if bid else "-"
             a = f"{float(ask):.{digits}f}" if ask else "-"
