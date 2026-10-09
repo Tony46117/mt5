@@ -850,6 +850,31 @@ PANEL_TMPL = """<!doctype html>
             <button class="btn mini" onclick="engRefresh()">REFRESH</button>
           </div></div>
         <div class="tblwrap" id="engSlots"><div class="empty">loading...</div></div>
+        <div class="sect"><h4>Saved accounts</h4>
+          <div class="right"><button class="btn mini blue" onclick="engToggleSave()">+ SAVE ACCOUNT</button></div></div>
+        <div class="tblwrap" id="engSaved"><div class="empty">loading...</div></div>
+        <div id="engSaveForm" style="display:none;margin-top:4px;
+          border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
+          padding-top:10px">
+          <div class="frow" style="margin-top:8px">
+            <div class="fgroup" style="grid-column:span 2"><label>Account number</label>
+              <input id="engSaveLoginIn" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 51234567"></div>
+            <div class="fgroup" style="grid-column:span 2"><label>Server</label>
+              <input id="engSaveServerIn" type="text" autocomplete="off" placeholder="FxPro-MT5 / HFM-Real"></div>
+            <div class="fgroup" style="grid-column:span 2"><label>Password</label>
+              <input id="engSavePassIn" type="password" autocomplete="new-password" placeholder="saved password"></div>
+            <div class="fgroup" style="grid-column:span 2"><label>Label (optional)</label>
+              <input id="engSaveLabelIn" type="text" autocomplete="off" placeholder="e.g. FxPro live"></div>
+          </div>
+          <div class="feedback" id="engSaveFeedback"></div>
+          <div class="frow" style="margin-top:6px">
+            <button class="btn blue" style="grid-column:span 2" onclick="engSaveSubmit()">SAVE</button>
+            <button class="btn" style="grid-column:span 2" onclick="engToggleSave(true)">CANCEL</button>
+          </div>
+          <div class="body mut" style="font-size:11px;padding-top:6px">
+            saving never touches a terminal - it just stores the info so the
+            account can be logged in later with one click (T1 / T2).</div>
+        </div>
         <div id="engForm" style="display:none;margin-top:12px;
           border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
           padding-top:10px">
@@ -1328,7 +1353,75 @@ async function engSubmitLogin(){
   password:password,server:server});
  if(j){fb.textContent='';fb.className='feedback ok';engCloseForm()}}
 function engLogin(t){engOpenForm(t)}
+/* ---------- saved accounts: store once, log in with one click ---------- */
+let ENGSAVED=null;
+function engSavedRender(){
+ const box=$id('engSaved');if(!box)return;
+ if(!ENGSAVED){box.innerHTML='<div class="empty">loading...</div>';return}
+ if(!ENGSAVED.length){box.innerHTML='<div class="empty">no saved accounts yet - press + SAVE ACCOUNT</div>';return}
+ box.innerHTML=ENGSAVED.map(a=>
+  '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;'+
+   'padding:10px 0;border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent)">'+
+   '<b class="mono">'+esc(a.login)+'</b>'+
+   '<span class="mut sub">'+esc(a.server||'-')+'</span>'+
+   (a.label?'<span class="sub">'+esc(a.label)+'</span>':'')+
+   '<span class="sub" style="color:'+(a.has_password?'#22c55e':'#eab308')+'">'+
+    (a.has_password?'● pw saved':'○ no pw')+'</span>'+
+   '<span class="spacer" style="flex:1"></span>'+
+   '<button class="btn mini blue" onclick="engSavedLogin(\''+esc(a.login)+'\',1)">T1 LOGIN</button>'+
+   '<button class="btn mini blue" onclick="engSavedLogin(\''+esc(a.login)+'\',2)">T2 LOGIN</button>'+
+   '<button class="btn mini" onclick="engSavedEdit(\''+esc(a.login)+'\')">EDIT</button>'+
+   '<button class="btn mini danger" onclick="engSavedDel(\''+esc(a.login)+'\')">DEL</button>'+
+  '</div>').join('')}
+async function engPollSaved(){
+ try{const j=await api('/api/engine/accounts');
+  ENGSAVED=j.accounts||[];engSavedRender()}catch(e){}}
+async function engSavedLogin(login,t){
+ await engAct('/api/engine/login',{terminal:t,login:login,
+  password:'',server:''})}
+async function engSavedDel(login){
+ if(!confirm('Forget saved account '+login+'? (terminals keep running)'))return;
+ const j=await engAct('/api/engine/forget',{login:login});
+ if(j)engPollSaved()}
+function engToggleSave(hide){
+ const f=$id('engSaveForm');if(!f)return;
+ f.style.display=(hide||f.style.display!=='none')?'none':'';
+ if(f.style.display!=='none'){
+  $id('engSaveFeedback').textContent='';
+  $id('engSaveFeedback').className='feedback';
+  const l=$id('engSaveLoginIn');if(l)l.focus()}}
+function engSavedEdit(login){
+ const a=(ENGSAVED||[]).find(x=>String(x.login)===String(login));
+ if(!a)return;
+ $id('engSaveLoginIn').value=a.login;
+ $id('engSaveServerIn').value=a.server||'';
+ $id('engSavePassIn').value='';
+ $id('engSaveLabelIn').value=a.label||'';
+ const f=$id('engSaveForm');if(f)f.style.display='';
+ $id('engSaveFeedback').textContent=a.has_password
+  ?'leave the password blank to keep the saved one'
+  :'no saved password - type one to store it';
+ $id('engSaveFeedback').className='feedback'}
+async function engSaveSubmit(){
+ const login=($id('engSaveLoginIn').value||'').trim();
+ const server=($id('engSaveServerIn').value||'').trim();
+ const password=$id('engSavePassIn').value||'';
+ const label=($id('engSaveLabelIn').value||'').trim();
+ const fb=$id('engSaveFeedback');
+ if(!/^\\d+$/.test(login)){fb.textContent='account number must be digits';
+  fb.className='feedback err';return}
+ if(!server){fb.textContent='server is required (e.g. FxPro-MT5)';
+  fb.className='feedback err';return}
+ fb.textContent='saving...';fb.className='feedback';
+ try{const j=await post('/api/engine/save',{login:login,server:server,
+   password:password,label:label});
+  fb.textContent='';fb.className='feedback ok';
+  $id('engSaveLoginIn').value='';$id('engSavePassIn').value='';
+  $id('engSaveLabelIn').value='';
+  toast(j.detail||'saved',true);engPollSaved();engFillKnown()}
+ catch(e){fb.textContent=e.message;fb.className='feedback err'}}
 engPoll();setInterval(engPoll,2000);
+engPollSaved();setInterval(engPollSaved,10000);
 """
 
 def render_panel() -> str:

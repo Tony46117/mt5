@@ -279,6 +279,38 @@ def api_engine_forget():
                 "detail": f"{login_id} "
                           f"{'forgotten' if removed else 'not found'}"})
 
+@app.post("/api/engine/save")
+@rate_limit(max_requests=20, window=60)
+def api_engine_save():
+    """Save (or update) an account's info so it can be logged in later
+    with one click - no terminal is touched and no login happens here."""
+    d = request.get_json(silent=True) or {}
+    login_id = str(d.get("login", "")).strip()
+    if not login_id.isdigit():
+        return _fail("login must be a plausible MT5 account number")
+    try:
+        import accounts as _known
+        known = _known.get(login_id) or {}
+    except Exception:
+        known = {}
+    server = str(d.get("server", "")).strip() or str(known.get("server", ""))
+    if not server:
+        return _fail("server is required (e.g. FxPro-MT5 or HFM-Real)")
+    password = str(d.get("password", "") or "")
+    label = str(d.get("label", "") or "").strip()
+    try:
+        account_engine.get_engine().remember(login_id, password, server,
+                                             label)
+    except ValueError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    has_pw = bool(password or known.get("password"))
+    return _ok({"account": {"login": login_id, "server": server,
+                            "label": label or str(known.get("label", "")),
+                            "has_password": has_pw},
+                "detail": f"{login_id} saved - one click logs it in"})
+
 @app.get("/api/debug")
 @rate_limit(max_requests=30, window=60)
 def api_debug():
