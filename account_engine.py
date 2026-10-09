@@ -39,6 +39,13 @@ WAIT_LOGIN_TIMEOUT_S = 90.0
 FAST_POLL_S = 0.15
 SLOW_POLL_S = 0.4
 FAST_POLL_WINDOW_S = 15.0
+# A live feed (EA writing) that keeps reporting a DIFFERENT real login this
+# long after a restart means MT5 has settled and rejected the switch
+# (wrong password, or server it cannot resolve) - fail fast with an
+# actionable message instead of burning the whole 90 s timeout.  Only
+# counts while the feed is live AND shows a real (non-empty) other login;
+# a logged-out/empty feed means the terminal is still booting/connecting.
+STUCK_LOGIN_S = 60.0
 # Phase 2 of verification: the EA already reports the wanted login, but MT5
 # has not delivered the trade-account details yet (ACCOUNT_CURRENCY empty,
 # balance 0.00 - typical right after logging into a new trade server such
@@ -154,8 +161,8 @@ class TerminalWorker(threading.Thread):
     def _execute(self, op: Op) -> str:
         return getattr(self, f"_do_{op.op}")(**op.args)
 
-    def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S
-                    ) -> tuple[dict, float, bool]:
+    def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S,
+                    server: str = "") -> tuple[dict, float, bool]:
         """Two-phase verification that the terminal is in `want`.
 
         Phase 1 waits for the EA feed to report `want` as its login
@@ -172,13 +179,35 @@ class TerminalWorker(threading.Thread):
         burning the whole timeout and failing.
         """
         br = _bridge()
+        sp = _spot()
         t0 = time.monotonic()
         deadline = t0 + timeout
         h: dict = {}
+        stuck_since = 0.0
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
             if str(h.get("login", "")) == want:
                 break
+            got = str(h.get("login", ""))
+            if got and got not in ("0", "?"):
+                try:
+                    live = sp.feed_age(self.inst) < 5.0
+                except Exception:
+                    live = False
+                if live:
+                    if not stuck_since:
+                        stuck_since = time.monotonic()
+                    elif time.monotonic() - stuck_since > STUCK_LOGIN_S:
+                        raise EngineError(
+                            f"terminal {self.inst} is live but stuck on "
+                            f"{got} - MT5 rejected the switch to {want} "
+                            f"(wrong password, or server "
+                            f"{server or '?'} unknown to this MT5 install - "
+                            f"log in once manually inside MT5, then ADOPT)")
+                else:
+                    stuck_since = 0.0
+            else:
+                stuck_since = 0.0
             elapsed = time.monotonic() - t0
             time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
         else:
@@ -211,8 +240,23 @@ class TerminalWorker(threading.Thread):
         exe = sp.TERMINALS[self.inst]["dir"] / "terminal64.exe"
         if not exe.exists():
             raise EngineError(f"terminal {self.inst} is not installed ({exe})")
+        # fail BEFORE touching anything: booting a server this MT5 install
+        # has never seen silently never connects (terminal keeps its last
+        # account) - a restart plus a 90 s burn for nothing.  An access
+        # point (host:port) resolves without prior knowledge.
+        from config import access_point_for
+        if (not sp.server_known(self.inst, server)
+                and not access_point_for(server)):
+            raise EngineError(
+                f"terminal {self.inst} has never seen server {server!r} - "
+                f"MT5 cannot log into it by name yet (it would just keep "
+                f"the current account). Log in once manually inside MT5 "
+                f"(File -> Login to Trade Account), then press ADOPT - "
+                f"after that one-click logins work. (Alternatively set "
+                f"MT5_AP_{server.upper()} to the broker's host:port.)")
 
         # write the slot (the other terminal's slot stays untouched)
+        prev = session.load()
         accs = session.load()
         accs[self.inst] = {"login": login, "password": password,
                            "server": server}
@@ -225,11 +269,19 @@ class TerminalWorker(threading.Thread):
         # restart the terminal into the fresh credentials, then verify the
         # EA reports the new login
         from spot import restart_terminal
-        if not restart_terminal(self.inst):
-            raise EngineError(f"terminal {self.inst} could not be restarted "
-                              f"for the login")
-
-        h, matched_in, synced = self._wait_login(login)
+        try:
+            if not restart_terminal(self.inst):
+                raise EngineError(f"terminal {self.inst} could not be restarted "
+                                  f"for the login")
+            h, matched_in, synced = self._wait_login(login, server=server)
+        except Exception:
+            # roll the session back so the supervisor does not chase a
+            # doomed account with repeated heal-restarts into it
+            try:
+                session.set_accounts(prev, persist=True)
+            except Exception:
+                pass
+            raise
         mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "unknown")
         base = (f"logged into {login} @ {server} "
                 f"[{mode}] bal {h.get('balance', '-')} "
@@ -433,6 +485,11 @@ class AccountEngine:
             synced_acct = bool(h and h.get("currency"))
             verified = bool(want and got == want)
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "") if h else ""
+            try:
+                from spot import server_known as _srv_known
+                srv_known = _srv_known(inst, stored.get("server", ""))
+            except Exception:
+                srv_known = True
             age = ages.get(inst)
             with self._lock:
                 active = self._active.get(inst)
@@ -442,6 +499,7 @@ class AccountEngine:
             slots.append({
                 "terminal": inst,
                 "want_login": want,
+                "want_server": stored.get("server", ""),
                 "login": got,
                 "server": h.get("server", "") if h else "",
                 "broker": h.get("broker", "") if h else "",
@@ -452,6 +510,7 @@ class AccountEngine:
                 "feed_age_s": round(age, 1) if age is not None else None,
                 "verified": verified,
                 "syncing": bool(verified and not synced_acct),
+                "server_known": srv_known,
                 "running": running,
             })
         with self._lock:
@@ -535,6 +594,10 @@ def _print_status() -> None:
         print(f"terminal {s['terminal']}: {state}"
               f"{'  [' + s['mode'] + ']' if s['mode'] else ''}")
         print(f"  server : {s['server'] or '-'}   broker: {s['broker'] or '-'}")
+        if s.get("want_login") and not s.get("server_known", True):
+            print(f"  !! server {s.get('want_server') or '?'} unknown to "
+                  f"this MT5 - one-click login will fail fast; log in once "
+                  f"manually, then ADOPT")
         print(f"  balance: {s['balance'] or '-'}   equity: {s['equity'] or '-'}"
               f"   feed: {s['feed_age_s'] if s['feed_age_s'] is not None else '-'}s")
         if s["running"]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import logging
 from pathlib import Path
@@ -114,9 +115,19 @@ def access_point_for(server: str) -> str:
     """Access point (host:port) to boot a server NAME with, or ''.
 
     Only servers that a stock MT5 cannot resolve by name need an entry
-    here; anything else keeps using its plain server name.
+    here; anything else keeps using its plain server name.  Any server
+    can also be covered WITHOUT a code change via
+    MT5_AP_<SERVER_NAME> (non-alphanumerics become _), e.g.
+    MT5_AP_FXPRO_MT5=mt5-ld4.fxpro.com:443 once FxPro support confirms
+    the host.
     """
-    return SERVER_ACCESS_POINTS.get(str(server or "").strip(), "")
+    name = str(server or "").strip()
+    if not name:
+        return ""
+    if name in SERVER_ACCESS_POINTS:
+        return SERVER_ACCESS_POINTS[name]
+    env_key = "MT5_AP_" + re.sub(r"\W+", "_", name).upper().strip("_")
+    return os.getenv(env_key, "").strip()
 
 @dataclass(frozen=True, slots=True)
 class Config:

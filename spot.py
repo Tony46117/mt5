@@ -1047,6 +1047,43 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     # terminal ever sits fullscreen covering the screen.
     minimize_terminal(inst)
 
+def server_known(inst: int, server: str) -> bool:
+    """Has this terminal's MT5 install ever seen trade server `server`?
+
+    MT5 keeps one directory per known trade server under Bases/.  Booting
+    an unknown server BY NAME silently never connects - the terminal just
+    keeps its last account (seen with FxPro-MT5: 90 s burn, still on the
+    old login).  Callers must then use an access point (host:port, which
+    resolves without prior knowledge) or onboard the server with one
+    manual login inside MT5 followed by ADOPT.
+    """
+    name = str(server or "").strip()
+    if not name:
+        return False
+    try:
+        if session._looks_like_access_point(name):
+            return True
+    except Exception:
+        pass
+    try:
+        inst_dir = TERMINALS[inst]["dir"]
+        bases = inst_dir / "Bases"
+        if not bases.is_dir():
+            # wine masks case; the second install uses lowercase "bases"
+            bases = inst_dir / "bases"
+    except (KeyError, TypeError):
+        return True                      # cannot tell - do not block
+    try:
+        if not bases.is_dir():
+            return True                  # cannot tell - do not block
+        if (bases / name).is_dir():
+            return True
+        low = name.lower()
+        return any(p.name.lower() == low
+                   for p in bases.iterdir() if p.is_dir())
+    except OSError:
+        return True                      # cannot tell - do not block
+
 def ensure_terminal(inst: int = 1) -> bool:
     exe = TERMINALS[inst]["dir"] / "terminal64.exe"
     if not exe.exists():
