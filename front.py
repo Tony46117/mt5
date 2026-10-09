@@ -140,6 +140,23 @@ a{color:var(--blue);text-decoration:none}
 .btn.close-top:active{transform:scale(.94);
   box-shadow:0 0 6px rgba(255,92,92,.35),inset 0 1px 0 rgba(255,92,92,.3)}
 .btn.close-top:disabled{opacity:.55;cursor:progress;transform:none}
+/* big solid-red CLOSE bar above the ACCOUNT 1 panel */
+.closebar{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;
+  margin-bottom:10px;align-items:center}
+.closebar .cell{min-width:0}
+.btn.close-main{display:inline-flex;align-items:center;justify-content:center;
+  gap:8px;padding:10px 30px;font-size:13px;font-weight:800;
+  letter-spacing:.16em;line-height:1.2;
+  background:linear-gradient(160deg,#ef4444,#b91c1c);
+  border:1px solid #ff5c5c;color:#fff;border-radius:10px;white-space:nowrap;
+  cursor:pointer;box-shadow:0 0 18px rgba(255,92,92,.35),0 2px 10px rgba(0,0,0,.5);
+  transition:transform .08s ease,box-shadow .08s ease,filter .08s ease}
+.btn.close-main:hover{filter:brightness(1.12);
+  box-shadow:0 0 26px rgba(255,92,92,.5),0 2px 10px rgba(0,0,0,.5);
+  transform:translateY(-1px)}
+.btn.close-main:active{transform:scale(.95)}
+.btn.close-main:disabled{opacity:.6;cursor:progress;transform:none}
+@media(max-width:1180px){.closebar{grid-template-columns:1fr}}
 @keyframes pop{0%{transform:scale(1)}40%{transform:scale(.9)}100%{transform:scale(1)}}
 /* small cool ORDER button (replaces the old full-width block) */
 .btn.order-mini{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;
@@ -822,6 +839,13 @@ PANEL_TMPL = """<!doctype html>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
+      <div class="closebar">
+        <div class="cell"><button class="btn close-main" id="closeMainBtn1"
+          onclick="asmrTap(1400);asmrPop(this);closeAll('1',this)"
+          title="close every position on account 1">✕ CLOSE</button></div>
+        <div class="cell"></div>
+        <div class="cell"></div>
+      </div>
       <div class="grid accounts mid">
         <section class="panel acc" id="acc1"></section>
         <div class="midclose">
@@ -908,8 +932,8 @@ function buildPanel(n){
   '<span class="sub" id="broker'+n+'">-</span>'+
   '<span class="sub" id="mode'+n+'"></span>'+\n  '<span class="sub"><button class="btn mini danger" onclick="restartTerm('+n+')">RESTART</button></span>'+
   '<span class="spacer"></span><span class="sub mono" id="cur'+n+'"></span>'+
-  '<button class="btn close-top danger" id="closeTopBtn'+n+'" onclick="closeAll('+n+')"'+
-  ' title="close every position on account '+n+'">✕ CLOSE</button></div>'+
+  (String(n)==='1'?'':'<button class="btn close-top danger" id="closeTopBtn'+n+'" onclick="closeAll('+n+',this)"'+
+  ' title="close every position on account '+n+'">✕ CLOSE</button>')+'</div>'+
  '<div style="padding:13px 13px 0"><div class="chips" id="spread'+n+'"></div></div>'+
  '<div style="padding:13px"><div class="kv">'+
   kv('Balance','id:bal'+n)+kv('Equity','id:eq'+n)+kv('Floating P/L','id:pl'+n)+
@@ -999,12 +1023,14 @@ async function closePos(n,ticket){
   toast('closed #'+ticket+' - '+(j.detail||'ok'),true);refresh()}
  catch(e){toast(e.message,false)}
  finally{delete INFLIGHT['c'+ticket]}}
-async function closeAll(n){
+async function closeAll(n,el){
  if(INFLIGHT['ca'+n])return;INFLIGHT['ca'+n]=true;
+ const b=el||$id('closeTopBtn'+n)||(String(n)==='1'?$id('closeMainBtn1'):null);
+ if(b){b.disabled=true;if(b.classList)b.classList.remove('pop');}
  try{const j=await post('/api/close',{account:+n,symbol:'ALL'});
   toast(j.detail||'close all sent',j.ok);refresh()}
  catch(e){toast(e.message,false)}
- finally{delete INFLIGHT['ca'+n]}}
+ finally{delete INFLIGHT['ca'+n];if(b)b.disabled=false}}
 /* the small pill between ACCOUNT 1 and ACCOUNT 2: closes everything on
    BOTH terminals at once via close.py (one thread per terminal - wall time
    is the slowest terminal, not the sum). Fast: instant ASMR tap + pop,
