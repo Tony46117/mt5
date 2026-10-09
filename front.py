@@ -126,6 +126,20 @@ a{color:var(--blue);text-decoration:none}
   box-shadow:0 0 6px rgba(255,92,92,.35),inset 0 1px 0 rgba(255,92,92,.3)}
 .btn.big:disabled{opacity:.55;cursor:progress;transform:none}
 .btn.big.pop{animation:pop .18s ease}
+.btn.close-top{display:inline-flex;align-items:center;gap:6px;padding:6px 16px;
+  font-size:11px;font-weight:700;letter-spacing:.12em;line-height:1.2;
+  background:linear-gradient(160deg,#2a0e0e,#180808);
+  border:1px solid #5a1a1a;color:#ffb4b4;border-radius:9px;white-space:nowrap;
+  box-shadow:0 1px 6px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,92,92,.15);
+  transition:transform .08s ease,box-shadow .08s ease,background .08s ease,
+  border-color .08s ease,color .08s ease;cursor:pointer}
+.btn.close-top:hover{border-color:#ff5c5c;color:#fff;
+  background:linear-gradient(160deg,#3a1212,#220a0a);
+  box-shadow:0 0 12px rgba(255,92,92,.28),inset 0 1px 0 rgba(255,92,92,.28);
+  transform:translateY(-1px)}
+.btn.close-top:active{transform:scale(.94);
+  box-shadow:0 0 6px rgba(255,92,92,.35),inset 0 1px 0 rgba(255,92,92,.3)}
+.btn.close-top:disabled{opacity:.55;cursor:progress;transform:none}
 @keyframes pop{0%{transform:scale(1)}40%{transform:scale(.9)}100%{transform:scale(1)}}
 /* small cool ORDER button (replaces the old full-width block) */
 .btn.order-mini{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;
@@ -893,7 +907,9 @@ function buildPanel(n){
   '<span class="sub" id="server'+n+'">-</span>'+
   '<span class="sub" id="broker'+n+'">-</span>'+
   '<span class="sub" id="mode'+n+'"></span>'+\n  '<span class="sub"><button class="btn mini danger" onclick="restartTerm('+n+')">RESTART</button></span>'+
-  '<span class="spacer"></span><span class="sub mono" id="cur'+n+'"></span></div>'+
+  '<span class="spacer"></span><span class="sub mono" id="cur'+n+'"></span>'+
+  '<button class="btn close-top danger" id="closeTopBtn'+n+'" onclick="closeAll('+n+')"'+
+  ' title="close every position on account '+n+'">✕ CLOSE</button></div>'+
  '<div style="padding:13px 13px 0"><div class="chips" id="spread'+n+'"></div></div>'+
  '<div style="padding:13px"><div class="kv">'+
   kv('Balance','id:bal'+n)+kv('Equity','id:eq'+n)+kv('Floating P/L','id:pl'+n)+
@@ -925,8 +941,7 @@ function buildPanel(n){
   '<div class="order-wrap"><button class="btn order-mini" id="ordBtn'+n+'" '+
    'onclick="asmrTap(1900);asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
  '</div>'+ '<div class="sect"><h4>Open positions</h4><div class="right">'+
-  '<span class="chip">P/L <b id="pospl'+n+'">-</b></span>'+
-  '<button class="btn mini danger" onclick="closeAll('+n+')">CLOSE ALL</button></div></div>'+
+  '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
   '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
  '<div class="sect"><h4>Scheduled trades</h4><div class="right">'+
   '<span class="chip">ACTIVE <b id="schcnt'+n+'">0</b></span>'+
