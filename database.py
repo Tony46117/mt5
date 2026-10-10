@@ -66,32 +66,54 @@ def _pg_conn():
     finally:
         p.putconn(conn)
 
-_sqlite_conn_obj: sqlite3.Connection | None = None
+_sqlite_local = threading.local()
+_SQLITE_BUSY_MS = 10000
+
+def _new_sqlite_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_sqlite_path, timeout=30,
+                           isolation_level=None,
+                           check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-32768")
+    return conn
+
+def _thread_sqlite_conn() -> sqlite3.Connection:
+    conn = getattr(_sqlite_local, "conn", None)
+    if conn is None:
+        conn = _new_sqlite_conn()
+        _sqlite_local.conn = conn
+        return conn
+    try:
+        conn.execute("SELECT 1")
+    except sqlite3.Error:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        conn = _new_sqlite_conn()
+        _sqlite_local.conn = conn
+    return conn
 
 @contextmanager
 def _sqlite_conn():
-    global _sqlite_conn_obj
-    with _sqlite_lock:
-        conn = _sqlite_conn_obj
-        if conn is None:
-            conn = sqlite3.connect(_sqlite_path, timeout=10,
-                                   isolation_level=None,
-                                   check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA temp_store=MEMORY")
-            conn.execute("PRAGMA cache_size=-32768")
-            _sqlite_conn_obj = conn
+    # Thread-local connections: reads run in parallel across the web panel,
+    # scheduler, metrics and engine threads instead of serializing on one
+    # global lock.  WAL + busy_timeout lets writers queue in SQLite instead
+    # of raising "database is locked" under burst load (50-order batches
+    # spawn 50 concurrent log_fired threads).
+    conn = _thread_sqlite_conn()
+    try:
+        yield conn
+    except Exception:
         try:
-            yield conn
-        except Exception:
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                pass
-            raise
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
 
 @contextmanager
 def _conn():
@@ -103,11 +125,26 @@ def _conn():
             yield conn
 
 def init_db() -> None:
-    if USE_POSTGRES:
-        _init_pg()
-    else:
-        _init_sqlite()
-    _migrate()
+    """Create tables + migrate. Retries on 'database is locked' so several
+    processes importing at once (app + bridge + CLI) do not crash boot."""
+    import time as _t
+    last: Exception | None = None
+    for attempt in range(5):
+        try:
+            if USE_POSTGRES:
+                _init_pg()
+            else:
+                _init_sqlite()
+            _migrate()
+            return
+        except Exception as exc:
+            last = exc
+            if "locked" in str(exc).lower() and attempt < 4:
+                _t.sleep(0.2 * (attempt + 1))
+                continue
+            raise
+    if last is not None:
+        raise last
 
 def _migrate() -> None:
     with _conn() as c:
@@ -567,21 +604,37 @@ def log_fired(schedule_id: int, account: int, pair: str, side: str,
               lot: float, kind: str, ticket: str, ok: bool, detail: str,
               ms: float | None = None) -> None:
     import datetime as dt
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur,
-                """INSERT INTO fired (schedule_id, account, pair, side, lot, kind,
-                   ticket, ok, detail, ms, at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (schedule_id, account, pair, side, lot, kind, ticket,
-                 ok, detail, ms, dt.datetime.now(dt.timezone.utc)))
-        else:
-            _exec(cur,
-                """INSERT INTO fired (schedule_id, account, pair, side, lot, kind,
-                   ticket, ok, detail, ms, at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (schedule_id, account, pair, side, lot, kind, ticket,
-                 1 if ok else 0, detail, ms,
-                 dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")))
+    import time as _t
+    # Fire-and-forget callers spawn dozens of these concurrently; a transient
+    # "database is locked" must not lose the audit row.
+    last: Exception | None = None
+    for attempt in range(4):
+        try:
+            with _conn() as c:
+                cur = c.cursor()
+                if USE_POSTGRES:
+                    _exec(cur,
+                        """INSERT INTO fired (schedule_id, account, pair, side, lot, kind,
+                           ticket, ok, detail, ms, at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (schedule_id, account, pair, side, lot, kind, ticket,
+                         ok, detail, ms, dt.datetime.now(dt.timezone.utc)))
+                else:
+                    _exec(cur,
+                        """INSERT INTO fired (schedule_id, account, pair, side, lot, kind,
+                           ticket, ok, detail, ms, at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (schedule_id, account, pair, side, lot, kind, ticket,
+                         1 if ok else 0, detail, ms,
+                         dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")))
+            return
+        except Exception as exc:
+            last = exc
+            if "locked" in str(exc).lower() and attempt < 3:
+                _t.sleep(0.05 * (attempt + 1))
+                continue
+            log.warning(f"log_fired failed (non-fatal): {exc}")
+            return
+    if last is not None:
+        log.warning(f"log_fired failed after retries (non-fatal): {last}")
 
 def list_fired(limit: int = 50) -> list[dict]:
     with _conn() as c:

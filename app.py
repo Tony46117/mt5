@@ -72,6 +72,16 @@ def add_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     return response
 
+@app.route("/api/<path:_p>", methods=["OPTIONS"])
+def api_preflight(_p):
+    origin = os.getenv("MT5_CORS_ORIGIN", "").strip()
+    if origin and origin != "*":
+        return ("", 204, {"Access-Control-Allow-Origin": origin,
+                          "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Vary": "Origin"})
+    return ("", 204)
+
 @app.get("/")
 def page_dashboard():
     return front.render_dashboard()
@@ -130,11 +140,12 @@ def _acc_panel(acc_snapshot: dict, inst: int) -> dict:
 
 _sys_cache: dict = {}
 _sys_cache_ts: float = 0.0
+_SYS_CACHE_TTL_S = 0.5
 
 def _system() -> dict:
     global _sys_cache, _sys_cache_ts
     now = time.time()
-    if _sys_cache and now - _sys_cache_ts < 1.0:
+    if _sys_cache and now - _sys_cache_ts < _SYS_CACHE_TTL_S:
         return _sys_cache
     sched_alive = bool(getattr(sys.modules[__name__], "_scheduler", None)
                        and getattr(sys.modules[__name__], "_scheduler", None).is_alive())
@@ -387,7 +398,7 @@ def api_accounts():
                     "accounts": {"1": acc1, "2": acc2}})
 
 @app.post("/api/trade")
-@rate_limit(max_requests=30, window=60)
+@rate_limit(max_requests=120, window=60)
 def api_trade():
     d = request.get_json(silent=True) or {}
     try:
@@ -438,7 +449,7 @@ def api_trade():
             return _fail(detail)
         return _ok({"detail": detail, "price": price, "ticket": ticket,
                     "n": 1, "ms": round(order_ms, 1)})
-    mapped = map_symbol(symbol.upper(), account)
+    mapped = map_symbol(symbol.strip(), account)
     commands = [("OPEN", mapped, side, f"{lot:.2f}", "0", "0",
                  str(777001), "py") for _ in range(n)]
     t0 = time.perf_counter()
@@ -477,7 +488,7 @@ def api_trade():
                 "ms": round(order_ms, 1)})
 
 @app.post("/api/order")
-@rate_limit(max_requests=30, window=60)
+@rate_limit(max_requests=120, window=60)
 def api_order():
     """Place a PENDING order: BUY LIMIT / BUY STOP / SELL LIMIT / SELL STOP.
 
@@ -556,7 +567,7 @@ def api_order():
             return _fail(detail)
         return _ok({"detail": detail, "price": fill_price, "ticket": ticket,
                     "type": ptype, "n": 1, "ms": round(order_ms, 1)})
-    mapped = map_symbol(symbol.upper(), account)
+    mapped = map_symbol(symbol.strip(), account)
     p = ptype.upper().replace(" ", "").replace("_", "")
     commands = [("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
                  "0", "0", str(777002), "pend") for _ in range(n)]
@@ -592,7 +603,7 @@ def api_order():
                 "type": ptype, "ms": round(order_ms, 1)})
 
 @app.post("/api/close")
-@rate_limit(max_requests=30, window=60)
+@rate_limit(max_requests=120, window=60)
 def api_close():
     d = request.get_json(silent=True) or {}
     try:
@@ -609,7 +620,8 @@ def api_close():
         if ticket:
             ok, detail = cmd.close_position(ticket)
         else:
-            ok, detail = cmd.close_all(None if symbol in ("", "ALL") else symbol)
+            ok, detail = cmd.close_all(None if symbol in ("", "ALL") else symbol,
+                                       timeout=8.0)
         close_ms = (time.perf_counter() - t0) * 1000.0
         if ticket:
             threading.Thread(target=db.log_fired,
@@ -627,10 +639,11 @@ def api_close():
 def api_close_all():
     """Close ALL positions on BOTH terminals concurrently (close.py)."""
     d = request.get_json(silent=True) or {}
-    pair = str(d.get("symbol") or d.get("pair") or "ALL").strip().upper() or "ALL"
+    raw = str(d.get("symbol") or d.get("pair") or "ALL").strip() or "ALL"
+    pair = None if raw.upper() == "ALL" else raw
     try:
         import close as closer
-        res = closer.close_all_accounts_results(None if pair == "ALL" else pair)
+        res = closer.close_all_accounts_results(pair)
     except Exception as exc:
         return _fail(str(exc), code=500)
     accs = res.get("accounts", {})

@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.70"
+#property version   "1.71"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -407,25 +407,24 @@ void DumpTrades()
               IntegerToString(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)));
    for(int i = 0; i < total; i++)
      {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
-         continue;
-      long   type   = PositionGetInteger(POSITION_TYPE);
-      long   vmul   = (type == POSITION_TYPE_SELL) ? -1 : 1;
-      string sym    = PositionGetString(POSITION_SYMBOL);
-      int    dg     = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-      double volume = PositionGetDouble(POSITION_VOLUME);
-      double vopen  = PositionGetDouble(POSITION_PRICE_OPEN);
+       ulong ticket = PositionGetTicket(i);
+       if(ticket == 0 || !PositionSelectByTicket(ticket))
+          continue;
+       long   type   = PositionGetInteger(POSITION_TYPE);
+       string sym    = PositionGetString(POSITION_SYMBOL);
+       int    dg     = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+       double volume = PositionGetDouble(POSITION_VOLUME);
+       double vopen  = PositionGetDouble(POSITION_PRICE_OPEN);
       double vcur   = PositionGetDouble(POSITION_PRICE_CURRENT);
       double profit = PositionGetDouble(POSITION_PROFIT);
       double swap   = PositionGetDouble(POSITION_SWAP);
       long   msc    = PositionGetInteger(POSITION_TIME_MSC);
       string stype  = (type == POSITION_TYPE_SELL) ? "SELL" : "BUY";
-      FileWrite(handle,
-                IntegerToString((long)ticket),
-                sym,
-                stype,
-                DoubleToString(volume * vmul, 2),
+       FileWrite(handle,
+                 IntegerToString((long)ticket),
+                 sym,
+                 stype,
+                 DoubleToString(volume, 2),
                 DoubleToString(vopen, dg),
                 DoubleToString(vcur, dg),
                 DoubleToString(profit, 2),
@@ -811,9 +810,14 @@ void ExecuteLine(string line)
       int total = PositionsTotal();
       if(total > 0)
         {
-         MqlTradeRequest reqs[];
-         ArrayResize(reqs, total);
-         int nreq = 0;
+         // Synchronous closes with an aggregate reply.  The old async fan-out
+         // returned silently after queueing and Python's single-cid wait
+         // resolved on the FIRST "closed" line - close-all reported success
+         // while most positions were still open (and async failures were
+         // invisible).  One reply, full truth: OK only when everything
+         // matched closed, ERR otherwise so Python retries the remainder.
+         int closed = 0, failed = 0;
+         string firstErr = "";
          for(int i = total - 1; i >= 0; i--)
            {
             ulong ticket = PositionGetTicket(i);
@@ -829,7 +833,9 @@ void ExecuteLine(string line)
                             ? SymbolInfoDouble(psym, SYMBOL_BID)
                             : SymbolInfoDouble(psym, SYMBOL_ASK);
             MqlTradeRequest req;
+            MqlTradeResult  res;
             ZeroMemory(req);
+            ZeroMemory(res);
             req.action       = TRADE_ACTION_DEAL;
             req.symbol       = psym;
             req.position     = ticket;
@@ -837,32 +843,31 @@ void ExecuteLine(string line)
             req.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
             req.price        = NormalizeDouble(price, dg);
             req.deviation    = 20;
-            ENUM_ORDER_TYPE_FILLING f = ProvenFill(psym);
-            if(f == 0) f = FillingFor(psym);
-            req.type_filling = f;
-            reqs[nreq++] = req;
-           }
-         int sent = 0, failed = 0;
-         for(int i = 0; i < nreq; i++)
-           {
-            MqlTradeResult ares;
-            ZeroMemory(ares);
-            if(OrderSendAsync(reqs[i], ares) &&
-               (ares.retcode == TRADE_RETCODE_PLACED ||
-                ares.retcode == TRADE_RETCODE_DONE ||
-                ares.retcode == TRADE_RETCODE_DONE_PARTIAL))
-              {
-               AsyncTrack(ares.request_id, id, false, reqs[i].symbol, reqs[i].volume,
-                          (int)SymbolInfoInteger(reqs[i].symbol, SYMBOL_DIGITS),
-                          (long)reqs[i].type_filling, reqs[i]);
-               sent++;
-              }
+            req.comment      = "closeall";
+            if(SendDealWithFallback(req, res) &&
+               (res.retcode == TRADE_RETCODE_DONE ||
+                res.retcode == TRADE_RETCODE_PLACED ||
+                res.retcode == TRADE_RETCODE_DONE_PARTIAL))
+               closed++;
             else
+              {
                failed++;
+               if(StringLen(firstErr) == 0)
+                  firstErr = "retcode " + IntegerToString((long)res.retcode) +
+                             " " + res.comment;
+              }
            }
-         if(sent == 0)
+         if(failed == 0)
+            AppendOut(id, "OK", "closed " + IntegerToString(closed) +
+                                " failed 0");
+         else if(closed > 0)
+            AppendOut(id, "ERR", "closed " + IntegerToString(closed) +
+                                 " failed " + IntegerToString(failed) +
+                                 (StringLen(firstErr) > 0 ? " " + firstErr : ""));
+         else
             AppendOut(id, "ERR", "no close sent (failed " +
-                              IntegerToString(failed) + ")");
+                                 IntegerToString(failed) + ")" +
+                                 (StringLen(firstErr) > 0 ? " " + firstErr : ""));
 
          return;
         }

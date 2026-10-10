@@ -70,7 +70,7 @@ CLASSIC_PAIRS_RAW = (
 
 CLASSIC_PAIRS = _apply_suffix(CLASSIC_PAIRS_RAW, SYMBOL_SUFFIX_1) if SYMBOL_SUFFIX_1 else CLASSIC_PAIRS_RAW
 
-EXEC_TIMEOUT_SECONDS = float(os.getenv("MT5_EXEC_TIMEOUT", "3.0"))
+EXEC_TIMEOUT_SECONDS = float(os.getenv("MT5_EXEC_TIMEOUT", "8.0"))
 EXEC_PING_TIMEOUT_SECONDS = 1.0
 
 def map_symbol(symbol: str, inst: int) -> str:

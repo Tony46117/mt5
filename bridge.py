@@ -15,7 +15,7 @@ from spot import (
     TERMINALS, MT5_DIR2, read_accounts, read_header, scan_terminals,
     term_running, launch_terminal, restart_terminal, stop_terminal,
     setup_terminal2, install_script, feed_age, scrub_start_cfg,
-    ensure_autotrading, pick_terminal,
+    ensure_autotrading, pick_terminal, restart_in_progress,
 )
 import session
 import accounts as known_accounts
@@ -45,6 +45,12 @@ def _session_accounts() -> dict[int, dict[str, str]]:
 LOGIN_VERIFY_TIMEOUT_S = 90.0
 SCRUB_AFTER_LIVE_S = 8.0
 SYNC_DEAD_S = 45.0
+# A terminal that is freshly booted but not yet logged in (login 0, no
+# currency) is usually still STARTING, not broken: cold wine boots need
+# 60-90 s+ (EA attach, history sync, 20 s+ broker network scan) before the
+# first authorization.  Restarting it at 45 s murders healthy boots in a
+# kill-restart loop that looks exactly like "login takes forever".
+SYNC_HEAL_GRACE_S = 120.0
 # After the session file changes, an intentional login is in flight and the
 # terminal is restarting.  trades.csv still holds the PREVIOUS account for a
 # while, so following it here would adopt the old account back and undo the
@@ -154,21 +160,36 @@ def login_and_boot() -> tuple[bool, list[int]]:
     return all(verify_res.get(i, False) for i in (1, 2)), launched
 
 def header_for(inst: int) -> dict:
+    # Own install tree first: during a login switch the session already
+    # carries the WANT login while the terminal still reports the old one.
+    # Resolving via pick_terminal(want) would miss and fall back to another
+    # terminal's tree.  The terminal's own file is always authoritative for
+    # "what is THIS terminal reporting right now".
+    own = read_header(TERMINALS[inst]["dir"] / "MQL5" / "Files" / "trades.csv")
     login = session.expected_login(inst)
+    if not login:
+        if own:
+            return own
+    elif own and str(own.get("login", "")) == login:
+        return own
+    elif own and own.get("login"):
+        # Own tree reports *something* (old login mid-switch, or a manual
+        # UI switch the session has not adopted yet) - that is still this
+        # terminal's truth; return it so verification/adoption sees reality.
+        # Only fall through to the global pick when the own file is empty.
+        return own
     if login:
         term = pick_terminal(login)
         if term:
             return read_header(term["trades_path"])
     if inst == 1:
-        path = TERMINALS[1]["dir"] / "MQL5" / "Files" / "trades.csv"
-        h = read_header(path)
-        if h:
-            return h
+        if own:
+            return own
         terms = _cached_scan()
         terms = [t for t in terms if t["root"] != MT5_DIR2 / "MQL5"]
         terms.sort(key=lambda t: t["mtime"], reverse=True)
         return terms[0]["header"] if terms else {}
-    return read_header(TERMINALS[2]["dir"] / "MQL5" / "Files" / "trades.csv")
+    return own
 
 class TermState:
     __slots__ = ('inst', 'running', 'age_bucket', 'login', 'last_start',
@@ -227,6 +248,7 @@ class Supervisor:
         self._sess_stamp = session.file_stamp()
         self._sess_changed_at = 0.0
         self._fast_frame = False
+        self._restart_noticed: set[int] = set()
 
     def log(self, text: str) -> None:
         self.events.insert(0, f"{DIM}{now_ts()}{RESET}  {text}")
@@ -280,6 +302,18 @@ class Supervisor:
                 st.running = running
 
             if not running:
+                # An intentional restart (engine login/logout/switch or a
+                # heal) stops the process on purpose: relaunching here
+                # would start a RIVAL instance whose boot config may predate
+                # the switch, and the engine's own launch then no-ops -
+                # the classic "live but stuck on the old login".
+                if restart_in_progress(inst):
+                    if inst not in self._restart_noticed:
+                        self._restart_noticed.add(inst)
+                        self.log(f"terminal {inst} restarting (intentional) - "
+                                 f"supervisor standing by")
+                    continue
+                self._restart_noticed.discard(inst)
                 credless = expected in ("", "?")
                 may_launch = exe_ok and (not credless or st.last_start == 0.0)
                 cooldown = min(RELAUNCH_COOLDOWN_S * (2 ** min(st.launch_fails, 5)), 300.0)
@@ -342,7 +376,7 @@ class Supervisor:
                     st.sync_dead_since = time.monotonic()
                 if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
                         and time.monotonic() - self._sess_changed_at > ADOPT_QUIET_S
-                        and time.monotonic() - st.last_start > GRACE_S
+                        and time.monotonic() - st.last_start > max(GRACE_S, SYNC_HEAL_GRACE_S)
                         and time.monotonic() - st.last_heal > COOLDOWN_S):
                     self.log(f"{YELLOW}terminal {inst} feed live but LOGGED OUT "
                              f"(login 0) / never synchronized - restarting into "

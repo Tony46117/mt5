@@ -39,13 +39,22 @@ WAIT_LOGIN_TIMEOUT_S = 90.0
 FAST_POLL_S = 0.15
 SLOW_POLL_S = 0.4
 FAST_POLL_WINDOW_S = 15.0
+# A freshly launched MT5 under wine needs tens of seconds before it even
+# ATTEMPTS authorization (EA attach + history sync + network scan observed
+# at 20-60 s on cold boots).  Killing or failing the switch inside that
+# window murders healthy boots - the "login takes forever" complaint.
+# So the stuck-terminal shortcut below is gated on boot age: while the
+# process is younger than BOOT_GRACE_S, a live old login (or login 0) just
+# means "still starting".  Past grace, STUCK_LOGIN_S of live-wrong-login
+# fails fast with an actionable message.
+BOOT_GRACE_S = 60.0
 # A live feed (EA writing) that keeps reporting a DIFFERENT real login this
-# long after a restart means MT5 has settled and rejected the switch
+# long AFTER boot grace means MT5 has settled and rejected the switch
 # (wrong password, or server it cannot resolve) - fail fast with an
 # actionable message instead of burning the whole 90 s timeout.  Only
 # counts while the feed is live AND shows a real (non-empty) other login;
 # a logged-out/empty feed means the terminal is still booting/connecting.
-STUCK_LOGIN_S = 60.0
+STUCK_LOGIN_S = 30.0
 # Phase 2 of verification: the EA already reports the wanted login, but MT5
 # has not delivered the trade-account details yet (ACCOUNT_CURRENCY empty,
 # balance 0.00 - typical right after logging into a new trade server such
@@ -137,12 +146,15 @@ class TerminalWorker(threading.Thread):
         self.engine = engine
         self.inst = inst
         self.q: queue.Queue[Op] = queue.Queue()
+        self._current_op: Op | None = None
 
     def run(self) -> None:
         while True:
             op = self.q.get()
+            self._current_op = op
             try:
                 op.state = "running"   # busy was already set at enqueue time
+                op.detail = "starting..."
                 op.detail = self._execute(op)
                 op.state = "done"
                 self.engine.log(f"terminal {self.inst}: {op.op} OK - {op.detail}")
@@ -154,6 +166,7 @@ class TerminalWorker(threading.Thread):
                           f"failed: {exc}")
             finally:
                 op.done_ts = _now_iso()
+                self._current_op = None
                 self.engine._clear_active(self.inst, op)
 
     # ---- individual operations ----
@@ -161,8 +174,13 @@ class TerminalWorker(threading.Thread):
     def _execute(self, op: Op) -> str:
         return getattr(self, f"_do_{op.op}")(**op.args)
 
+    def _progress(self, text: str) -> None:
+        op = self._current_op
+        if op is not None and op.state == "running":
+            op.detail = text
+
     def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S,
-                    server: str = "") -> tuple[dict, float, bool]:
+                    server: str = "", boot_ts: float = 0.0) -> tuple[dict, float, bool]:
         """Two-phase verification that the terminal is in `want`.
 
         Phase 1 waits for the EA feed to report `want` as its login
@@ -182,19 +200,31 @@ class TerminalWorker(threading.Thread):
         sp = _spot()
         t0 = time.monotonic()
         deadline = t0 + timeout
+        boot_age = (time.monotonic() - boot_ts) if boot_ts else float("inf")
+        if boot_ts and boot_age < BOOT_GRACE_S:
+            self._progress(f"booting into {want} "
+                           f"(terminal just launched, giving it "
+                           f"{BOOT_GRACE_S - boot_age:.0f}s to connect...)")
         h: dict = {}
         stuck_since = 0.0
+        last_progress = 0.0
+        self._progress(f"waiting for {want}...")
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
             if str(h.get("login", "")) == want:
                 break
             got = str(h.get("login", ""))
+            # Boot grace: a young process reporting the old login (or
+            # nothing yet) is still starting, NOT stuck.  Only a settled
+            # (past-grace) terminal counts toward the stuck shortcut.
+            past_grace = (not boot_ts
+                          or time.monotonic() - boot_ts >= BOOT_GRACE_S)
             if got and got not in ("0", "?"):
                 try:
                     live = sp.feed_age(self.inst) < 5.0
                 except Exception:
                     live = False
-                if live:
+                if live and past_grace:
                     if not stuck_since:
                         stuck_since = time.monotonic()
                     elif time.monotonic() - stuck_since > STUCK_LOGIN_S:
@@ -204,11 +234,17 @@ class TerminalWorker(threading.Thread):
                             f"(wrong password, or server "
                             f"{server or '?'} unknown to this MT5 install - "
                             f"log in once manually inside MT5, then ADOPT)")
-                else:
+                elif not live or not past_grace:
                     stuck_since = 0.0
             else:
                 stuck_since = 0.0
             elapsed = time.monotonic() - t0
+            if elapsed - last_progress > 2.0:
+                last_progress = elapsed
+                state = (got if got and got not in ("0", "?")
+                         else "logged out / still starting")
+                self._progress(f"waiting for {want}: terminal reports "
+                               f"{state} ({elapsed:.0f}s elapsed)")
             time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
         else:
             h = br.header_for(self.inst)
@@ -216,7 +252,10 @@ class TerminalWorker(threading.Thread):
         got = str(h.get("login", ""))
         if got != want:
             raise EngineError(f"terminal did not reach {want} within "
-                              f"{timeout:.0f}s (reports {got or 'logged out'})")
+                              f"{timeout:.0f}s (reports {got or 'logged out'}"
+                              f"{'' if got and got not in ('0', '?') else ' - MT5 never attempted the login: it may still be booting, or the broker is not answering. Give it one clean attempt, not repeated restarts'}). "
+                              f"If it stays logged out, log in once manually "
+                              f"inside MT5, then ADOPT")
         if h.get("currency"):
             return h, matched_in, True
         sync_deadline = time.monotonic() + SYNC_TIMEOUT_S
@@ -266,6 +305,32 @@ class TerminalWorker(threading.Thread):
                     f"(Alternatively set MT5_AP_{server.upper()} to the "
                     f"broker's host:port.)")
 
+        # Fast path: already there.  A repeat click (or a manual UI switch
+        # the supervisor already adopted) must NOT bounce a healthy
+        # terminal through a full wine reboot - verify in place instead.
+        br = _bridge()
+        try:
+            cur = br.header_for(self.inst)
+        except Exception:
+            cur = {}
+        if str(cur.get("login", "")) == login:
+            accs = session.load()
+            accs[self.inst] = {"login": login, "password": password,
+                               "server": server}
+            session.set_accounts(accs, persist=True)
+            try:
+                known_accounts.remember(login, password, server)
+            except ValueError:
+                pass
+            self._progress(f"already on {login} - verifying sync...")
+            h, matched_in, synced = self._wait_login(login, server=server,
+                                                     boot_ts=0.0)
+            mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")),
+                                         "unknown")
+            return (f"already on {login} @ {server} [{mode}] - verified "
+                    f"without a restart (matched in {matched_in:.0f}s)"
+                    + ("" if synced else " - broker sync pending"))
+
         # write the slot (the other terminal's slot stays untouched)
         prev = session.load()
         accs = session.load()
@@ -278,13 +343,20 @@ class TerminalWorker(threading.Thread):
             pass
 
         # restart the terminal into the fresh credentials, then verify the
-        # EA reports the new login
-        from spot import restart_terminal
+        # EA reports the new login.  The credentials travel explicitly into
+        # the restart (no session re-read inside the launch), so a session
+        # revert racing the restart cannot boot the WRONG account and burn
+        # the whole login timeout "live but stuck on the old login".
+        from spot import restart_terminal, last_launch_ts
+        block = {"login": login, "password": password, "server": server}
         try:
-            if not restart_terminal(self.inst):
+            self._progress(f"restarting terminal {self.inst} into {login}...")
+            if not restart_terminal(self.inst, login_block=block):
                 raise EngineError(f"terminal {self.inst} could not be restarted "
                                   f"for the login")
-            h, matched_in, synced = self._wait_login(login, server=server)
+            h, matched_in, synced = self._wait_login(
+                login, server=server,
+                boot_ts=last_launch_ts(self.inst))
         except Exception:
             # roll the session back so the supervisor does not chase a
             # doomed account with repeated heal-restarts into it
@@ -351,19 +423,25 @@ class TerminalWorker(threading.Thread):
         sp.scrub_start_cfg(self.inst)
         sp.scrub_common_ini_login(self.inst)
         from spot import restart_terminal
-        if not restart_terminal(self.inst):
+        # Explicit empty block: boot logged out even if the session is
+        # rewritten underneath the restart.
+        if not restart_terminal(self.inst, login_block={}):
             raise EngineError(f"terminal {self.inst} could not be restarted "
                               f"after logout (credentials are scrubbed "
                               f"anyway)")
         return f"logged out{f' (was {login})' if login else ''}"
 
     def _do_restart(self) -> str:
-        from spot import restart_terminal
-        if not restart_terminal(self.inst):
+        from spot import restart_terminal, last_launch_ts
+        want = session.expected_login(self.inst)
+        block = dict(session.get(self.inst)) if want else {}
+        self._progress(f"restarting terminal {self.inst}...")
+        if not restart_terminal(self.inst, login_block=block):
             raise EngineError(f"terminal {self.inst} could not be restarted")
         want = session.expected_login(self.inst)
         if want:
-            h, matched_in, synced = self._wait_login(want)
+            h, matched_in, synced = self._wait_login(
+                want, boot_ts=last_launch_ts(self.inst))
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "unknown")
             base = (f"restarted, logged into {want} [{mode}] "
                     f"(matched in {matched_in:.0f}s)")
@@ -476,10 +554,8 @@ class AccountEngine:
             age1 = feed_age_fn(1)
         except Exception:
             age1 = None
-        age2 = age1
         try:
-            if age1 is None:
-                age2 = feed_age_fn(2)
+            age2 = feed_age_fn(2)
         except Exception:
             age2 = None
         ages = {1: age1, 2: age2}

@@ -36,8 +36,9 @@ def close_all_accounts_results(pair: str | None = None) -> dict:
     accounts = read_accounts()
     active = [n for n in (1, 2) if accounts.get(n, {}).get("login")]
     results: dict[int, tuple[bool, str, float]] = {}
-    target = close_account if pair in (None, "ALL") else close_account_pair
-    args_by = (lambda n: (n, results)) if pair in (None, "ALL") \
+    is_all = pair is None or (isinstance(pair, str) and pair.strip().upper() == "ALL")
+    target = close_account if is_all else close_account_pair
+    args_by = (lambda n: (n, results)) if is_all \
         else (lambda n: (n, pair, results))
     threads = [threading.Thread(target=target, args=args_by(n),
                                 daemon=True, name=f"close-all-{n}")
@@ -82,9 +83,10 @@ def main() -> int:
     ap.add_argument("--pair", type=str, default="ALL",
                     help="close only this symbol (e.g. XAUUSD247); default ALL")
     args = ap.parse_args()
-    print(f"Closing {'ALL positions' if args.pair.upper() == 'ALL' else args.pair.upper()} "
+    _pair = args.pair.strip()
+    print(f"Closing {'ALL positions' if _pair.upper() == 'ALL' else _pair} "
           f"across ALL accounts - CONCURRENTLY...")
-    wall_ms = close_all_accounts(args.pair.upper())
+    wall_ms = close_all_accounts(None if _pair.upper() == "ALL" else _pair)
     print(f"\nDone in {wall_ms:.1f} ms wall time.")
     return 0
 

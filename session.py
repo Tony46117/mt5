@@ -66,10 +66,27 @@ def _sanitize_server(login: str, server: str) -> str:
 
 def _machine_key() -> bytes:
     import platform
-    import uuid
-    node = (os.getenv("MT5_MACHINE_KEY", "").strip()
-            or f"{platform.node()}|{uuid.getnode()}|{os.getuid() if hasattr(os, 'getuid') else 0}")
-    return hashlib.sha256(node.encode() + b"|" + _SALT).digest()
+    # Stable across interpreters and processes on this box.  This MUST NOT
+    # use uuid.getnode(): different Python versions enumerate NICs
+    # differently (observed: system python3 sees b0:5c:..., python3.12 sees
+    # 74:d8:...), so a getnode-derived key differs per interpreter - every
+    # cross-interpreter read fails to decrypt, and (with the old
+    # read-path reseed) each failure rewrote session.json, erasing
+    # in-flight account switches within a fraction of a second.  That was
+    # the "terminal 1 login won't switch" bug.
+    override = os.getenv("MT5_MACHINE_KEY", "").strip()
+    if override:
+        basis = override
+    else:
+        try:
+            basis = Path("/etc/machine-id").read_text().strip()
+        except OSError:
+            basis = ""
+        if not basis:
+            import getpass
+            basis = (f"{platform.node()}|{getpass.getuser()}|"
+                     f"{os.getuid() if hasattr(os, 'getuid') else 0}")
+    return hashlib.sha256(basis.encode() + b"|" + _SALT).digest()
 
 def _keystream(key: bytes, n: int) -> bytes:
     out = bytearray()
@@ -131,6 +148,22 @@ def _file_accounts() -> dict[int, dict[str, str]]:
     except OSError:
         return {}
     accounts = _decode(text)
+    if SESSION_FILE.exists() and not accounts and text.strip():
+        # Non-empty file that decodes to nothing almost always means the
+        # file was written under a different machine key (container
+        # recreated without MT5_MACHINE_KEY, or a foreign process wrote
+        # it).  Report it loudly - and NEVER "repair" it here.  Repair
+        # belongs to an explicit login, not to a read path.
+        try:
+            st = SESSION_FILE.stat()
+            extra = f" (size={st.st_size} mtime_ns={st.st_mtime_ns})"
+        except OSError:
+            extra = ""
+        log.warning("session: session.json exists but cannot be decoded with "
+                    "the current machine key - set MT5_MACHINE_KEY to the "
+                    "value used when the session was created, or log in "
+                    "again (one direct --login per terminal restores it). "
+                    "The file is left untouched" + extra)
     # repair any access-point server an older prober left behind, so the
     # terminal is never launched with an unusable server value
     for inst, acc in accounts.items():
@@ -156,7 +189,12 @@ def load() -> dict[int, dict[str, str]]:
         if _MEM is None or key != _CACHE_STAT:
             _MEM = _file_accounts()
             _CACHE_STAT = key
-            if not _MEM and SESSION_FILE.exists():
+            if not _MEM and not SESSION_FILE.exists():
+                # First boot with no session file at all: import the legacy
+                # acc.env credentials (explicit initial seeding only).
+                # An EXISTING-but-undecodable file is never overwritten
+                # here: a concurrent reader must not be able to revert an
+                # in-flight account switch back to stale acc.env content.
                 _seed_from_acc_env()
                 _MEM = _file_accounts()
                 try:

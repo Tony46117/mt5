@@ -53,7 +53,10 @@ def is_always_on_symbol(pair: str) -> bool:
     p = (pair or "").upper()
     return any(m in p for m in ALWAYS_ON_MARKERS)
 HORIZON_CACHE = 0.1
-EXEC_IN_TTL = 15.0
+# Must exceed the longest command round-trip (FIRE_DEADLINE 20 s + retries):
+# sweeping earlier deleted in-flight order files mid-fill and triggered a
+# spurious terminal restart on slow live fills.
+EXEC_IN_TTL = 45.0
 HEAL_COOLDOWN_S = 600.0
 HEAL_BOOT_GRACE_S = 120.0
 TRADING_DAYS = tuple(int(x) for x in
@@ -371,7 +374,9 @@ class SendCommand:
     def open_trade(self, symbol: str, side: str, lot: float,
                    magic: int = 777001, comment: str = "py",
                    timeout: float | None = None) -> tuple[bool, str]:
-        mapped = map_symbol(symbol.upper(), self.inst)
+        # Symbol case is significant (e.g. "Boom 1000 Index") - pass through
+        # exactly as given, only stripping whitespace.
+        mapped = map_symbol(symbol.strip(), self.inst)
         return self.send("OPEN", mapped, side.upper(), f"{lot:.2f}",
                          "0", "0", str(magic), comment, timeout=timeout)
 
@@ -381,7 +386,7 @@ class SendCommand:
         """Place a pending order: type is BUYLIMIT / BUYSTOP / SELLLIMIT /
         SELLSTOP and `price` is the trigger level.  The result detail is
         `price|order_ticket|volume`, same shape as a market fill."""
-        mapped = map_symbol(symbol.upper(), self.inst)
+        mapped = map_symbol(symbol.strip(), self.inst)
         p = ptype.upper().replace(" ", "").replace("_", "")
         return self.send("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
                          "0", "0", str(magic), comment, timeout=timeout)
@@ -391,7 +396,7 @@ class SendCommand:
 
     def close_all(self, symbol: str | None = None,
                   timeout: float | None = None) -> tuple[bool, str]:
-        mapped = map_symbol(symbol.upper(), self.inst) if symbol else "ALL"
+        mapped = map_symbol(symbol.strip(), self.inst) if symbol else "ALL"
         return self.send("CLOSEALL", mapped, timeout=timeout)
 
     def ping(self) -> tuple[bool, str]:
@@ -516,7 +521,10 @@ class FutureTradeScheduler(threading.Thread):
         self.stop_flag = threading.Event()
         self._hz_ts = 0.0
         self._hz_val: float | None = None
-        self._closes: dict[str, dt.datetime] = {}
+        # Keyed by schedule id: two schedules on the same account+symbol with
+        # different close times must each arm their own close.  The old
+        # account:pair key silently dropped every close but the earliest.
+        self._closes: dict[str, tuple[dt.datetime, int, str]] = {}
         self._closes_lock = threading.Lock()
         self._janitor_ts = 0.0
         self._heal_ts = {1: 0.0, 2: 0.0}
@@ -553,20 +561,18 @@ class FutureTradeScheduler(threading.Thread):
             close = now + dt.timedelta(seconds=1)
         if not is_always_on_symbol(sch.get("pair", "")):
             close = self._next_trading_day(close)
-        key = f"{sch['account']}:{sch['pair']}"
+        key = f"sch#{sch['id']}"
         with self._closes_lock:
-            prev = self._closes.get(key)
-            if prev is None or close < prev[0]:
-                self._closes[key] = (close, sch.get("pair", ""))
+            self._closes[key] = (close, int(sch["account"]),
+                                 sch.get("pair", ""))
 
     def _due_closes(self) -> list[tuple[int, str]]:
         now = dt.datetime.now(dt.timezone.utc)
         due: list[tuple[int, str]] = []
         with self._closes_lock:
-            for key, (when, _pair) in list(self._closes.items()):
+            for key, (when, acc, pair) in list(self._closes.items()):
                 if now >= when:
-                    acc_s, pair = key.split(":", 1)
-                    due.append((int(acc_s), pair))
+                    due.append((int(acc), pair))
                     del self._closes[key]
         return due
 
@@ -683,6 +689,24 @@ class FutureTradeScheduler(threading.Thread):
         if self._claim(sch):
             self._fire(sch)
 
+    @staticmethod
+    def _terminal_ready(acc: int) -> tuple[bool, str]:
+        """Is terminal `acc` up and fed enough to take a scheduled fire?
+
+        Checked BEFORE claiming a slot so a reboot/boot window does not eat
+        one-shot schedules: unready terminals leave the slot for the next
+        loop iteration (still bounded by MAX_FIRE_LATE).
+        """
+        try:
+            from spot import term_running, feed_age
+            if not term_running(acc):
+                return False, "terminal not running"
+            if feed_age(acc) > 30.0:
+                return False, "feed stale"
+        except Exception as exc:
+            return False, f"readiness check failed: {exc}"
+        return True, ""
+
     def _fire(self, sch: dict) -> None:
         if (not self._is_trading_day(dt.datetime.now(dt.timezone.utc))
                 and not is_always_on_symbol(sch.get("pair", ""))):
@@ -722,8 +746,9 @@ class FutureTradeScheduler(threading.Thread):
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
         # same broker-symbol mapping as every other order path
-        # (open_trade / open_pending / close_all all map_symbol)
-        mapped = map_symbol(pair.upper(), acc)
+        # (open_trade / open_pending / close_all all map_symbol).
+        # Case is significant ("Boom 1000 Index") - never uppercase.
+        mapped = map_symbol(pair.strip(), acc)
         try:
             from spot import read_spots
             spots = read_spots()
@@ -760,9 +785,23 @@ class FutureTradeScheduler(threading.Thread):
         commands = [("OPEN", mapped, side, f"{lot:.2f}", "0", "0",
                      str(777000 + acc), f"sch#{sch['id']}")
                     for _ in range(n)]
-        t0 = time.perf_counter()
-        results = list(cmd.send_batch(*commands, timeout=FIRE_DEADLINE))
-        fire_ms = (time.perf_counter() - t0) * 1000.0
+        # Retry loop: transient broker rejects (requote/price changed/no
+        # quotes) get a 500 ms retry; partial fills are never retried (that
+        # would duplicate positions).  Total loss still deactivates the slot.
+        results: list[tuple[bool, str]] = []
+        fire_ms = 0.0
+        for attempt in range(1, max(1, RETRY_MAX) + 1):
+            t0 = time.perf_counter()
+            results = list(cmd.send_batch(*commands, timeout=FIRE_DEADLINE))
+            fire_ms = (time.perf_counter() - t0) * 1000.0
+            ok_cnt = sum(1 for ok, _ in results if ok)
+            if ok_cnt > 0 or attempt >= max(1, RETRY_MAX):
+                break
+            first = results[0][1] if results else ""
+            log.warning(f"schedule #{sch['id']} acc{acc} {pair}: open attempt "
+                        f"{attempt}/{RETRY_MAX} failed ({first}) - retry in "
+                        f"{RETRY_DELAY_S * 1000:.0f} ms")
+            time.sleep(RETRY_DELAY_S)
 
         ok_cnt = 0
         blocked_10027 = 0
@@ -853,6 +892,12 @@ class FutureTradeScheduler(threading.Thread):
 
                 claimed: list[dict] = []
                 for sch in db.due_schedules():
+                    ready, why = self._terminal_ready(int(sch.get("account", 0)))
+                    if not ready:
+                        log.warning(f"schedule #{sch['id']} due but {why} - "
+                                    f"slot held for retry (bounded by "
+                                    f"{MAX_FIRE_LATE:.0f}s lateness guard)")
+                        continue
                     if self._claim(sch):
                         claimed.append(sch)
                 if claimed:

@@ -174,8 +174,10 @@ paths and file ownership stay consistent.
 - Web panel: `http://127.0.0.1:8000` - buy/sell buttons, schedules,
   account overview.
 - Scheduled trades are stored with an execution time and a close time.
-  **Those times are UTC**, not your local clock - the panel labels the
-  fields and shows your offset, and `/api/clock` reports both. The
+  Those times are entered in the **machine-local clock** (the same clock
+  shown in the panel top bar and the schedule dials) and stored as UTC -
+  the panel labels the fields and shows your offset, and `/api/clock`
+  reports both. The
   executor fires opens to the planned second (commands are queued
   slightly ahead so fills land on the second), then closes them
   automatically. 24/7 symbols (anything with `247`, Boom/Crash, Deriv

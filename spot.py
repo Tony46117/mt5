@@ -266,34 +266,40 @@ def _any_bridge_fresh(timeout_s: float = 5.0) -> bool:
         time.sleep(0.25)
     return False
 
+FEED_AGE_CACHE_TTL_S = 0.5
+_TERM_RUNNING_DEFAULT_TTL_S = 0.5
+
 def feed_age(inst: int = 1) -> float:
     """Seconds since THIS terminal's EA last wrote a feed file.
 
-    Scoped to the terminal's own install tree.  The old version scanned
-    every terminal's files and returned the global newest, so a dead
-    terminal still read LIVE while its sibling was up - the supervisor,
-    the health endpoint and the dashboard could not see a one-sided
-    feed death.  Falls back to the global scan when the install tree
-    holds no feed files at all (e.g. a non-portable setup).
+    Scoped to the terminal's own install tree.  A dead terminal must read
+    STALE even while its sibling is live, or the supervisor, health
+    endpoint and dashboard cannot see a one-sided feed death.  The global
+    scan fallback only applies when the install tree itself is absent
+    (non-portable setup) - never when the tree exists but holds no fresh
+    files.
     """
     now = time.time()
     cached = _FEED_AGE_CACHE.get(inst)
-    if cached and now - cached[0] < 1.0:
+    if cached and now - cached[0] < FEED_AGE_CACHE_TTL_S:
         return cached[1]
     try:
         own = TERMINALS[inst]["dir"] / "MQL5" / "Files"
+    except (KeyError, TypeError):
+        own = None
+    if own is not None and own.is_dir():
         newest = 0.0
         for name in ("spots.csv", "trades.csv", "candles.csv"):
             try:
                 newest = max(newest, (own / name).stat().st_mtime)
             except OSError:
                 pass
-        if newest:
-            age = now - newest
-            _FEED_AGE_CACHE[inst] = (now, age)
-            return age
-    except (KeyError, TypeError):
-        pass
+        # Tree exists: its own freshness is the answer (999 = dead), even
+        # if the sibling is live.  Falling back to the global newest here
+        # is exactly what masked one-sided deaths.
+        age = now - newest if newest else 999.0
+        _FEED_AGE_CACHE[inst] = (now, age)
+        return age
     roots = data_roots()
     files: list[Path] = []
     for root in roots:
@@ -328,7 +334,7 @@ def wineserver_bin() -> str:
             return ws
     return "/usr/bin/wineserver"
 
-def term_running(inst: int = 1, max_age: float = 1.0) -> bool:
+def term_running(inst: int = 1, max_age: float = 0.5) -> bool:
     cached = _TERM_RUNNING_CACHE.get(inst)
     now = time.monotonic()
     if cached and now - cached[0] < max_age:
@@ -468,12 +474,23 @@ def force_profile(inst: int = 1) -> None:
     if new != text:
         _write_ini_atomic(ini, new)
 
-def _write_start_cfg(inst: int, with_login: bool = True) -> None:
+def _write_start_cfg(inst: int, with_login: bool = True,
+                     login_block: dict | None = None) -> str:
+    """Write the terminal's boot config.  Returns the login written ('' if
+    the login block was skipped).
+
+    `login_block` carries the intended credentials explicitly so a restart
+    cannot boot the wrong account when the on-disk session is reverted or
+    stale underneath it (the exact failure behind "live but stuck on the
+    old login" after a switch).  When omitted, the session is read as
+    before.
+    """
     ini = TERMINALS[inst]["ini"]
+    written = ""
     try:
         common = ""
         if with_login:
-            a = read_accounts().get(inst, {})
+            a = dict(login_block) if login_block else read_accounts().get(inst, {})
             lg = str(a.get("login", "")).strip()
             if lg in ("", "0", "?", "LOGIN") or not lg.isdigit():
                 log.warning(f"terminal {inst}: session login {lg!r} is not a "
@@ -512,8 +529,11 @@ def _write_start_cfg(inst: int, with_login: bool = True) -> None:
         finally:
             os.close(fd)
         os.chmod(ini, 0o600)
+        if with_login:
+            written = str(a.get("login", "")).strip()
     except OSError:
         pass
+    return written
 
 def scrub_start_cfg(inst: int) -> None:
     ini = TERMINALS[inst]["ini"]
@@ -964,17 +984,56 @@ def shrink_all_mt5_windows(do_minimize: bool = True) -> int:
             handled += 1
     return handled
 
-def minimize_terminal(inst: int, tries: int = 45,
-                      delay: float = 1.0) -> None:
+def _sync_minimize_once(inst: int, do_minimize: bool = True,
+                        timeout: float = 30.0) -> int:
+    """Block until an MT5 window maps, then shrink/minimize it at once.
+
+    `xdotool search --sync` sleeps inside the X server instead of polling,
+    so this wakes the instant a matching window appears and the terminal
+    never visibly sits fullscreen.  Returns windows handled.
+    """
+    xdo, env = _xdo_env()
+    if not xdo:
+        return 0
+    try:
+        out = subprocess.run(
+            [xdo, "search", "--sync", "--onlyvisible", "--limit", "4",
+             "--name", "MetaTrader|MetaQuotes|HFMarkets|HFM"],
+            capture_output=True, text=True, timeout=timeout + 5,
+            env=env).stdout.split()
+    except Exception:
+        return 0
+    handled = 0
+    L, T, R, B = window_geom(inst)
+    for wid in out:
+        try:
+            if shrink_mt5_window(wid, L, T, R - L, B - T, env, do_minimize):
+                handled += 1
+        except Exception:
+            pass
+    if not handled:
+        try:
+            handled = _enforce_small_windows_once(inst, do_minimize)
+        except Exception:
+            pass
+    return handled
+
+def minimize_terminal(inst: int, tries: int = 60,
+                      delay: float = 0.5) -> None:
     """Shrink terminal `inst` to its small slot as soon as it appears.
 
-    The MT5 window shows up seconds after launch and can re-maximize on
-    login, so this retries for ~45 s and re-pins a few times even after
-    the first hit.  Purely cosmetic - never raises, never blocks.
+    The worker first blocks in `xdotool search --sync` so the window is
+    caught and minimized the instant it maps (no fullscreen flash), then
+    keeps re-pinning on a tight loop because MT5 re-shows/re-maximizes
+    around login.  Purely cosmetic - never raises, never blocks.
     """
     keep = os.getenv("MT5_KEEP_WINDOWS", "") == "1"
 
     def _worker() -> None:
+        try:
+            _sync_minimize_once(inst, do_minimize=not keep, timeout=30.0)
+        except Exception:
+            pass
         hits = 0
         for i in range(max(1, tries)):
             try:
@@ -982,7 +1041,7 @@ def minimize_terminal(inst: int, tries: int = 45,
                     hits += 1
                     log.debug(f"terminal {inst}: window shrunk small "
                               f"({hits}x)")
-                    if hits >= 3:
+                    if hits >= 5:
                         return
                 elif hits:
                     # window was small, disappeared (restart?) - keep watching
@@ -1000,8 +1059,26 @@ def minimize_terminal(inst: int, tries: int = 45,
                      name=f"minimize-t{inst}").start()
 
 def launch_terminal(inst: int = 1, jitter: float | None = None,
-                    with_login: bool = True) -> None:
-    slot = read_accounts().get(inst, {})
+                    with_login: bool = True,
+                    login_block: dict | None = None,
+                    allow_when_restarting: bool = False) -> bool:
+    """Launch terminal `inst`.  Returns True when a launch was issued AND
+    the boot config carries the intended login.
+
+    `login_block` bypasses the session read for the boot credentials (see
+    _write_start_cfg) and the written Login= is verified before the
+    process starts: launching MT5 with the wrong account's config is
+    worse than not launching at all.  Launches that would rival an
+    in-flight intentional restart are refused unless `allow_when_restarting`
+    (set only by restart_terminal, which owns the marker).
+    """
+    if not allow_when_restarting and restart_in_progress(inst):
+        log.info(f"terminal {inst}: launch skipped - a restart is already "
+                 f"in flight (not launching a rival instance)")
+        return False
+    # NOTE: `is not None` (not truthiness): an explicit empty block means
+    # "boot logged out" and must NOT fall back to reading the session.
+    slot = dict(login_block) if login_block is not None else read_accounts().get(inst, {})
     slot_login = str(slot.get("login", "")).strip()
     if slot_login in ("", "0", "?", "LOGIN") or not slot_login.isdigit():
         slot = {}
@@ -1015,7 +1092,15 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     if not wallet_reconnect:
         scrub_common_ini_login(inst)
     repair_common_ini(inst)
-    _write_start_cfg(inst, with_login=with_login)
+    written = _write_start_cfg(inst, with_login=with_login,
+                               login_block=dict(login_block) if login_block is not None else None)
+    if login_block is not None and with_login and not wallet_reconnect:
+        want = str(login_block.get("login", "")).strip()
+        if written != want:
+            log.error(f"terminal {inst}: boot config carries login "
+                      f"{written!r}, want {want!r} - NOT launching into the "
+                      f"wrong account")
+            return False
     ensure_autotrading(inst)
     scrub_terminal2_credentials()
     sanitize_charts(inst)
@@ -1042,10 +1127,12 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    _LAST_LAUNCH_TS[inst] = time.monotonic()
     # ALWAYS enforce the small window (both terminals).  MT5_KEEP_WINDOWS=1
     # only skips the minimize step - the resize-to-small still runs so no
     # terminal ever sits fullscreen covering the screen.
     minimize_terminal(inst)
+    return True
 
 def server_known(inst: int, server: str) -> bool:
     """Has this terminal's MT5 install ever seen trade server `server`?
@@ -1131,6 +1218,85 @@ def server_known_anywhere(server: str) -> bool:
         pass
     return False
 
+RESTART_MARK_TTL_S = 180.0
+_LAST_LAUNCH_TS: dict[int, float] = {}
+
+def last_launch_ts(inst: int) -> float:
+    """Monotonic timestamp of this box's most recent launch of `inst`
+    (0.0 if unknown - e.g. started before this process).  Lets waiters
+    grant a booting terminal patience instead of mistaking a slow cold
+    boot for a rejected login."""
+    return _LAST_LAUNCH_TS.get(inst, 0.0)
+
+def restart_marker_path(inst: int) -> Path:
+    return TERMINALS[inst]["ini"].parent / f"restarting.{inst}.mark"
+
+def mark_restart_begin(inst: int) -> None:
+    try:
+        p = restart_marker_path(inst)
+        p.write_text(f"{time.time():.3f}\n{os.getpid()}\n", encoding="ascii")
+    except OSError as exc:
+        log.debug(f"terminal {inst}: restart marker write skipped: {exc}")
+
+def mark_restart_end(inst: int) -> None:
+    try:
+        restart_marker_path(inst).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def restart_in_progress(inst: int, ttl: float = RESTART_MARK_TTL_S) -> bool:
+    """Is an intentional restart of `inst` currently in flight?
+
+    The supervisor's DOWN-relaunch must stand down while the account
+    engine (or a heal) is stopping/relaunching a terminal on purpose -
+    otherwise the supervisor launches a RIVAL instance mid-restart,
+    its boot config (read from a stale session view) wins, and the
+    engine burns its whole login timeout "live but stuck on the old
+    login".  Cross-process via a small marker file next to the start
+    configs; stale markers expire via TTL so a crashed restart cannot
+    suppress healing forever.
+    """
+    try:
+        text = restart_marker_path(inst).read_text(encoding="ascii",
+                                                   errors="replace")
+        age = time.time() - float(text.split()[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    if age < ttl:
+        return True
+    mark_restart_end(inst)
+    return False
+
+def _terminal_pids(inst: int) -> set[int]:
+    """Live PIDs of terminal `inst` (fresh pgrep, never cached).
+
+    Used to prove a restart actually cycled the process: if every PID
+    from before the stop is still alive afterwards, the "restart" never
+    happened and reporting success would leave the old login in place.
+    """
+    try:
+        pat = re.escape(TERMINALS[inst]["dir"].name) + r"[\\/]+terminal64\.exe"
+        r = subprocess.run(["pgrep", "-f", pat],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return set()
+    if r.returncode != 0:
+        return set()
+    out: set[int] = set()
+    for tok in r.stdout.split():
+        try:
+            out.add(int(tok))
+        except ValueError:
+            continue
+    # pgrep -f can match our own short-lived wrapper shell when the
+    # pattern literal appears in its command line - never count ourselves.
+    out.discard(os.getpid())
+    try:
+        out.discard(os.getppid())
+    except OSError:
+        pass
+    return out
+
 def ensure_terminal(inst: int = 1) -> bool:
     exe = TERMINALS[inst]["dir"] / "terminal64.exe"
     if not exe.exists():
@@ -1166,23 +1332,61 @@ def stop_terminal(inst: int = 1) -> bool:
     except Exception:
         pass
     time.sleep(2)
-    return not term_running(inst)
+    # Final verdict must be UNCACHED: a cached "running" from before the
+    # kill would falsely report failure (and a cached "stopped" would
+    # falsely report success while the old process still holds the login).
+    return not term_running(inst, max_age=0)
 
-def restart_terminal(inst: int = 1) -> bool:
+def restart_terminal(inst: int = 1,
+                     login_block: dict | None = None) -> bool:
+    """Stop + relaunch terminal `inst` into its intended account.
+
+    `login_block` ({"login","password","server"}) is written into the boot
+    config verbatim instead of re-reading the session deep inside the
+    launch - the engine passes the credentials it just stored, so a
+    session revert racing the restart cannot boot the WRONG account.
+
+    The whole stop->launch gap is covered by a restart marker so the
+    supervisor never launches a rival instance mid-restart, and success
+    requires proof the process actually cycled (no pre-stop PID may
+    survive): a "successful" restart that leaves the old process running
+    is exactly how a switch ends "live but stuck on the old login".
+    """
     log.info(f"restarting MT5 terminal {inst}...")
-    stop_terminal(inst)
-    if term_running(inst):
-        log.error(f"could not stop terminal {inst} - close it manually and retry")
-        return False
-    launch_terminal(inst)
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        if term_running(inst):
-            log.info(f"terminal {inst} is up")
-            return True
-        time.sleep(0.5)
-    log.error(f"terminal {inst} did not start")
-    return False
+    mark_restart_begin(inst)
+    try:
+        before = _terminal_pids(inst)
+        stop_terminal(inst)
+        if term_running(inst, max_age=0):
+            log.error(f"could not stop terminal {inst} - close it manually and retry")
+            return False
+        survivors = _terminal_pids(inst) & before
+        if survivors:
+            log.error(f"terminal {inst}: old PIDs {sorted(survivors)} survived "
+                      f"the stop - refusing to launch a rival instance that "
+                      f"would no-op while the survivor keeps the old login")
+            return False
+        if not launch_terminal(inst, login_block=login_block,
+                               allow_when_restarting=True):
+            return False
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if term_running(inst, max_age=0):
+                break
+            time.sleep(0.5)
+        else:
+            log.error(f"terminal {inst} did not start")
+            return False
+        after = _terminal_pids(inst)
+        if before and after and after <= before:
+            log.error(f"terminal {inst}: no new process appeared "
+                      f"(PIDs still {sorted(after)}) - the old instance "
+                      f"survived, login unchanged")
+            return False
+        log.info(f"terminal {inst} is up")
+        return True
+    finally:
+        mark_restart_end(inst)
 
 def setup_terminal2() -> bool:
     d2 = TERMINALS[2]["dir"]
