@@ -563,6 +563,32 @@ class AccountEngine:
                 got = ""
             synced_acct = bool(h and h.get("currency"))
             verified = bool(want and got == want)
+            syncing = bool(verified and not synced_acct)
+            # Stalled sync: matched login but the broker hasn't delivered
+            # account details for 10+ minutes (unreachable server rather
+            # than a slow sync).  Tracked in shared kv so every process
+            # agrees; touched only while actually syncing.
+            stalled = False
+            sync_age_s = None
+            skey = f"sync_since_{inst}_{want}" if want else ""
+            if skey:
+                try:
+                    import database as _db
+                    if syncing:
+                        since = _db.kv_get(skey) or 0
+                        try:
+                            since = float(since)
+                        except (TypeError, ValueError):
+                            since = 0.0
+                        if since <= 0:
+                            since = time.time()
+                            _db.kv_set(skey, since)
+                        sync_age_s = round(time.time() - since, 1)
+                        stalled = sync_age_s > 600.0
+                    elif _db.kv_get(skey):
+                        _db.kv_set(skey, 0.0)
+                except Exception:
+                    pass
             mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "") if h else ""
             try:
                 from spot import server_known as _srv_known
@@ -588,7 +614,9 @@ class AccountEngine:
                 "equity": h.get("equity", "") if h else "",
                 "feed_age_s": round(age, 1) if age is not None else None,
                 "verified": verified,
-                "syncing": bool(verified and not synced_acct),
+                "syncing": syncing,
+                "stalled": stalled,
+                "sync_age_s": sync_age_s,
                 "server_known": srv_known,
                 "running": running,
             })

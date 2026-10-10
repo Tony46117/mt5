@@ -195,7 +195,7 @@ class TermState:
     __slots__ = ('inst', 'running', 'age_bucket', 'login', 'last_start',
                  'last_heal', 'last_check', 'ever_session', 'header',
                  'header_ts', 'launch_fails', 'heal_fails',
-                 'sync_dead_since')
+                 'sync_dead_since', 'heal_sync_fails')
 
     def __init__(self, inst: int):
         self.inst = inst
@@ -211,6 +211,7 @@ class TermState:
         self.launch_fails = 0
         self.heal_fails = 0
         self.sync_dead_since = 0.0
+        self.heal_sync_fails = 0
 
     def bucket(self) -> str:
         if not self.running:
@@ -377,7 +378,8 @@ class Supervisor:
                 if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
                         and time.monotonic() - self._sess_changed_at > ADOPT_QUIET_S
                         and time.monotonic() - st.last_start > max(GRACE_S, SYNC_HEAL_GRACE_S)
-                        and time.monotonic() - st.last_heal > COOLDOWN_S):
+                        and time.monotonic() - st.last_heal > COOLDOWN_S
+                        and st.heal_sync_fails < 3):
                     self.log(f"{YELLOW}terminal {inst} feed live but LOGGED OUT "
                              f"(login 0) / never synchronized - restarting into "
                              f"session account {expected}{RESET}")
@@ -386,9 +388,23 @@ class Supervisor:
                         st.last_start = time.monotonic()
                         st.running = True
                     st.heal_fails += 1
+                    st.heal_sync_fails += 1
                     st.sync_dead_since = 0.0
+                    if st.heal_sync_fails >= 3:
+                        import re as _re
+                        srv = accs.get(inst, {}).get("server", "") or "?"
+                        ap_key = ("MT5_AP_"
+                                  + _re.sub(r"\W+", "_", srv).upper().strip("_"))
+                        self.log(f"{RED}terminal {inst} still unsynced after 3 "
+                                 f"restarts - auto-heal standing down (no more "
+                                 f"reboots). Get {srv} onboarded: log in once "
+                                 f"manually inside MT5, then ADOPT (or set "
+                                 f"{ap_key}=host:port and restart).{RESET}")
+                        log.error(f"terminal {inst}: sync-heal capped - needs "
+                                  f"manual onboarding of {srv}")
             else:
                 st.sync_dead_since = 0.0
+                st.heal_sync_fails = 0
 
             if time.monotonic() - st.last_check > (1.0 if (not st.login or st.login != expected) else 5.0):
                 st.last_check = time.monotonic()
