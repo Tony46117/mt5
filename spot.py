@@ -92,6 +92,68 @@ def trades_csv_paths() -> list[Path]:
 def candles_csv_paths() -> list[Path]:
     return [root / "Files" / "candles.csv" for root in data_roots()]
 
+# cache is keyed on the file's (mtime_ns, size), so an unchanged catalogue
+# is never re-parsed no matter how often the prober asks for it.  The last
+# good copy is only served for SYMBOL_CAT_STALE_S once the file stops being
+# readable, so a stopped/removed terminal cannot report its old broker's
+# symbols forever.
+_SYMBOL_CAT_CACHE: dict[int, tuple[tuple | None, dict, float]] = {}
+SYMBOL_CAT_STALE_S = 120.0
+
+def catalogue_path(inst: int) -> Path:
+    """The symbols.csv THIS terminal writes (never a sibling's)."""
+    return exec_in_path(inst) / "symbols.csv"
+
+def read_symbol_catalogue(inst: int) -> dict[str, list[str]]:
+    """Every symbol `inst`'s account can see, as {broker_symbol: fields}.
+
+    Written by the EA (symbols.csv) with the same field layout a PROBE
+    reply carries - name, digits, filling mode, execution mode, trade
+    mode, order mode, stops, freeze, volume min/max/step, spread,
+    contract size, tick value, tick size, bid, ask.  This is the whole
+    quote universe (Boom/Crash/Jump/Volatility on Deriv, cent variants,
+    suffixed ECN pairs, ...), not just the watchlist in spots.csv, and it
+    costs no exec round trips to read.
+
+    Only the terminal's OWN file is read (a sibling terminal's catalogue
+    lists an entirely different broker's symbols) and it is re-parsed
+    only when it actually changes.
+    """
+    path = catalogue_path(inst)
+    try:
+        st = path.stat()
+        stamp: tuple | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    now = time.monotonic()
+    cached = _SYMBOL_CAT_CACHE.get(inst)
+    if cached and cached[0] == stamp and stamp is not None:
+        return cached[1]                    # unchanged since the last read
+    rows = _parse_catalogue(path) if stamp else {}
+    if not rows and cached and now - cached[2] < SYMBOL_CAT_STALE_S:
+        # torn read (EA mid-rewrite), or the file went away a moment ago -
+        # keep serving the last good copy, but only briefly
+        return cached[1]
+    # NOTE: never fall back to another install's symbols.csv.  The sibling
+    # terminal trades a different broker, so its catalogue is a completely
+    # different symbol universe - serving it here would silently report the
+    # wrong broker's quotes.  No file (or a stale one) means "unknown".
+    _SYMBOL_CAT_CACHE[inst] = (stamp, rows, now)
+    return rows
+
+def _parse_catalogue(path: Path) -> dict[str, list[str]]:
+    try:
+        raw = path.read_text(encoding="cp1252", errors="replace")
+    except OSError:
+        return {}
+    rows: dict[str, list[str]] = {}
+    for line in raw.splitlines():
+        parts = [q.strip() for q in line.split("\t")]
+        if len(parts) < 15 or not parts[0]:
+            continue
+        rows[parts[0]] = parts
+    return rows
+
 def exec_in_path(inst: int = 1) -> Path:
     return _exec_dir(inst)
 
@@ -809,6 +871,74 @@ def purge_exec_channel(inst: int) -> None:
                     pass
     except OSError as exc:
         log.debug(f"terminal {inst}: exec purge skipped: {exc}")
+
+def last_auth_failure(inst: int, login: str, since: float = 0.0) -> str:
+    """Tail MT5's own journal for a broker AUTHORIZATION REJECTION of
+    `login` at or after `since` (wall-clock epoch).  Returns the broker's
+    line, or '' when the login was never refused.
+
+    This is how a bad password / wrong server is reported in seconds
+    instead of looking like a terminal that "is still syncing" for 90 s:
+    MT5 logs `'<login>': authorization on <server> failed (Invalid
+    account)` the moment the trade server says no.
+    """
+    login = str(login or "").strip()
+    if not login:
+        return ""
+    try:
+        logs = sorted((TERMINALS[inst]["dir"] / "logs").glob("*.log"),
+                      key=lambda p: p.stat().st_mtime)[-2:]
+    except (OSError, KeyError, TypeError):
+        return ""
+    needle = f"'{login}'"
+    for path in reversed(logs):
+        try:
+            with open(path, "rb") as fh:
+                # the BOM lives at the START of the file, never at the tail
+                # we read - checking raw[:2] after seeking therefore always
+                # picked the wrong codec and decoded UTF-16 into noise
+                head = fh.read(2)
+                fh.seek(0, 2)
+                size = fh.tell()
+                start = max(0, size - 131072)
+                if head == b"\xff\xfe" and start % 2:   # keep UTF-16 alignment
+                    start += 1
+                fh.seek(start)
+                raw = fh.read()
+        except OSError:
+            continue
+        txt = raw.decode("utf-16-le" if head == b"\xff\xfe" else "utf-8",
+                         errors="replace")
+        day = 0.0
+        m = re.match(r"(\d{4})(\d{2})(\d{2})", path.stem)
+        if m:
+            try:
+                day = dt.datetime(int(m.group(1)), int(m.group(2)),
+                                  int(m.group(3))).timestamp()
+            except ValueError:
+                day = 0.0
+        for line in reversed(txt.splitlines()):
+            low = line.lower()
+            if "authorization" not in low or "failed" not in low:
+                continue
+            if needle not in line:
+                continue
+            parts = line.split("\t")
+            stamp = 0.0
+            for field in parts:
+                field = field.strip()
+                if re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3}$", field):
+                    try:
+                        t = dt.datetime.strptime(field, "%H:%M:%S.%f")
+                    except ValueError:
+                        break
+                    stamp = (day + t.hour * 3600 + t.minute * 60 + t.second
+                             + t.microsecond / 1e6)
+                    break
+            if since and stamp and stamp < since - 2.0:
+                continue                          # an older attempt
+            return parts[-1].strip() if parts else line.strip()
+    return ""
 
 def _xdo_env() -> tuple[str | None, dict]:
     xdo = shutil.which("xdotool")

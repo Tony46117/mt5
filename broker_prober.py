@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import threading
 import time
 
@@ -20,11 +21,43 @@ EXEC_NAMES = {0: "REQUEST", 1: "INSTANT", 2: "MARKET", 3: "EXCHANGE", 4: "SYNCHR
 
 PROBE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 3.0
-# Probe the whole board, not a sample: every quoted symbol the account
-# exposes (live and demo alike), so scheduling validation and the panel
-# see each account's full tradeable universe.
-MAX_PROBE_SYMBOLS = 120
+# Probe the whole board, not a sample: every symbol the account exposes
+# (live and demo alike), so scheduling validation and the panel see each
+# account's full tradeable universe.  The cap only exists so a pathological
+# catalogue (thousands of expiry CFDs) cannot flood the log.
+MAX_PROBE_SYMBOLS = int(os.getenv("MT5_MAX_PROBE_SYMBOLS", "2000"))
 PROBE_CHUNK = 30
+
+def _field(fields: list[str], i: int) -> str:
+    return fields[i] if len(fields) > i else ""
+
+def _cat_quoted(fields: list[str]) -> bool:
+    """Does this catalogue row carry a live quote right now?"""
+    try:
+        return float(_field(fields, 15)) > 0.0
+    except ValueError:
+        return False
+
+def catalogue_symbols_for(inst: int) -> list[str]:
+    """Every symbol this account can see, broker-quoted ones first.
+
+    Comes from the EA's full catalogue (symbols.csv) - the account's
+    complete quote universe, including Deriv's Boom/Crash/Jump/Volatility
+    indices, cent-account variants and every broker-specific suffix - and
+    falls back to the live watchlist (spots.csv) and then to the classic
+    pairs.  No exec round trips: the terminal writes this file itself.
+    """
+    try:
+        from spot import read_symbol_catalogue
+        cat = read_symbol_catalogue(inst)
+    except Exception:
+        cat = {}
+    if cat:
+        quoted = [s for s, f in cat.items() if _cat_quoted(f)]
+        quoted_set = set(quoted)
+        rest = [s for s in cat if s not in quoted_set]
+        return (quoted + rest)[:MAX_PROBE_SYMBOLS]
+    return list(probe_symbols_for(inst))
 
 def probe_symbols_for(inst: int) -> tuple[str, ...]:
     """Every quoted symbol on this terminal (classic pairs first), capped
@@ -43,6 +76,55 @@ def probe_symbols_for(inst: int) -> tuple[str, ...]:
         pass
     # Fallback: use classic pairs for this terminal
     return tuple(classic_pairs_for(inst)[:MAX_PROBE_SYMBOLS])
+
+def parse_probe_fields(fields: list[str]) -> dict | None:
+    """PROBE reply / catalogue row -> one capability dict.
+
+    Both sources describe a symbol with the same field layout, so the
+    prober's view of the broker is identical whether the data arrived
+    from a PROBE round trip or from the terminal's own catalogue.
+    """
+    if len(fields) < 12:
+        return None
+    try:
+        info = {
+            "symbol": fields[0],
+            "digits": int(fields[1]),
+            "filling_flags": int(fields[2]),
+            "trade_exemode": int(fields[3]),
+            "trade_mode": int(fields[4]),
+            "order_mode": int(fields[5]),
+            "stops_level": int(fields[6]),
+            "freeze_level": int(fields[7]),
+            "volume_min": float(fields[8]),
+            "volume_max": float(fields[9]),
+            "volume_step": float(fields[10]),
+            "spread_pts": int(float(fields[11])),
+        }
+    except ValueError:
+        return None
+    # EA v1.73+ appends contract/tick economics; older EAs send 12 fields
+    # and simply omit these (scheduling validation degrades gracefully to
+    # volume limits).
+    if len(fields) >= 15:
+        try:
+            info["contract_size"] = float(fields[12])
+            info["tick_value"] = float(fields[13])
+            info["tick_size"] = float(fields[14])
+        except ValueError:
+            pass
+    # catalogue rows (EA v1.75+) also carry the live quote
+    if len(fields) >= 17:
+        try:
+            info["bid"] = float(fields[15])
+            info["ask"] = float(fields[16])
+        except ValueError:
+            pass
+    info["filling_allowed"] = FILLING_NAMES.get(info["filling_flags"], "RETURN")
+    info["best"] = best_filling_from_flags(info["filling_flags"])
+    info["trade_mode_name"] = MODE_NAMES.get(info["trade_mode"], str(info["trade_mode"]))
+    info["exec_mode_name"] = EXEC_NAMES.get(info["trade_exemode"], str(info["trade_exemode"]))
+    return info
 
 ACCESS_POINTS: dict[str, list[str]] = {
     "HFMarketsKE-Demo2": [
@@ -76,17 +158,24 @@ def _journal_fill_ms(inst: int, limit: int = 12) -> list[float]:
         return []
     try:
         with open(logs[-1], "rb") as fh:
+            # the encoding BOM sits at the file START, so read it there -
+            # checking raw[:2] at the tail offset never sees it and silently
+            # decoded UTF-16 into noise (fill times always came back empty)
+            head = fh.read(2)
             try:
                 fh.seek(0, 2)
                 size = fh.tell()
-                fh.seek(max(0, size - 65536))
+                start = max(0, size - 65536)
+                if head == b"\xff\xfe" and start % 2:
+                    start += 1
+                fh.seek(start)
             except OSError:
                 pass
             raw = fh.read()
     except OSError:
         return []
-    txt = (raw.decode("utf-16-le", errors="replace")
-           if raw[:2] == b"\xff\xfe" else raw.decode(errors="replace"))
+    txt = raw.decode("utf-16-le" if head == b"\xff\xfe" else "utf-8",
+                     errors="replace")
     vals = [float(m.group(1)) for m in re.finditer(
         r"done in ([0-9.]+) ms", txt)]
     return vals[-limit:]
@@ -143,6 +232,10 @@ class BrokerProber:
     def __init__(self):
         self._lock = threading.Lock()
         self._data: dict[int, dict[str, dict]] = {}
+        # case-insensitive index: brokers such as Deriv name symbols with
+        # spaces and mixed case ("Boom 1000 Index"), so an uppercase lookup
+        # against the broker-exact key would never hit
+        self._upper: dict[int, dict[str, dict]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_pass: dict[int, float] = {}
@@ -151,6 +244,37 @@ class BrokerProber:
         self._opt_ts = 0.0
         self._accounts: dict[int, dict] = {}
         self._accounts_ts = 0.0
+
+    def _store(self, inst: int, data: dict[str, dict]) -> None:
+        if not data:
+            return
+        with self._lock:
+            syms = self._data.setdefault(inst, {})
+            up = self._upper.setdefault(inst, {})
+            for sym, info in data.items():
+                syms[sym] = info
+                up[str(sym).upper()] = info
+            self._last_pass[inst] = time.time()
+            self._ok[inst] = True
+
+    def load_catalogue(self, inst: int) -> dict[str, dict]:
+        """Prime the prober from the terminal's own full symbol catalogue.
+
+        The EA writes EVERY symbol the account can see (with the same
+        fields a PROBE reply carries), so the account's whole quote
+        universe - Boom/Crash/Jump/Volatility indices, cent variants,
+        suffixed ECN pairs - is known after one file read instead of N
+        exec round trips.  This is what makes probing all quotes cheap.
+        """
+        from spot import read_symbol_catalogue
+        rows = read_symbol_catalogue(inst)
+        out: dict[str, dict] = {}
+        for _sym, fields in rows.items():
+            info = parse_probe_fields(fields)
+            if info:
+                out[info["symbol"]] = info
+        self._store(inst, out)
+        return out
 
     @staticmethod
     def _sender(inst: int):
@@ -184,46 +308,12 @@ class BrokerProber:
                 if not ok2:
                     log.debug(f"prober: terminal {inst} PROBE {sym} failed: {detail2}")
                     continue
-                fields = detail2.split("|")
-                if len(fields) < 12:
+                info = parse_probe_fields(detail2.split("|"))
+                if info is None:
                     log.warning(f"prober: terminal {inst} returned short response for {sym}: {detail2[:120]}")
                     continue
-                try:
-                    info = {
-                        "symbol": fields[0],
-                        "digits": int(fields[1]),
-                        "filling_flags": int(fields[2]),
-                        "trade_exemode": int(fields[3]),
-                        "trade_mode": int(fields[4]),
-                        "order_mode": int(fields[5]),
-                        "stops_level": int(fields[6]),
-                        "freeze_level": int(fields[7]),
-                        "volume_min": float(fields[8]),
-                        "volume_max": float(fields[9]),
-                        "volume_step": float(fields[10]),
-                        "spread_pts": int(fields[11]),
-                    }
-                except ValueError:
-                    continue
-                # EA v1.73+ appends contract/tick economics; older EAs send
-                # 12 fields and simply omit these (scheduling validation
-                # degrades gracefully to volume limits).
-                if len(fields) >= 15:
-                    try:
-                        info["contract_size"] = float(fields[12])
-                        info["tick_value"] = float(fields[13])
-                        info["tick_size"] = float(fields[14])
-                    except ValueError:
-                        pass
-                info["filling_allowed"] = FILLING_NAMES.get(info["filling_flags"], "RETURN")
-                info["best"] = best_filling_from_flags(info["filling_flags"])
-                info["trade_mode_name"] = MODE_NAMES.get(info["trade_mode"], str(info["trade_mode"]))
-                info["exec_mode_name"] = EXEC_NAMES.get(info["trade_exemode"], str(info["trade_exemode"]))
                 out[sym] = info
-        with self._lock:
-            self._data.setdefault(inst, {}).update(out)
-            self._last_pass[inst] = time.time()
-            self._ok[inst] = bool(out)
+        self._store(inst, out)
         if out:
             log.info(f"prober: terminal {inst} probed {len(out)} symbols - "
                      f"best filling decided per symbol")
@@ -235,6 +325,8 @@ class BrokerProber:
         if not targets:
             return
         import threading
+        # one thread per terminal: both accounts probe CONCURRENTLY, so the
+        # pass costs the slowest terminal, never the sum of both.
         threads = [threading.Thread(target=self._probe_one,
                                     args=(inst,), daemon=True,
                                     name=f"probe-t{inst}")
@@ -249,6 +341,25 @@ class BrokerProber:
             log.warning(f"prober: server optimization failed: {exc}")
 
     def _probe_one(self, inst: int) -> None:
+        # Fast path: the terminal's own catalogue already lists every quote
+        # the account can see, so take it as the probe result and only
+        # PROBE what the catalogue does not cover (older EA, or a symbol
+        # that appeared since the last refresh).
+        try:
+            cat = self.load_catalogue(inst)
+        except Exception as exc:
+            cat = {}
+            log.debug(f"prober: terminal {inst} catalogue unavailable: {exc}")
+        if cat:
+            log.info(f"prober: terminal {inst} catalogue carries {len(cat)} "
+                     f"symbols - full quote universe (no round trips)")
+            try:
+                missing = [s for s in probe_symbols_for(inst) if s not in cat]
+                if missing:
+                    self.probe_terminal(inst, missing)
+            except Exception as exc:
+                log.debug(f"prober: terminal {inst} gap probe skipped: {exc}")
+            return
         try:
             self.probe_terminal(inst)
         except Exception as exc:
@@ -308,8 +419,10 @@ class BrokerProber:
         return reports
 
     def best_filling(self, inst: int, symbol: str) -> str | None:
+        sym = str(symbol or "").strip()
         with self._lock:
-            info = self._data.get(inst, {}).get(symbol.upper())
+            info = (self._data.get(inst, {}).get(sym)
+                    or self._upper.get(inst, {}).get(sym.upper()))
         return info.get("best") if info else None
 
     def report(self) -> dict:
@@ -419,15 +532,21 @@ def best_filling(inst: int, symbol: str) -> str | None:
     return get_prober().best_filling(inst, symbol)
 
 def _render(inst: int, data: dict[str, dict]) -> str:
-    out = [f"{BOLD}TERMINAL {inst}{RESET}  {DIM}{len(data)} symbols probed{RESET}",
-           f"  {DIM}{'SYMBOL':<8}{'BEST':<7}{'ALLOWED':<9}{'EXEC':<10}{'TRADE':<9}"
-           f"{'SPREAD':>7}{'STOPS':>7}{'VOL STEP':>10}{RESET}"]
+    # Broker names are not always short upper-case pairs - Deriv's synthetics
+    # are "Boom 1000 Index" and cent/ECN feeds add letters - so size the
+    # symbol column to the widest name in this account's list.
+    width = max([8] + [len(s) for s in data]) + 2
+    header = [f"{BOLD}TERMINAL {inst}{RESET}  "
+              f"{DIM}{len(data)} symbols probed{RESET}",
+              f"  {DIM}{'SYMBOL':<{width}}{'BEST':<7}{'ALLOWED':<9}{'EXEC':<10}"
+              f"{'TRADE':<9}{'SPREAD':>7}{'STOPS':>7}{'VOL STEP':>10}{RESET}"]
     for sym, i in sorted(data.items()):
-        out.append(f"  {sym:<8}{GREEN}{i['best']:<7}{RESET}{i['filling_allowed']:<9}"
-                   f"{i['exec_mode_name']:<10}{i['trade_mode_name']:<9}"
-                   f"{i['spread_pts']:>5}pt{i['stops_level']:>7}"
-                   f"{i['volume_step']:>10.2f}")
-    return "\n".join(out)
+        header.append(
+            f"  {sym:<{width}}{GREEN}{i['best']:<7}{RESET}{i['filling_allowed']:<9}"
+            f"{i['exec_mode_name']:<10}{i['trade_mode_name']:<9}"
+            f"{i['spread_pts']:>5}pt{i['stops_level']:>7}"
+            f"{i['volume_step']:>10.2f}")
+    return "\n".join(header)
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Probe broker capabilities + best filling")
@@ -448,8 +567,14 @@ def main() -> int:
         print(f"\n{BOLD}BROKER PROBE{RESET} {DIM}{time.strftime('%H:%M:%S')}{RESET}")
         for inst in (1, 2):
             if accs.get(inst, {}).get("login"):
-                symbols = cli_symbols if cli_symbols else probe_symbols_for(inst)
-                data = prober.probe_terminal(inst, symbols)
+                # explicit --symbols always goes through a live PROBE round
+                # trip; otherwise report the account's whole catalogue
+                # (every quote it can see), falling back to PROBE only when
+                # the catalogue is unavailable (older EA / dead terminal).
+                data = (prober.probe_terminal(inst, cli_symbols) if cli_symbols
+                        else prober.load_catalogue(inst))
+                if not data and not cli_symbols:
+                    data = prober.probe_terminal(inst)
                 print(_render(inst, data) if data else
                       f"{RED}terminal {inst}: probe failed (terminal not running?){RESET}")
         if args.watch <= 0:

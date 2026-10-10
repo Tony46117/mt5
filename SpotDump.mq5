@@ -1,16 +1,24 @@
 
 #property copyright "spot bridge"
-#property version   "1.74"
+#property version   "1.75"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
 #define CANDLE_FILE  "candles.csv"
+#define SYMBOLS_FILE "symbols.csv"
 #define EXEC_IN      "exec_in.csv"
 #define EXEC_OUT     "exec_out.csv"
 #define EXEC_NEXT    "exec_next.txt"
 #define SPOT_DUMP_MS 50
 #define ASYNC_MAX    64
+// Watchlist dumped to spots.csv (Market Watch + classic pairs + Deriv
+// synthetics).  Kept modest on purpose: this file feeds the live panel.
 #define MAX_SYM_DUMP 300
+// Full broker catalogue dumped to symbols.csv (EVERY symbol this account
+// can see, whatever the broker calls it).  Written rarely and consumed by
+// broker_prober, so it can be large without costing the price feed.
+#define MAX_SYM_CATALOGUE 12000
+#define SYMBOL_DUMP_SEC 60
 
 int        g_interval_ms = 1;
 
@@ -250,6 +258,7 @@ int OnInit()
     DumpSpots();
     DumpTrades();
     DumpCandles();
+    DumpSymbols();
     return(INIT_SUCCEEDED);
   }
 
@@ -291,6 +300,17 @@ void OnTimer()
      }
    else
       s_since_dump++;
+
+   // Full broker catalogue: once every SYMBOL_DUMP_SEC, plus once right
+   // after a login changes (handled by OnInit), so the prober always has
+   // the account's complete quote universe without a single exec round
+   // trip.
+   static uint s_last_cat_ms = 0;
+   if(now_ms - s_last_cat_ms >= SYMBOL_DUMP_SEC * 1000)
+     {
+      s_last_cat_ms = now_ms;
+      DumpSymbols();
+     }
   }
 
 bool IsClassicPair(string name)
@@ -319,8 +339,12 @@ void SymAdd(string s)
    for(int i = 0; i < g_nsymbols; i++)
       if(g_sym_names[i] == s)
          return;
-   if(SymbolInfoDouble(s, SYMBOL_BID) <= 0.0)
-      return;
+   // SUBSCRIBE FIRST.  A symbol this terminal has never selected (a Deriv
+   // Boom/Crash/Jump index, a cent-account variant, an exotic) reports
+   // bid 0 until MT5 selects it - the old "skip when there is no bid yet"
+   // test therefore dropped exactly the symbols the account exists for.
+   // Select it, then keep it: the quote lands a tick later and DumpSpots
+   // starts writing it from then on.
    if(!SymbolSelect(s, true))
       return;
    g_sym_names[g_nsymbols] = s;
@@ -353,6 +377,58 @@ void RefreshSymbols()
 
    ArrayResize(g_sym_names, g_nsymbols);
    g_last_rescan_min = (long)(TimeCurrent() / 60);
+  }
+
+// Every symbol this account can see, with the FULL capability set the
+// broker prober needs (same fields the PROBE command returns, plus the
+// live bid/ask so consumers can tell which names are actually quoting).
+// This is what lets the software probe ALL of a broker's quotes - Deriv's
+// Boom/Crash/Jump/Volatility indices, cent-account variants, suffixed ECN
+// pairs - without a dedicated terminal install and without subscribing
+// thousands of symbols into Market Watch.
+void DumpSymbols()
+  {
+   // Publish only while the trade account is actually AUTHORIZED.  A
+   // terminal that is still connecting - or whose login was refused -
+   // exposes MetaQuotes' GLOBAL symbol base (thousands of NASDAQ/ETF
+   // tickers this account cannot trade) instead of its broker's list, and
+   // dumping that would swamp the prober and the panel with instruments
+   // that do not belong to this account.  Leaving the previous file alone
+   // keeps the last known-good catalogue readable.
+   if(StringLen(AccountInfoString(ACCOUNT_CURRENCY)) == 0)
+      return;
+   int handle = FileOpen(SYMBOLS_FILE, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, '\t');
+   if(handle == INVALID_HANDLE)
+      return;
+   int all = SymbolsTotal(false);
+   int written = 0;
+   for(int i = 0; i < all && written < MAX_SYM_CATALOGUE; i++)
+     {
+      string s = SymbolName(i, false);
+      if(StringLen(s) == 0)
+         continue;
+      int digits = (int)SymbolInfoInteger(s, SYMBOL_DIGITS);
+      FileWrite(handle,
+                s,
+                IntegerToString(digits),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_FILLING_MODE)),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_TRADE_EXEMODE)),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_TRADE_MODE)),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_ORDER_MODE)),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_TRADE_STOPS_LEVEL)),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_TRADE_FREEZE_LEVEL)),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MIN), 2),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_MAX), 2),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_VOLUME_STEP), 2),
+                IntegerToString(SymbolInfoInteger(s, SYMBOL_SPREAD)),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_CONTRACT_SIZE), 2),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_TICK_VALUE), 8),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_TRADE_TICK_SIZE), 8),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_BID), digits),
+                DoubleToString(SymbolInfoDouble(s, SYMBOL_ASK), digits));
+      written++;
+     }
+   FileClose(handle);
   }
 
 string MscToTime(long msc)
@@ -523,77 +599,94 @@ void AppendOut(string id, string status, string detail)
    FileClose(hw);
   }
 
+// Read one command file, delete it, then run its lines.  The file is
+// deleted BEFORE the lines execute so a command can never be double-fired.
+bool ConsumeCommandFile(string target)
+  {
+   int hc = FileOpen(target, FILE_READ | FILE_TXT | FILE_ANSI |
+                     FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(hc == INVALID_HANDLE)
+      return(false);
+   string lines[50];
+   int n = 0;
+   while(!FileIsEnding(hc) && n < 50)
+     {
+      string l = FileReadString(hc);
+      StringTrimLeft(l);
+      StringTrimRight(l);
+      if(StringLen(l) > 0)
+         lines[n++] = l;
+     }
+   FileClose(hc);
+   if(!FileDelete(target))
+      return(false);
+   for(int k = 0; k < n; k++)
+      ExecuteLine(lines[k]);
+   return(true);
+  }
+
+// The pointer file is a PRIORITY hint: consume the file Python pointed at
+// first so the oldest command is never starved behind a flood of new ones.
+bool ConsumePointer()
+  {
+   if(!FileIsExist(EXEC_NEXT))
+      return(false);
+   int hp = FileOpen(EXEC_NEXT, FILE_READ | FILE_TXT | FILE_ANSI |
+                     FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(hp == INVALID_HANDLE)
+      return(false);
+   string target = "";
+   while(!FileIsEnding(hp))
+     {
+      string l = FileReadString(hp);
+      StringTrimLeft(l);
+      StringTrimRight(l);
+      if(StringLen(l) > 0)
+         target = l;
+     }
+   FileClose(hp);
+   FileDelete(EXEC_NEXT);
+   if(StringLen(target) == 0 || !FileIsExist(target))
+      return(false);
+   return(ConsumeCommandFile(target));
+  }
+
+// Drain the directory: any other command file that is fully written is
+// consumed in the SAME pass.  Before this the terminal ran exactly one
+// command per pointer handshake (Python had to re-point every ~1 ms), so
+// a 50-position basket cost 50 handshakes before the first fill even
+// started.  Python writes each command to a temp name and renames it, so
+// a file found here is always complete.
+bool ConsumePending()
+  {
+   string found = "";
+   long h = FileFindFirst("exec_in.*.txt", found);
+   if(h == INVALID_HANDLE)
+      return(false);
+   bool did = false;
+   int guard = 0;
+   do
+     {
+      guard++;
+      if(StringFind(found, "exec_in.") != 0)
+         break;
+      if(ConsumeCommandFile(found))
+         did = true;
+     }
+   while(guard < 64 && FileFindNext(h, found));
+   FileFindClose(h);
+   return(did);
+  }
+
 void ProcessExecIn()
   {
    for(int i = 0; i < 50; i++)
      {
-      if(!FileIsExist(EXEC_NEXT))
+      bool did = ConsumePointer();
+      if(!did)
+         did = ConsumePending();
+      if(!did)
          return;
-      int hp = FileOpen(EXEC_NEXT, FILE_READ | FILE_TXT | FILE_ANSI |
-                        FILE_SHARE_READ | FILE_SHARE_WRITE);
-      if(hp == INVALID_HANDLE)
-         return;
-      string target = "";
-      while(!FileIsEnding(hp))
-        {
-         string l = FileReadString(hp);
-         StringTrimLeft(l);
-         StringTrimRight(l);
-         if(StringLen(l) > 0)
-            target = l;
-        }
-      FileClose(hp);
-      if(StringLen(target) == 0)
-        {
-         FileDelete(EXEC_NEXT);
-         return;
-        }
-      int hc = FileOpen(target, FILE_READ | FILE_TXT | FILE_ANSI |
-                        FILE_SHARE_READ | FILE_SHARE_WRITE);
-      if(hc == INVALID_HANDLE)
-        {
-
-         static int dbg2 = 0;
-         int err = GetLastError();
-         if(dbg2 < 6)
-           {
-            bool ex1 = FileIsExist(target);
-            int h2 = FileOpen(target, FILE_READ | FILE_BIN | FILE_SHARE_READ);
-            int h3 = FileOpen(target, FILE_READ | FILE_TXT | FILE_ANSI |
-                              FILE_SHARE_READ);
-            Print("exec: open FAILED err=", err, " len=", StringLen(target),
-                  " [", target, "] isexist=", ex1,
-                  " bin=", h2, " txtshare=", h3);
-            if(h2 != INVALID_HANDLE)
-               FileClose(h2);
-            if(h3 != INVALID_HANDLE)
-               FileClose(h3);
-            dbg2++;
-           }
-         FileDelete(EXEC_NEXT);
-         return;
-        }
-      string lines[50];
-      int n = 0;
-      while(!FileIsEnding(hc) && n < 50)
-        {
-         string l = FileReadString(hc);
-         StringTrimLeft(l);
-         StringTrimRight(l);
-         if(StringLen(l) > 0)
-            lines[n++] = l;
-        }
-      FileClose(hc);
-      if(!FileDelete(target))
-        {
-         Print("exec: delete ", target, " failed err=", GetLastError());
-         FileDelete(EXEC_NEXT);
-         return;
-        }
-      FileDelete(EXEC_NEXT);
-      Print("exec: consumed ", target, " lines=", n);
-      for(int k = 0; k < n; k++)
-         ExecuteLine(lines[k]);
      }
   }
 

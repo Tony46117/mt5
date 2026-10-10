@@ -19,6 +19,19 @@ One command starts everything; Ctrl+C stops everything.
   routing, web panel, monitor, close, metrics. Conversely, if the
   stored session is rewritten externally, terminals are reconnected
   into it.
+- Full quote-universe probing: the EA publishes every symbol the
+  account can see (broker-suffixed pairs, cent variants, Deriv's
+  Boom/Crash/Jump/Volatility indices) to `symbols.csv`, and
+  `broker_prober` reports that catalogue in milliseconds - no per-symbol
+  round trips, both accounts at once. Symbols are subscribed before
+  MT5 is asked for a price, so a synthetic index that had never been
+  selected still shows up (and stays tradeable) as soon as it quotes.
+- Order batches drain in one terminal tick: command files are written
+  atomically and the EA consumes every pending one per pass, so a
+  50-position basket is handed to the broker in ~30 ms instead of ~50
+  pointer handshakes. Measured channel cost is ~0.6 ms per command;
+  what remains is the broker's own fill time. Failed logins surface the
+  trade server's own rejection instead of looking like a slow sync.
 - Millisecond scheduled trading: a background scheduler fires each
   schedule slot to the planned second with atomic slot claims (no
   double fires, no lost slots), concurrent per-terminal order batches,
@@ -37,7 +50,7 @@ One command starts everything; Ctrl+C stops everything.
 
 | Component       | Role |
 |-----------------|------|
-| `SpotDump.mq5`  | MQL5 Expert Advisor attached to each terminal's chart. Writes the market feed and account header to `MQL5/Files`, consumes order commands (`OPEN`, `CLOSE`, `CLOSEALL`, `PING`) from `exec_in.<id>.txt` via an atomic pointer file, appends results to `exec_out.csv`. |
+| `SpotDump.mq5`  | MQL5 Expert Advisor attached to each terminal's chart. Writes the market feed, account header and the full broker symbol catalogue (`symbols.csv`) to `MQL5/Files`, consumes order commands (`OPEN`, `CLOSE`, `CLOSEALL`, `PING`, `PROBE`) from `exec_in.<id>.txt` - every pending file it finds each tick, pointer file first - and appends results to `exec_out.csv`. |
 | `spot.py`       | Terminal lifecycle (launch, stop, restart, minimal one-chart boot), start-config generation and credential scrubbing, feed readers. |
 | `bridge.py`     | Supervisor screen. Concurrent boot of both terminals, feed/watchdog auto-heal, hot account switching, antidetect scrubbing. |
 | `executor.py`   | The only way Python trades. `SendCommand` file protocol, batched concurrent orders, `FutureTradeScheduler` with CAS claims, fire-latency control, 500 ms retries. |
@@ -47,7 +60,7 @@ One command starts everything; Ctrl+C stops everything.
 | `session.py`    | Obfuscated credential store (`session.json`), stat-validated on every read so account changes propagate live across all processes. |
 | `account_engine.py` | Account Integration Engine: concurrent per-terminal login/switch/adopt/logout of any account (live or demo) with pre-validation, EA-verified results, demo/live detection, an operation registry, CLI (`--login/--adopt/--status/...`) and `/api/engine/*` endpoints for the panel. |
 | `database.py`   | SQLite/Postgres storage for schedules and the fired log. |
-| `broker_prober.py` | Probes broker symbols/spreads and order-fill behaviour. |
+| `broker_prober.py` | Probes the account's full quote universe and order-fill behaviour. The EA writes every symbol the account can see to `symbols.csv`, so the prober reports the whole broker catalogue (including Deriv's Boom/Crash/Jump/Volatility indices and any symbol a broker renames with extra letters, e.g. `XAUUSD247`, `EURUSD.Z`) with no exec round trips, then only PROBEs what the catalogue is missing. Both terminals probe concurrently. |
 | `metrics.py`    | Closed-trade and equity observation. |
 | `run.sh`        | One-command launcher for the whole stack with full teardown on Ctrl+C. |
 | `install.sh`    | System bootstrap: packages, Wine prefix, MT5 install, venv, EA compilation. |
@@ -204,6 +217,10 @@ python monitor.py                                  # live dual-account book
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `MT5_TRADING_DAYS` | `0,1,2,3,4` | Weekdays (0=Mon) schedules may fire on |
+| `MT5_MAX_PROBE_SYMBOLS` | `2000` | Ceiling on symbols the prober reports per account |
+| `MT5_STRICT_UNKNOWN_SERVER` | unset | Set to `1` to refuse logins to a trade server the terminal has never connected to (default: attempt it by name) |
+| `MT5_CLOSE_VERIFY_TIMEOUT` | `15` | Seconds a close waits for the broker to report the position book empty |
+| `MT5_IGNORE_AUTH_FAILURE` | unset | Set to `1` to ignore `authorization ... failed` lines from MT5's journal during a login |
 | `MT5_NO_LAUNCH_JITTER` | unset | Set to `1` to disable anti-detect launch jitter |
 | `MT5_RUN_KEEP_TERMINALS` | unset | Set to `1` so `run.sh` Ctrl+C keeps terminals running |
 | `MT5_CORS_ORIGIN` | unset | Exact origin allowed to call the API cross-origin (see Security) |

@@ -24,6 +24,7 @@ existing adoption path does.
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import threading
 import time
@@ -187,6 +188,7 @@ class TerminalWorker(threading.Thread):
         br = _bridge()
         sp = _spot()
         t0 = time.monotonic()
+        started_at = time.time()
         deadline = t0 + timeout
         boot_age = (time.monotonic() - boot_ts) if boot_ts else float("inf")
         if boot_ts and boot_age < BOOT_GRACE_S:
@@ -201,6 +203,9 @@ class TerminalWorker(threading.Thread):
             h = br.header_for(self.inst)
             if str(h.get("login", "")) == want:
                 break
+            rejected = self._broker_rejection(want, started_at, server)
+            if rejected:
+                raise EngineError(rejected)
             got = str(h.get("login", ""))
             # Boot grace: a young process reporting the old login (or
             # nothing yet) is still starting, NOT stuck.  Only a settled
@@ -254,12 +259,47 @@ class TerminalWorker(threading.Thread):
                 break              # terminal moved away - re-check below
             if h.get("currency"):
                 return h, matched_in, True
+            rejected = self._broker_rejection(want, started_at, server)
+            if rejected:
+                raise EngineError(rejected)
         h = br.header_for(self.inst)
         if str(h.get("login", "")) != want:
             raise EngineError(f"terminal left {want} while waiting for the "
                               f"broker sync (now reports "
                               f"{h.get('login', '') or 'logged out'})")
         return h, matched_in, False
+
+    def _broker_rejection(self, want: str, since: float, server: str) -> str:
+        """Did the trade server actually REFUSE this login?
+
+        MT5 journals `'<login>': authorization on <server> failed (...)`
+        the moment it is refused.  Without this the failure looks exactly
+        like a slow sync, so the operator waits out the whole timeout for
+        an account the broker has already rejected - and the terminal is
+        restarted into it over and over.  Throttled: the journal is only
+        re-read about twice a second, never on every poll.
+        """
+        if os.getenv("MT5_IGNORE_AUTH_FAILURE", "") == "1":
+            return ""
+        now = time.monotonic()
+        if now - getattr(self, "_reject_ts", 0.0) < 0.5:
+            return ""
+        self._reject_ts = now
+        try:
+            line = _spot().last_auth_failure(self.inst, want, since)
+        except Exception:
+            return ""
+        if not line:
+            return ""
+        log.error(f"terminal {self.inst}: login {want} refused by the trade "
+                  f"server: {line}")
+        return (f"terminal {self.inst}: the trade server REFUSED login {want} "
+                f"@ {server or '?'} - {line}.  The account number, the MT5 "
+                f"password or the server name is wrong (some brokers issue "
+                f"an MT5-specific password that differs from the platform "
+                f"password, and an unused demo can expire).  Fix it in the "
+                f"broker's client area, or log in once inside MT5 and press "
+                f"ADOPT.")
 
     def _do_login(self, login: str, password: str, server: str) -> str:
         login, password, server = validate_credentials(login, password, server)
@@ -282,7 +322,7 @@ class TerminalWorker(threading.Thread):
                                  f"{self.inst} - attempting anyway)")
                 log.info(f"terminal {self.inst}: server {server} known to "
                          f"sibling install only - attempting login anyway")
-            else:
+            elif os.getenv("MT5_STRICT_UNKNOWN_SERVER", "") == "1":
                 import re as _re
                 ap_key = ("MT5_AP_"
                           + _re.sub(r"\W+", "_", server).upper().strip("_"))
@@ -295,6 +335,23 @@ class TerminalWorker(threading.Thread):
                     f"then press ADOPT - after that one-click logins work. "
                     f"(Alternatively set {ap_key} to the "
                     f"broker's host:port and restart the stack.)")
+            else:
+                # MT5 resolves trade servers from MetaQuotes' public server
+                # list, so a broker this install has never CONNECTED to -
+                # a Deriv account on an HFM install, a brand-new broker -
+                # is still loginable by name.  "Bases/<server>" only
+                # appears AFTER the first successful connect, so refusing
+                # here made that first connect impossible without a manual
+                # UI login: exactly the "need the Deriv MT5 setup" wall.
+                # Attempt it; a genuine rejection is reported by the
+                # settled-terminal check in _wait_login.
+                new_here_note = (f" (server {server} is new to this MT5 "
+                                 f"install - attempting the login by name)")
+                log.warning(
+                    f"terminal {self.inst}: server {server} is not in this "
+                    f"install's Bases yet - attempting the login anyway (MT5 "
+                    f"can resolve it from the public server list; set "
+                    f"MT5_STRICT_UNKNOWN_SERVER=1 to refuse instead)")
 
         # Fast path: already there.  A repeat click (or a manual UI switch
         # the supervisor already adopted) must NOT bounce a healthy
@@ -376,15 +433,31 @@ class TerminalWorker(threading.Thread):
             raise EngineError(f"terminal {self.inst} is not logged into any "
                               f"account in MT5 - nothing to adopt")
         if not h.get("currency"):
-            for _ in range(6):
-                time.sleep(0.3)
+            # The terminal is ALREADY in the account - only the broker's
+            # account details are still in flight, and a trade server this
+            # install has never used can take tens of seconds to deliver
+            # them.  The old 1.8 s probe declared "not synchronized" and
+            # refused to adopt an account that was sitting right there.
+            self._progress(f"adopting {login} - waiting for the broker "
+                           f"sync...")
+            deadline = time.monotonic() + SYNC_TIMEOUT_S
+            while time.monotonic() < deadline:
+                time.sleep(SYNC_POLL_S)
                 h = br.header_for(self.inst)
-                login = str(h.get("login", ""))
-                if login and login not in ("0", "?") and h.get("currency"):
+                cur = str(h.get("login", ""))
+                if cur in ("", "0", "?"):
+                    raise EngineError(
+                        f"terminal {self.inst} left account {login} while "
+                        f"adopting (now reports logged out)")
+                login = cur
+                if h.get("currency"):
                     break
             else:
-                raise EngineError(f"terminal {self.inst} account {login} has not "
-                                  f"synchronized yet - try again shortly")
+                h = br.header_for(self.inst)
+                login = str(h.get("login", "")) or login
+                log.warning(f"terminal {self.inst}: adopting account {login} "
+                            f"before the broker delivered account details "
+                            f"(no currency after {SYNC_TIMEOUT_S:.0f}s)")
         server = str(h.get("server", "")) or "MetaQuotes-Demo"
         known = known_accounts.get(login)
         password = (known or {}).get("password", "")
@@ -702,9 +775,9 @@ def _print_status() -> None:
               f"{'  [' + s['mode'] + ']' if s['mode'] else ''}")
         print(f"  server : {s['server'] or '-'}   broker: {s['broker'] or '-'}")
         if s.get("want_login") and not s.get("server_known", True):
-            print(f"  !! server {s.get('want_server') or '?'} unknown to "
-                  f"this MT5 - one-click login will fail fast; log in once "
-                  f"manually, then ADOPT")
+            print(f"  !! server {s.get('want_server') or '?'} is not in this "
+                  f"MT5 install's Bases yet - the login is still attempted "
+                  f"by name (set MT5_STRICT_UNKNOWN_SERVER=1 to refuse)")
         print(f"  balance: {s['balance'] or '-'}   equity: {s['equity'] or '-'}"
               f"   feed: {s['feed_age_s'] if s['feed_age_s'] is not None else '-'}s")
         if s["running"]:

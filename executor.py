@@ -18,9 +18,10 @@ import database as db
 
 log = setup_logging(__name__)
 
-EXEC_POLL_INTERVAL = 0.0005
-EXEC_POLL_SLEEP = 0.0002
-EXEC_REASSERT_INTERVAL = 0.001
+# The EA consumes the pointer target AND drains every other pending
+# exec_in.*.txt in the same pass, so re-pointing faster than that is pure
+# syscall churn (3 calls every millisecond, per in-flight order).
+EXEC_REASSERT_INTERVAL = 0.005
 SCHEDULER_POLL_IDLE = 0.250
 SCHEDULER_POLL_NEAR = 0.005
 SCHEDULER_NEAR_WINDOW = 2.0
@@ -30,6 +31,13 @@ MAX_FIRE_LATE = 120.0
 FIRE_DEADLINE = 20.0
 RETRY_DELAY_S = 0.5
 RETRY_MAX = 3
+# How long a close waits for the broker to report the book empty before it
+# counts as failed.  Observed fills on a slow live/demo server run 8-9 s
+# (the EA journals "done in 8804 ms"), so a 5 s verify declared success a
+# failure and re-sent CLOSEALL on positions that were already filling.
+# The poll returns the instant the book empties, so a generous ceiling
+# costs nothing when fills are fast.
+CLOSE_VERIFY_TIMEOUT_S = float(os.getenv("MT5_CLOSE_VERIFY_TIMEOUT", "15"))
 RETCODE_HINTS = {
     "10004": "requote", "10006": "rejected by broker", "10013": "invalid request",
     "10014": "invalid volume", "10015": "invalid price", "10016": "invalid stops",
@@ -175,16 +183,19 @@ class SendCommand:
     def _write_cmd(self, files_dir, parts: tuple[str, ...]) -> tuple[str, Path]:
         cid = uuid.uuid4().hex[:12]
         cmd_file = files_dir / f"exec_in.{cid}.txt"
+        tmp_file = files_dir / f"exec_in.{cid}.tmp"
         line = ("\t".join((cid, *parts)) + "\n").encode("ascii")
         # NOTE: no O_SYNC - forcing an fsync on every order cost real
-        # milliseconds of latency per trade.  The file name carries a
-        # unique uuid, so there is no torn-write risk; a plain close is
-        # enough and the EA picks the file up from the directory listing.
-        fd = os.open(str(cmd_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        # milliseconds of latency per trade.  Instead the command is built
+        # under a .tmp name and RENAMED into place, which is atomic: the EA
+        # drains every exec_in.*.txt it finds in one pass, so it must never
+        # see a half-written one.  (.tmp does not match its *.txt glob.)
+        fd = os.open(str(tmp_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             os.write(fd, line)
         finally:
             os.close(fd)
+        os.replace(tmp_file, cmd_file)
         return cid, cmd_file
 
     def _await_result(self, cid: str, cmd_file, files_dir, out_path,
@@ -513,7 +524,8 @@ def _open_count(acc: int, pair: str | None) -> int | None:
         return None
     return sum(1 for r in rows if r.get("symbol") == pair)
 
-def _positions_empty(acc: int, pair: str | None, timeout: float = 5.0) -> bool:
+def _positions_empty(acc: int, pair: str | None,
+                     timeout: float = CLOSE_VERIFY_TIMEOUT_S) -> bool:
     """Poll until the broker reports zero open positions (or timeout).
 
     The EA fans CLOSEALL out asynchronously, so the command ack only means
@@ -537,7 +549,7 @@ def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, st
             detail = f"exception: {exc}"
         # The ack only proves the closes were flighted (async fan-out);
         # verify against the position book before claiming success.
-        if _positions_empty(acc, pair, timeout=5.0):
+        if _positions_empty(acc, pair, timeout=CLOSE_VERIFY_TIMEOUT_S):
             if attempt > 1:
                 log.info(f"close acc{acc} {pair}: verified empty on retry "
                          f"{attempt} - {detail}")
