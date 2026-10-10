@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.73"
+#property version   "1.74"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -295,12 +295,16 @@ void OnTimer()
 
 bool IsClassicPair(string name)
   {
-   static string bases[] = {
-      "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD",
-      "EURGBP","EURJPY","GBPJPY","AUDJPY","CHFJPY","EURCHF","EURAUD",
-      "GBPCHF","CADJPY","AUDNZD","GBPAUD","EURNZD","AUDCAD","NZDJPY",
-      "GBPNZD","EURCAD","GBPCAD","AUDCHF","NZDCHF","CADCHF",
-      "XAUUSD","XAGUSD"};
+    static string bases[] = {
+       "EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD",
+       "EURGBP","EURJPY","GBPJPY","AUDJPY","CHFJPY","EURCHF","EURAUD",
+       "GBPCHF","CADJPY","AUDNZD","GBPAUD","EURNZD","AUDCAD","NZDJPY",
+       "GBPNZD","EURCAD","GBPCAD","AUDCHF","NZDCHF","CADCHF",
+       "XAUUSD","XAGUSD",
+       // Deriv synthetics (Boom/Crash/Jump/Volatility/Step/RangeBreak):
+       // prefix-matched, so they are dumped, probed and tradeable even
+       // when the operator never added them to Market Watch.
+       "BOOM","CRASH","JUMP","VOLATILITY","STEP INDEX","RANGE BREAK"};
    int n = ArraySize(bases);
    for(int i = 0; i < n; i++)
       if(StringFind(name, bases[i]) == 0)

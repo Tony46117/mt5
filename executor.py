@@ -46,8 +46,8 @@ def _explain(detail: str) -> str:
         if code in detail and hint not in detail:
             return f"{detail} - {hint}"
     return detail
-ALWAYS_ON_MARKERS = ("247", "BOOM", "CRASH", "JUMP", "RANGE BREAK", "STEP INDEX",
-                     "DERIV")
+ALWAYS_ON_MARKERS = ("247", "BOOM", "CRASH", "JUMP", "VOLATILITY",
+                      "RANGE BREAK", "STEP INDEX", "DERIV")
 
 def is_always_on_symbol(pair: str) -> bool:
     p = (pair or "").upper()
