@@ -283,6 +283,9 @@ class TerminalWorker(threading.Thread):
                 log.info(f"terminal {self.inst}: server {server} known to "
                          f"sibling install only - attempting login anyway")
             else:
+                import re as _re
+                ap_key = ("MT5_AP_"
+                          + _re.sub(r"\W+", "_", server).upper().strip("_"))
                 raise EngineError(
                     f"terminal {self.inst} has never seen server {server!r} - "
                     f"MT5 cannot log into it by name yet (it would just keep "
@@ -290,8 +293,8 @@ class TerminalWorker(threading.Thread):
                     f"against your broker's account email, or log in once "
                     f"manually inside MT5 (File -> Login to Trade Account), "
                     f"then press ADOPT - after that one-click logins work. "
-                    f"(Alternatively set MT5_AP_{server.upper()} to the "
-                    f"broker's host:port.)")
+                    f"(Alternatively set {ap_key} to the "
+                    f"broker's host:port and restart the stack.)")
 
         # Fast path: already there.  A repeat click (or a manual UI switch
         # the supervisor already adopted) must NOT bounce a healthy
