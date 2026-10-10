@@ -29,8 +29,6 @@ _LOCK = threading.RLock()
 _MEM: dict[int, dict[str, str]] | None = None
 _CACHE_STAT: tuple[int, int] | None = None
 
-_OVERRIDE = None
-
 _INVALID_LOGINS = frozenset({"0", "?", "LOGIN"})
 
 # MT5 logs in by SERVER NAME (e.g. HFMarketsKE-Live2), never by an access
@@ -174,11 +172,6 @@ def _file_accounts() -> dict[int, dict[str, str]]:
     return accounts
 
 def load() -> dict[int, dict[str, str]]:
-    if _OVERRIDE is not None:
-        try:
-            return _OVERRIDE()
-        except Exception:
-            return {}
     global _MEM, _CACHE_STAT
     with _LOCK:
         try:
@@ -312,14 +305,6 @@ def prompt_all(*, stdin=None, fresh: bool = False) -> dict[int, dict[str, str]]:
         set_accounts(accounts)
         print(f"  {len(accounts)} account(s) saved to {SESSION_FILE.name}")
     return accounts
-
-def set_override(fn) -> None:
-    global _OVERRIDE
-    _OVERRIDE = fn
-
-def clear_override() -> None:
-    global _OVERRIDE
-    _OVERRIDE = None
 
 def _seed_from_acc_env() -> int:
     import re

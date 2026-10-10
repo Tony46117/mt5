@@ -129,33 +129,3 @@ def all_known() -> list[dict]:
                     "label": a.get("label", ""),
                     "has_password": bool(a.get("password"))})
     return out
-
-def import_from_acc_env(env_file: Path | None = None) -> int:
-    import re
-    env_file = env_file or Path(__file__).resolve().parent / "acc.env"
-    try:
-        text = env_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return 0
-    n = 0
-    cur: dict = {}
-    for line in text.splitlines():
-        s = line.strip()
-        m = re.match(r"(?i)^account\s*([12])\b\s*(.*)$", s)
-        if m:
-            if cur.get("login"):
-                remember(cur["login"], cur.get("password", ""),
-                         cur.get("server", ""))
-                n += 1
-            cur = {}
-            s = m.group(2).strip()
-        if not s or s.startswith("#"):
-            continue
-        for key in ("login", "password", "server"):
-            m2 = re.match(rf"(?i)^{key}\s*=\s*(.+)$", s)
-            if m2:
-                cur[key] = m2.group(1).strip()
-    if cur.get("login"):
-        remember(cur["login"], cur.get("password", ""), cur.get("server", ""))
-        n += 1
-    return n

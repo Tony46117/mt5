@@ -15,12 +15,12 @@ from typing import Callable
 
 from flask import Flask, jsonify, request
 
-from config import CONFIG, map_symbol, setup_logging, validate_config
+from config import CONFIG, setup_logging, validate_config
 
 import front
 import database as db
 from info import snapshot
-from spot import read_spots, feed_age, term_running, read_header
+from spot import read_spots, feed_age, term_running, read_header, resolve_symbol
 from executor import start_scheduler, sender_for
 from monitor import read_positions, account_info
 import metrics
@@ -181,6 +181,39 @@ def _ok(payload: dict | None = None):
     if payload:
         j.update(payload)
     return jsonify(j)
+
+def _lot_check(account: int, broker_symbol: str, lot: float) -> str | None:
+    """Reject lots the broker will refuse, using probed volume limits.
+
+    Returns an error string, or None when the lot is fine (or when no
+    probe data exists yet - never block trading on missing metadata).
+    """
+    try:
+        syms = broker_prober.get_prober().report()["terminals"].get(str(account), {})
+        info = syms.get(broker_symbol)
+    except Exception:
+        return None
+    if not info:
+        return None
+    try:
+        vmin = float(info.get("volume_min", 0) or 0)
+        vmax = float(info.get("volume_max", 0) or 0)
+        step = float(info.get("volume_step", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if vmin > 0 and lot < vmin - 1e-9:
+        return (f"lot {lot:g} is below the broker minimum {vmin:g} for "
+                f"{broker_symbol} on account {account}")
+    if vmax > 0 and lot > vmax + 1e-9:
+        return (f"lot {lot:g} is above the broker maximum {vmax:g} for "
+                f"{broker_symbol} on account {account}")
+    if step > 0:
+        steps = round(lot / step)
+        if abs(steps * step - lot) > 1e-6:
+            near = steps * step
+            return (f"lot {lot:g} is not a multiple of the broker step "
+                    f"{step:g} for {broker_symbol} - nearest: {near:g}")
+    return None
 
 def _fail(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
@@ -429,8 +462,12 @@ def api_trade():
     if not 1 <= n <= 50:
         return _fail("orders must be 1..50")
     spots = read_spots()
-    if symbol not in spots or not spots[symbol][0]:
+    broker_sym = resolve_symbol(symbol, account)
+    if broker_sym not in spots or not spots[broker_sym][0]:
         return _fail("no live quote for " + symbol)
+    lot_err = _lot_check(account, broker_sym, lot)
+    if lot_err:
+        return _fail(lot_err)
     sender = sender_for(account)
     if n == 1:
         t0 = time.perf_counter()
@@ -449,8 +486,7 @@ def api_trade():
             return _fail(detail)
         return _ok({"detail": detail, "price": price, "ticket": ticket,
                     "n": 1, "ms": round(order_ms, 1)})
-    mapped = map_symbol(symbol.strip(), account)
-    commands = [("OPEN", mapped, side, f"{lot:.2f}", "0", "0",
+    commands = [("OPEN", broker_sym, side, f"{lot:.2f}", "0", "0",
                  str(777001), "py") for _ in range(n)]
     t0 = time.perf_counter()
     try:
@@ -525,8 +561,12 @@ def api_order():
     if not 1 <= n <= 50:
         return _fail("orders must be 1..50")
     spots = read_spots()
-    if symbol not in spots or not spots[symbol][0]:
+    broker_sym = resolve_symbol(symbol, account)
+    if broker_sym not in spots or not spots[broker_sym][0]:
         return _fail("no live quote for " + symbol)
+    lot_err = _lot_check(account, broker_sym, lot)
+    if lot_err:
+        return _fail(lot_err)
     try:
         price = float(d.get("price", 0) or 0)
     except (TypeError, ValueError):
@@ -543,7 +583,7 @@ def api_order():
         except ValueError:
             return _fail("bad level (decimal)")
         price = whole + frac
-    bid = float(spots[symbol][0])
+    bid = float(spots[broker_sym][0])
     digits = len(f"{bid}".split(".")[1]) if "." in f"{bid}" else 0
     if price <= 0:
         return _fail("level required (whole number + decimal)")
@@ -567,9 +607,8 @@ def api_order():
             return _fail(detail)
         return _ok({"detail": detail, "price": fill_price, "ticket": ticket,
                     "type": ptype, "n": 1, "ms": round(order_ms, 1)})
-    mapped = map_symbol(symbol.strip(), account)
     p = ptype.upper().replace(" ", "").replace("_", "")
-    commands = [("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
+    commands = [("PENDING", broker_sym, p, f"{lot:.2f}", f"{price:.8f}",
                  "0", "0", str(777002), "pend") for _ in range(n)]
     t0 = time.perf_counter()
     try:
@@ -703,14 +742,18 @@ def api_schedule():
         return _fail("lot out of range")
     if not 1 <= n <= 50:
         return _fail("positions must be 1..50")
+    broker_pair = resolve_symbol(pair, account)
     try:
-        _sym = broker_prober.get_prober().report()["terminals"].get(str(account), {}).get(pair)
+        _sym = broker_prober.get_prober().report()["terminals"].get(str(account), {}).get(broker_pair)
         if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
             return _fail(f"{pair} is DISABLED for trading by the broker on "
                          f"account {account} (trade_mode=0, retcode 10017) - "
                          f"pick a tradeable symbol (e.g. XAUUSD)")
     except Exception:
         pass
+    lot_err = _lot_check(account, broker_pair, lot)
+    if lot_err:
+        return _fail(lot_err)
     for h, m, s in ((eh, em, es), (ch, cm, cs)):
         if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
             return _fail("time out of range")
@@ -802,14 +845,21 @@ def api_schedule_update():
         return _fail("nothing to update")
     if "pair" in updates and updates["pair"] != cur["pair"]:
         try:
+            _rsym = resolve_symbol(updates["pair"], int(cur["account"]))
             _sym = broker_prober.get_prober().report()["terminals"] \
-                .get(str(cur["account"]), {}).get(updates["pair"])
+                .get(str(cur["account"]), {}).get(_rsym)
             if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
                 return _fail(f"{updates['pair']} is DISABLED for trading by "
                              f"the broker on account {cur['account']} "
                              f"(trade_mode=0, retcode 10017)")
         except Exception:
             pass
+    _flot = updates.get("lot", cur["lot"])
+    _fpair = resolve_symbol(updates.get("pair", cur["pair"]),
+                            int(cur["account"]))
+    _lerr = _lot_check(int(cur["account"]), _fpair, float(_flot))
+    if _lerr:
+        return _fail(_lerr)
     try:
         changed = db.update_schedule(sid, **updates)
     except db.DuplicateScheduleError as exc:

@@ -20,19 +20,15 @@ EXEC_NAMES = {0: "REQUEST", 1: "INSTANT", 2: "MARKET", 3: "EXCHANGE", 4: "SYNCHR
 
 PROBE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 3.0
-MAX_PROBE_SYMBOLS = 35
-PROBE_CHUNK = 20
+# Probe the whole board, not a sample: every quoted symbol the account
+# exposes (live and demo alike), so scheduling validation and the panel
+# see each account's full tradeable universe.
+MAX_PROBE_SYMBOLS = 120
+PROBE_CHUNK = 30
 
 def probe_symbols_for(inst: int) -> tuple[str, ...]:
-    """Every symbol the broker's feed exposes, for probing.
-
-    Reads the EA spots feed (which now carries the Market-Watch symbols PLUS
-    every broker variant of the classic pairs - EURUSDc, EURUSD.raw,
-    XAUUSD247, ...), keeps the classic pairs first, then appends the rest, so
-    each broker's own quote suffixes get probed too.
-
-    Falls back to classic_pairs_for() when no spots feed is available yet.
-    """
+    """Every quoted symbol on this terminal (classic pairs first), capped
+    for one fast batch.  Falls back to classic pairs with no feed yet."""
     try:
         from spot import read_spots
         spots = read_spots(max_age=5.0)
@@ -153,6 +149,8 @@ class BrokerProber:
         self._ok: dict[int, bool] = {}
         self._opt: dict[int, dict] = {}
         self._opt_ts = 0.0
+        self._accounts: dict[int, dict] = {}
+        self._accounts_ts = 0.0
 
     @staticmethod
     def _sender(inst: int):
@@ -207,6 +205,16 @@ class BrokerProber:
                     }
                 except ValueError:
                     continue
+                # EA v1.73+ appends contract/tick economics; older EAs send
+                # 12 fields and simply omit these (scheduling validation
+                # degrades gracefully to volume limits).
+                if len(fields) >= 15:
+                    try:
+                        info["contract_size"] = float(fields[12])
+                        info["tick_value"] = float(fields[13])
+                        info["tick_size"] = float(fields[14])
+                    except ValueError:
+                        pass
                 info["filling_allowed"] = FILLING_NAMES.get(info["filling_flags"], "RETURN")
                 info["best"] = best_filling_from_flags(info["filling_flags"])
                 info["trade_mode_name"] = MODE_NAMES.get(info["trade_mode"], str(info["trade_mode"]))
@@ -309,9 +317,65 @@ class BrokerProber:
             snap = {inst: {s: dict(i) for s, i in syms.items()}
                     for inst, syms in self._data.items()}
             opt = {str(k): dict(v) for k, v in self._opt.items()}
+        try:
+            from spot import detect_suffix
+            suffix = {str(i): detect_suffix(i) for i in (1, 2)}
+        except Exception:
+            suffix = {}
         return {"ok": True, "terminals": {str(k): v for k, v in snap.items()},
                 "probed_at": {str(k): v for k, v in self._last_pass.items()},
-                "server_optimization": opt}
+                "server_optimization": opt,
+                "accounts": self.account_snapshot(),
+                "suffix": suffix}
+
+    def account_snapshot(self) -> dict:
+        """Per-terminal account economics for scheduling: leverage,
+        currency, margin mode/trade mode, balance.  Refreshed at most
+        every 30 s; reads the EA header (no trading)."""
+        now = time.time()
+        with self._lock:
+            if self._accounts and now - self._accounts_ts < 30.0:
+                return {str(k): dict(v) for k, v in self._accounts.items()}
+        snap: dict[int, dict] = {}
+        try:
+            from monitor import account_info
+            from spot import read_accounts, pick_terminal, read_header
+            for inst in (1, 2):
+                try:
+                    a = account_info(inst)
+                except Exception:
+                    continue
+                lev = str(a.get("leverage", "") or "").strip()
+                if lev.isdigit():
+                    lev = f"1:{lev}"
+                cur = ""
+                try:
+                    login = read_accounts().get(inst, {}).get("login", "")
+                    term = pick_terminal(login) if login else None
+                    if term:
+                        cur = read_header(term["trades_path"]).get("currency", "") or ""
+                except Exception:
+                    pass
+                snap[inst] = {
+                    "login": a.get("login", ""),
+                    "server": a.get("server", ""),
+                    "currency": cur,
+                    "leverage": lev,
+                    "balance": a.get("balance", 0.0),
+                    "equity": a.get("equity", 0.0),
+                    "margin": a.get("margin", 0.0),
+                    "margin_free": a.get("margin_free", 0.0),
+                    "margin_level": a.get("margin_level", 0.0),
+                    "positions": a.get("positions", 0),
+                    "trade_allowed": a.get("trade_allowed", "1"),
+                    "mql_allowed": a.get("mql_allowed", "1"),
+                }
+        except Exception:
+            pass
+        with self._lock:
+            self._accounts = snap
+            self._accounts_ts = now
+        return {str(k): dict(v) for k, v in snap.items()}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

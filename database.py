@@ -395,33 +395,6 @@ def due_schedules(now: float | None = None) -> list[dict]:
                 (now_dt.isoformat(timespec="seconds"),))
         return _fetchall(cur)
 
-def reschedule(sid: int) -> None:
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, "SELECT exec_h, exec_m, exec_s, next_fire FROM future_trades WHERE id=%s", (sid,))
-        else:
-            _exec(cur, "SELECT exec_h, exec_m, exec_s, next_fire FROM future_trades WHERE id=?", (sid,))
-        row = _fetchone(cur)
-        if not row:
-            return
-        _update_fire(cur, sid, row["exec_h"], row["exec_m"], row["exec_s"],
-                     row["next_fire"])
-
-def reschedule_at(sid: int, when) -> None:
-    if isinstance(when, str):
-        when = dt.datetime.fromisoformat(when)
-    if getattr(when, "tzinfo", None) is None:
-        when = when.replace(tzinfo=dt.timezone.utc)
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, "UPDATE future_trades SET next_fire=%s WHERE id=%s",
-                  (when.isoformat(timespec="seconds"), sid))
-        else:
-            _exec(cur, "UPDATE future_trades SET next_fire=? WHERE id=?",
-                  (when.isoformat(timespec="seconds"), sid))
-
 def claim_schedule(sid: int, expected_fire) -> bool:
     with _conn() as c:
         cur = c.cursor()
@@ -459,15 +432,6 @@ def _next_fire_from(exec_h: int, exec_m: int, exec_s: int, anchor) -> dt.datetim
     if nxt_local <= anchor_local:
         nxt_local += dt.timedelta(days=1)
     return _local_to_utc(nxt_local)
-
-def _update_fire(cur, sid: int, exec_h: int, exec_m: int, exec_s: int,
-                 current_fire) -> None:
-    nxt = _next_fire_from(exec_h, exec_m, exec_s, current_fire)
-    if USE_POSTGRES:
-        _exec(cur, "UPDATE future_trades SET next_fire=%s WHERE id=%s", (nxt, sid))
-    else:
-        _exec(cur, "UPDATE future_trades SET next_fire=? WHERE id=?",
-              (nxt.isoformat(timespec="seconds"), sid))
 
 def deactivate(sid: int) -> None:
     with _conn() as c:
@@ -643,17 +607,6 @@ def list_fired(limit: int = 50) -> list[dict]:
             _exec(cur, "SELECT * FROM fired ORDER BY id DESC LIMIT %s", (limit,))
         else:
             _exec(cur, "SELECT * FROM fired ORDER BY id DESC LIMIT ?", (limit,))
-        return _fetchall(cur)
-
-def fired_since(iso_utc: str) -> list[dict]:
-    with _conn() as c:
-        cur = c.cursor()
-        if USE_POSTGRES:
-            _exec(cur, "SELECT * FROM fired WHERE at >= %s ORDER BY id ASC",
-                  (iso_utc,))
-        else:
-            _exec(cur, "SELECT * FROM fired WHERE at >= ? ORDER BY id ASC",
-                  (iso_utc,))
         return _fetchall(cur)
 
 def kv_set(key: str, value: Any) -> None:

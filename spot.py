@@ -127,6 +127,88 @@ def _exec_dir(inst: int) -> Path:
     _EXEC_DIR_CACHE[inst] = (now + EXEC_DIR_TTL_S, stamp, resolved)
     return resolved
 
+_SUFFIX_CACHE: dict[int, tuple[float, str]] = {}
+SUFFIX_CACHE_TTL_S = 30.0
+
+def detect_suffix(inst: int) -> str:
+    """Broker symbol suffix for terminal `inst` (e.g. `.raw`, `m`),
+    auto-detected from the live feed.  '' when undetectable - callers
+    must pass symbols through in that case."""
+    now = time.monotonic()
+    cached = _SUFFIX_CACHE.get(inst)
+    if cached and now - cached[0] < SUFFIX_CACHE_TTL_S:
+        return cached[1]
+    suffix = _detect_suffix_uncached(inst)
+    _SUFFIX_CACHE[inst] = (now, suffix)
+    return suffix
+
+def _detect_suffix_uncached(inst: int) -> str:
+    try:
+        spots = read_spots(max_age=5.0)
+    except Exception:
+        return ""
+    names = [s for s, (b, _a, _t) in spots.items() if b]
+    if not names:
+        return ""
+    name_set = set(names)
+    votes: dict[str, int] = {}
+    for base in config.CLASSIC_PAIRS_RAW:
+        variants = [s for s in names
+                    if s != base and s.startswith(base)]
+        if base in name_set and not variants:
+            votes[""] = votes.get("", 0) + 1
+        elif variants and base not in name_set:
+            extras = {s[len(base):] for s in variants}
+            if len(extras) == 1:
+                extra = next(iter(extras))
+                votes[extra] = votes.get(extra, 0) + 1
+    if not votes:
+        return ""
+    best, n = max(votes.items(), key=lambda kv: kv[1])
+    if n >= 2 and n > sum(votes.values()) / 2:
+        return best
+    return ""
+
+def resolve_symbol(symbol: str, inst: int) -> str:
+    """Broker-exact symbol for `symbol` on terminal `inst`.
+
+    Exact feed hit wins (case-insensitive fallback included), then the
+    configured/detected suffix, then a unique prefix variant - else the
+    input passes through untouched.  Use for every order path so live and
+    demo accounts trade under their own quote names with zero config.
+    """
+    sym = str(symbol or "").strip()
+    if not sym:
+        return sym
+    try:
+        spots = read_spots(max_age=5.0)
+    except Exception:
+        spots = {}
+    live = {s: q for s, q in spots.items() if q and q[0]}
+    if sym in live:
+        return sym
+    try:
+        env_mapped = config.map_symbol(sym, inst)
+    except Exception:
+        env_mapped = sym
+    if env_mapped != sym and env_mapped in live:
+        return env_mapped
+    suffix = detect_suffix(inst)
+    if suffix and (sym + suffix) in live:
+        return sym + suffix
+    cands = [s for s in live if s.startswith(sym) and len(s) > len(sym)]
+    if len(cands) == 1:
+        return cands[0]
+    up = sym.upper()
+    ci = [s for s in live if s.upper() == up]
+    if ci:
+        return ci[0]
+    ci_pre = [s for s in live
+              if s.upper().startswith(up) and len(s) > len(sym)]
+    if len(ci_pre) == 1:
+        return ci_pre[0]
+    return sym + suffix if suffix else sym
+
 def compiled_paths(inst: int | None = None) -> list[Path]:
     if inst:
         return [TERMINALS[inst]["dir"] / "MQL5" / "Experts" / "SpotDump.ex5"]
@@ -238,17 +320,6 @@ def pick_terminal(login: str) -> dict | None:
         return None
     return terms[0] if terms else None
 
-def bridge_age(extra_paths: list[Path] | None = None) -> float:
-    files = spots_csv_paths() + trades_csv_paths() + (extra_paths or [])
-    newest = 0.0
-    now = time.time()
-    for p in files:
-        try:
-            newest = max(newest, p.stat().st_mtime)
-        except OSError:
-            pass
-    return now - newest if newest else 999.0
-
 def wait_for_bridge(inst: int = 1, timeout: float = 120) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -257,28 +328,13 @@ def wait_for_bridge(inst: int = 1, timeout: float = 120) -> bool:
         time.sleep(1)
     return False
 
-
-def _any_bridge_fresh(timeout_s: float = 5.0) -> bool:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if any(feed_age(inst) < 5 for inst in (1, 2)):
-            return True
-        time.sleep(0.25)
-    return False
-
 FEED_AGE_CACHE_TTL_S = 0.5
 _TERM_RUNNING_DEFAULT_TTL_S = 0.5
 
 def feed_age(inst: int = 1) -> float:
-    """Seconds since THIS terminal's EA last wrote a feed file.
-
-    Scoped to the terminal's own install tree.  A dead terminal must read
-    STALE even while its sibling is live, or the supervisor, health
-    endpoint and dashboard cannot see a one-sided feed death.  The global
-    scan fallback only applies when the install tree itself is absent
-    (non-portable setup) - never when the tree exists but holds no fresh
-    files.
-    """
+    """Seconds since THIS terminal's EA last wrote.  Scoped to the own
+    install tree (a dead terminal reads STALE even with a live sibling);
+    global scan only when the tree itself is absent."""
     now = time.time()
     cached = _FEED_AGE_CACHE.get(inst)
     if cached and now - cached[0] < FEED_AGE_CACHE_TTL_S:
@@ -327,13 +383,6 @@ def wine_bin() -> str:
             return cand
     return "wine"
 
-def wineserver_bin() -> str:
-    for ws in (shutil.which("wineserver"), "/usr/lib/wine/wineserver",
-               "/usr/bin/wineserver"):
-        if ws and os.path.exists(ws):
-            return ws
-    return "/usr/bin/wineserver"
-
 def term_running(inst: int = 1, max_age: float = 0.5) -> bool:
     cached = _TERM_RUNNING_CACHE.get(inst)
     now = time.monotonic()
@@ -348,65 +397,6 @@ def term_running(inst: int = 1, max_age: float = 0.5) -> bool:
         running = False
     _TERM_RUNNING_CACHE[inst] = (now, running)
     return running
-
-def check_terminal_running() -> bool:
-    return term_running(1)
-
-# Legacy XML chart form.  Unused (MT5 .chr/.tpl files use the key=value text
-# format, see MINIMAL_TPL in make_bridge_tpl.py) - kept only so nothing that
-# references the name breaks.
-MINIMAL_CHART_XML = """<chart>
-  <chart_settings>
-    <symbol>EURUSD</symbol>
-    <period>60</period>
-    <chart_type>1</chart_type>
-    <chart_mode>0</chart_mode>
-    <chart_shift>0</chart_shift>
-    <chart_autoscroll>1</chart_autoscroll>
-    <chart_scale>5</chart_scale>
-    <chart_scalefix>0</chart_scalefix>
-    <chart_scalefix_11>0</chart_scalefix_11>
-    <chart_scale_percent>0</chart_scale_percent>
-    <chart_points_per_bar>0</chart_points_per_bar>
-    <chart_show_ohlc>1</chart_show_ohlc>
-    <chart_show_grid>1</chart_show_grid>
-    <chart_show_volumes>1</chart_show_volumes>
-    <chart_show_line_break>0</chart_show_line_break>
-    <chart_show_bid_line>1</chart_show_bid_line>
-    <chart_show_ask_line>0</chart_show_ask_line>
-    <chart_show_last_line>0</chart_show_last_line>
-    <chart_show_period_sep>1</chart_show_period_sep>
-    <chart_show_time_scale>1</chart_show_time_scale>
-    <chart_color_background>16777215</chart_color_background>
-    <chart_color_foreground>0</chart_color_foreground>
-    <chart_color_grid>8421504</chart_color_grid>
-    <chart_color_volumes>8421504</chart_color_volumes>
-    <chart_color_bull>255</chart_color_bull>
-    <chart_color_bear>16711680</chart_color_bear>
-    <chart_color_line>0</chart_color_line>
-    <chart_color_ask>8421504</chart_color_ask>
-    <chart_color_stop>16711680</chart_color_stop>
-    <chart_color_profit>255</chart_color_profit>
-    <chart_color_last>0</chart_color_last>
-    <chart_color_bid_line>0</chart_color_bid_line>
-    <chart_color_ask_line>8421504</chart_color_ask_line>
-    <chart_color_last_line>0</chart_color_last_line>
-    <chart_color_period_sep>8421504</chart_color_period_sep>
-    <chart_shift_size>10</chart_shift_size>
-    <chart_scalefix_ratio>0</chart_scalefix_ratio>
-    <chart_scalefix_11_ratio>0</chart_scalefix_11_ratio>
-  </chart_settings>
-  <experts>
-    <expert>
-      <name>Experts\\SpotDump.ex5</name>
-      <flags>339</flags>
-      <window_num>0</window_num>
-    </expert>
-  </experts>
-  <indicators/>
-  <graphical_objects/>
-</chart>
-"""
 
 def sanitize_charts(inst: int = 1) -> None:
     charts_roots = [TERMINALS[inst]["dir"] / "Profiles" / "Charts",
@@ -427,16 +417,8 @@ def sanitize_charts(inst: int = 1) -> None:
             log.debug(f"terminal {inst}: chart sanitize skipped ({charts_root}): {exc}")
 
 def ensure_minimal_profile(inst: int) -> None:
-    """Force the boot profile SpotBridgeN to be ONE clean EURUSD chart.
-
-    This is the actual reason terminal 1 could come up cluttered while
-    terminal 2 came up minimal: MT5 silently rebuilds a default (busy)
-    profile whenever the profile folder is missing or holds no chart
-    files, and that state is sticky per install.  We write exactly one
-    chart file (chart01.chr) from the same minimalist text the Bridge
-    template uses, so BOTH terminals boot identically - one EURUSD chart
-    with the SpotDump EA attached and nothing else.
-    """
+    """Force boot profile SpotBridgeN to one clean EURUSD chart (prevents
+    MT5 rebuilding a cluttered default profile per install)."""
     try:
         import make_bridge_tpl
         tpl = make_bridge_tpl.minimal_chart_text()
@@ -480,10 +462,8 @@ def _write_start_cfg(inst: int, with_login: bool = True,
     the login block was skipped).
 
     `login_block` carries the intended credentials explicitly so a restart
-    cannot boot the wrong account when the on-disk session is reverted or
-    stale underneath it (the exact failure behind "live but stuck on the
-    old login" after a switch).  When omitted, the session is read as
-    before.
+    cannot boot the wrong account when the session is stale underneath it.
+    Returns the login written ('' if the login block was skipped).
     """
     ini = TERMINALS[inst]["ini"]
     written = ""
@@ -841,18 +821,6 @@ def _xdo_env() -> tuple[str | None, dict]:
     return xdo, dict(os.environ, DISPLAY=display)
 
 
-def _xdo(wid: str, *args: str, env: dict, timeout: float = 3.0) -> bool:
-    xdo, _ = _xdo_env()
-    if not xdo:
-        return False
-    try:
-        subprocess.run([xdo, *args, wid],
-                       capture_output=True, timeout=timeout, env=env)
-        return True
-    except Exception:
-        return False
-
-
 def _list_window_ids(env: dict) -> list[str]:
     xdo, _ = _xdo_env()
     if not xdo:
@@ -958,12 +926,6 @@ def _enforce_small_windows_once(inst: int, do_minimize: bool = True) -> int:
     return handled
 
 
-def _minimize_mt5_windows(inst: int) -> int:
-    """Kept for compatibility - now shrinks to small AND minimizes."""
-    keep = os.getenv("MT5_KEEP_WINDOWS", "") == "1"
-    return _enforce_small_windows_once(inst, do_minimize=not keep)
-
-
 def shrink_all_mt5_windows(do_minimize: bool = True) -> int:
     """Shrink EVERY MT5 window to small side-by-side slots.
 
@@ -1020,12 +982,8 @@ def _sync_minimize_once(inst: int, do_minimize: bool = True,
 
 def minimize_terminal(inst: int, tries: int = 60,
                       delay: float = 0.5) -> None:
-    """Shrink terminal `inst` to its small slot as soon as it appears.
-
-    The worker first blocks in `xdotool search --sync` so the window is
-    caught and minimized the instant it maps (no fullscreen flash), then
-    keeps re-pinning on a tight loop because MT5 re-shows/re-maximizes
-    around login.  Purely cosmetic - never raises, never blocks.
+    """Shrink terminal `inst` to its small slot as soon as it appears
+    (event-driven wait, then re-pins; cosmetic, never raises/blocks).
     """
     keep = os.getenv("MT5_KEEP_WINDOWS", "") == "1"
 
@@ -1062,15 +1020,10 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
                     with_login: bool = True,
                     login_block: dict | None = None,
                     allow_when_restarting: bool = False) -> bool:
-    """Launch terminal `inst`.  Returns True when a launch was issued AND
-    the boot config carries the intended login.
-
-    `login_block` bypasses the session read for the boot credentials (see
-    _write_start_cfg) and the written Login= is verified before the
-    process starts: launching MT5 with the wrong account's config is
-    worse than not launching at all.  Launches that would rival an
-    in-flight intentional restart are refused unless `allow_when_restarting`
-    (set only by restart_terminal, which owns the marker).
+    """Launch terminal `inst`; True when launched with the intended login
+    in the boot config.  Explicit `login_block` bypasses the session
+    read; rival launches during an in-flight restart are refused unless
+    `allow_when_restarting` (restart_terminal only).
     """
     if not allow_when_restarting and restart_in_progress(inst):
         log.info(f"terminal {inst}: launch skipped - a restart is already "
@@ -1135,15 +1088,8 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     return True
 
 def server_known(inst: int, server: str) -> bool:
-    """Has this terminal's MT5 install ever seen trade server `server`?
-
-    MT5 keeps one directory per known trade server under Bases/.  Booting
-    an unknown server BY NAME silently never connects - the terminal just
-    keeps its last account (seen with FxPro-MT5: 90 s burn, still on the
-    old login).  Callers must then use an access point (host:port, which
-    resolves without prior knowledge) or onboard the server with one
-    manual login inside MT5 followed by ADOPT.
-    """
+    """Has this terminal's MT5 install ever seen trade server `server`
+    (Bases/ dir)?  Unknown-by-name boots silently keep the last account."""
     name = str(server or "").strip()
     if not name:
         return False
@@ -1245,17 +1191,8 @@ def mark_restart_end(inst: int) -> None:
         pass
 
 def restart_in_progress(inst: int, ttl: float = RESTART_MARK_TTL_S) -> bool:
-    """Is an intentional restart of `inst` currently in flight?
-
-    The supervisor's DOWN-relaunch must stand down while the account
-    engine (or a heal) is stopping/relaunching a terminal on purpose -
-    otherwise the supervisor launches a RIVAL instance mid-restart,
-    its boot config (read from a stale session view) wins, and the
-    engine burns its whole login timeout "live but stuck on the old
-    login".  Cross-process via a small marker file next to the start
-    configs; stale markers expire via TTL so a crashed restart cannot
-    suppress healing forever.
-    """
+    """Is an intentional restart of `inst` in flight?  The supervisor's
+    DOWN-relaunch stands down while marked (marker file, 180 s TTL)."""
     try:
         text = restart_marker_path(inst).read_text(encoding="ascii",
                                                    errors="replace")
@@ -1340,17 +1277,8 @@ def stop_terminal(inst: int = 1) -> bool:
 def restart_terminal(inst: int = 1,
                      login_block: dict | None = None) -> bool:
     """Stop + relaunch terminal `inst` into its intended account.
-
-    `login_block` ({"login","password","server"}) is written into the boot
-    config verbatim instead of re-reading the session deep inside the
-    launch - the engine passes the credentials it just stored, so a
-    session revert racing the restart cannot boot the WRONG account.
-
-    The whole stop->launch gap is covered by a restart marker so the
-    supervisor never launches a rival instance mid-restart, and success
-    requires proof the process actually cycled (no pre-stop PID may
-    survive): a "successful" restart that leaves the old process running
-    is exactly how a switch ends "live but stuck on the old login".
+    Success requires proof the process actually cycled (no pre-stop PID
+    may survive) - a phantom restart would leave the old login in place.
     """
     log.info(f"restarting MT5 terminal {inst}...")
     mark_restart_begin(inst)
@@ -1546,33 +1474,6 @@ def candles(symbol: str = "EURUSD", limit: int = 300) -> list[dict]:
             except ValueError:
                 continue
     return [memo[k] for k in sorted(memo)[-limit:]]
-
-def read_trades(login: str | None = None) -> list[dict]:
-    if login:
-        term = pick_terminal(login)
-        if not term:
-            return []
-        try:
-            raw = term["trades_path"].read_text(encoding="cp1252", errors="replace")
-        except OSError:
-            return []
-    else:
-        raw = _newest_text(trades_csv_paths())
-        if raw is None:
-            return []
-    rows: list[dict] = []
-    for line in raw.splitlines():
-        parts = [p.strip() for p in line.split("\t")]
-        if len(parts) >= 2 and parts[0] == "NONE":
-            continue
-        if len(parts) >= 11:
-            rows.append({
-                "ticket": parts[0], "symbol": parts[1], "side": parts[2],
-                "volume": parts[3], "open": parts[4], "cur": parts[5],
-                "pl": parts[6], "swap": parts[7], "magic": parts[8],
-                "time": parts[9], "comment": parts[10],
-            })
-    return rows
 
 def render_line(sym: str, bid: str, ask: str, ts: str, prev: dict) -> str:
     digits = 2 if sym == "XAUUSD" else (3 if sym == "XAGUSD" else 5)

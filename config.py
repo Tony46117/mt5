@@ -50,7 +50,7 @@ MAX_EQUITY_SAMPLES = int(os.getenv("MT5_MAX_EQUITY_SAMPLES", "4320"))
 MS_CANDLE_SECONDS = int(os.getenv("MT5_MS_CANDLE", "15"))
 MS_MAX_BARS = int(os.getenv("MT5_MS_BARS", "200"))
 DEFAULT_SYMBOL = os.getenv("MT5_DEFAULT_SYMBOL", "EURUSD")
-MS_WINDOW = int(os.getenv("MT5_MS_WINDOW", "5"))
+MS_WINDOW = int(os.getenv("MT5_MS_WINDOW", "30"))
 SYMBOL_SUFFIX_1 = os.getenv("MT5_SYMBOL_SUFFIX_1", "").strip()
 SYMBOL_SUFFIX_2 = os.getenv("MT5_SYMBOL_SUFFIX_2", "").strip()
 
@@ -80,13 +80,6 @@ def map_symbol(symbol: str, inst: int) -> str:
         return symbol
     return f"{symbol}{suffix}"
 
-def unmap_symbol(symbol: str, inst: int) -> str:
-    """Map a broker-specific symbol back to base symbol."""
-    suffix = SYMBOL_SUFFIX_1 if inst == 1 else SYMBOL_SUFFIX_2
-    if not suffix or not symbol.endswith(suffix):
-        return symbol
-    return symbol[:-len(suffix)]
-
 def classic_pairs_for(inst: int) -> tuple[str, ...]:
     """Get classic pairs with correct suffix for a terminal."""
     suffix = SYMBOL_SUFFIX_1 if inst == 1 else SYMBOL_SUFFIX_2
@@ -112,15 +105,8 @@ SERVER_ACCESS_POINTS: dict[str, str] = {
 }
 
 def access_point_for(server: str) -> str:
-    """Access point (host:port) to boot a server NAME with, or ''.
-
-    Only servers that a stock MT5 cannot resolve by name need an entry
-    here; anything else keeps using its plain server name.  Any server
-    can also be covered WITHOUT a code change via
-    MT5_AP_<SERVER_NAME> (non-alphanumerics become _), e.g.
-    MT5_AP_FXPRO_MT5=mt5-ld4.fxpro.com:443 once FxPro support confirms
-    the host.
-    """
+    """Access point (host:port) for a server NAME MT5 can't resolve, or ''.
+    Covers listed servers plus MT5_AP_<NAME> env overrides."""
     name = str(server or "").strip()
     if not name:
         return ""

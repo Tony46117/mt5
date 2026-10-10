@@ -181,21 +181,9 @@ class TerminalWorker(threading.Thread):
 
     def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S,
                     server: str = "", boot_ts: float = 0.0) -> tuple[dict, float, bool]:
-        """Two-phase verification that the terminal is in `want`.
-
-        Phase 1 waits for the EA feed to report `want` as its login
-        (usually seconds after a restart).  Phase 2 waits, bounded by
-        SYNC_TIMEOUT_S, for the broker to deliver the trade-account
-        details (currency non-empty).  Returns (header, matched_in_s,
-        synced).
-
-        Only a phase-1 timeout raises: the terminal never reached the
-        wanted account.  A matched-but-unsynced login is a *successful
-        switch* with the broker sync still pending (seen with FxPro-MT5,
-        where MT5 can take minutes to synchronize a fresh login) - the
-        caller reports it as success-with-sync-pending instead of
-        burning the whole timeout and failing.
-        """
+        """Two-phase check the terminal is in `want`: EA login match, then
+        broker sync (currency).  Returns (header, matched_in_s, synced).
+        Matched-but-unsynced is success-with-sync-pending, not failure."""
         br = _bridge()
         sp = _spot()
         t0 = time.monotonic()

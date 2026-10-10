@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.72"
+#property version   "1.73"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -894,7 +894,10 @@ void ExecuteLine(string line)
                 DoubleToString(SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN), 2) + "|" +
                 DoubleToString(SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX), 2) + "|" +
                 DoubleToString(SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP), 2) + "|" +
-                IntegerToString(SymbolInfoInteger(sym, SYMBOL_SPREAD)));
+                IntegerToString(SymbolInfoInteger(sym, SYMBOL_SPREAD)) + "|" +
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE), 2) + "|" +
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE), 8) + "|" +
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE), 8));
       return;
      }
 

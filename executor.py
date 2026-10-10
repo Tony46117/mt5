@@ -9,11 +9,11 @@ import uuid
 import datetime as dt
 import os
 
-from config import CONFIG, setup_logging, map_symbol, classic_pairs_for
+from config import CONFIG, setup_logging
 
 from pathlib import Path
 
-from spot import exec_in_path, exec_out_path, feed_age, BOLD, DIM, RESET, GREEN, RED
+from spot import exec_in_path, exec_out_path, feed_age, resolve_symbol, BOLD, DIM, RESET, GREEN, RED
 import database as db
 
 log = setup_logging(__name__)
@@ -376,7 +376,7 @@ class SendCommand:
                    timeout: float | None = None) -> tuple[bool, str]:
         # Symbol case is significant (e.g. "Boom 1000 Index") - pass through
         # exactly as given, only stripping whitespace.
-        mapped = map_symbol(symbol.strip(), self.inst)
+        mapped = resolve_symbol(symbol, self.inst)
         return self.send("OPEN", mapped, side.upper(), f"{lot:.2f}",
                          "0", "0", str(magic), comment, timeout=timeout)
 
@@ -386,7 +386,7 @@ class SendCommand:
         """Place a pending order: type is BUYLIMIT / BUYSTOP / SELLLIMIT /
         SELLSTOP and `price` is the trigger level.  The result detail is
         `price|order_ticket|volume`, same shape as a market fill."""
-        mapped = map_symbol(symbol.strip(), self.inst)
+        mapped = resolve_symbol(symbol, self.inst)
         p = ptype.upper().replace(" ", "").replace("_", "")
         return self.send("PENDING", mapped, p, f"{lot:.2f}", f"{price:.8f}",
                          "0", "0", str(magic), comment, timeout=timeout)
@@ -396,7 +396,7 @@ class SendCommand:
 
     def close_all(self, symbol: str | None = None,
                   timeout: float | None = None) -> tuple[bool, str]:
-        mapped = map_symbol(symbol.strip(), self.inst) if symbol else "ALL"
+        mapped = resolve_symbol(symbol, self.inst) if symbol else "ALL"
         return self.send("CLOSEALL", mapped, timeout=timeout)
 
     def ping(self) -> tuple[bool, str]:
@@ -795,9 +795,10 @@ class FutureTradeScheduler(threading.Thread):
         n = max(1, int(sch["n_positions"]))
         cmd = sender_for(acc)
         # same broker-symbol mapping as every other order path
-        # (open_trade / open_pending / close_all all map_symbol).
+        # Broker-exact symbol on this terminal (exact feed hit, suffix,
+        # unique variant, else passthrough - see spot.resolve_symbol).
         # Case is significant ("Boom 1000 Index") - never uppercase.
-        mapped = map_symbol(pair.strip(), acc)
+        mapped = resolve_symbol(pair, acc)
         try:
             from spot import read_spots
             spots = read_spots()

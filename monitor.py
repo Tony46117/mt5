@@ -82,10 +82,6 @@ def account_info(inst: int) -> dict:
             "broker": head.get("broker", "") or "",
             "leverage": head.get("leverage", "") or ""}
 
-def TERMINAL_DIR(inst: int):
-    from spot import TERMINALS
-    return TERMINALS[inst]["dir"]
-
 class Monitor:
 
     def __init__(self, account_no: int, strict_identity: bool = True):
