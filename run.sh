@@ -141,9 +141,9 @@ if curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "starting web app on :8000 (log: $APP_LOG)..."
+echo "starting web app on :8000 (log: $APP_LOG, production WSGI)..."
 : > "$APP_LOG"
-"$PY" -u "$HERE/app.py" >>"$APP_LOG" 2>&1 &
+"$PY" -u "$HERE/app.py" --production >>"$APP_LOG" 2>&1 &
 APP_PID=$!
 
 for _ in $(seq 1 30); do

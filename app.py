@@ -398,7 +398,7 @@ def api_accounts():
                     "accounts": {"1": acc1, "2": acc2}})
 
 @app.post("/api/trade")
-@rate_limit(max_requests=120, window=60)
+@rate_limit(max_requests=300, window=60)
 def api_trade():
     d = request.get_json(silent=True) or {}
     try:
@@ -488,7 +488,7 @@ def api_trade():
                 "ms": round(order_ms, 1)})
 
 @app.post("/api/order")
-@rate_limit(max_requests=120, window=60)
+@rate_limit(max_requests=300, window=60)
 def api_order():
     """Place a PENDING order: BUY LIMIT / BUY STOP / SELL LIMIT / SELL STOP.
 
@@ -603,7 +603,7 @@ def api_order():
                 "type": ptype, "ms": round(order_ms, 1)})
 
 @app.post("/api/close")
-@rate_limit(max_requests=120, window=60)
+@rate_limit(max_requests=300, window=60)
 def api_close():
     d = request.get_json(silent=True) or {}
     try:

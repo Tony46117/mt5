@@ -483,19 +483,68 @@ def print_diagnosis(inst: int) -> None:
         print(f"  broker feed: no symbols available")
     print()
 
+def _open_count(acc: int, pair: str | None) -> int | None:
+    """Open positions for (acc, pair) right now, or None when unknown.
+
+    None (identity mismatch / no feed) must NEVER read as "empty" - a
+    close verified against a veil would declare victory while positions
+    stand.  Callers keep waiting/retrying on None.
+    """
+    from spot import read_accounts, pick_terminal, read_header
+    from monitor import read_positions
+    login = read_accounts().get(acc, {}).get("login", "")
+    term = pick_terminal(login) if login else None
+    if not term:
+        return None
+    try:
+        head = read_header(term["trades_path"])
+    except Exception:
+        return None
+    if not head or head.get("login") != login:
+        return None
+    if pair in (None, "ALL"):
+        try:
+            return int(head.get("positions", 0))
+        except (TypeError, ValueError):
+            return None
+    try:
+        rows = read_positions(acc)
+    except Exception:
+        return None
+    return sum(1 for r in rows if r.get("symbol") == pair)
+
+def _positions_empty(acc: int, pair: str | None, timeout: float = 5.0) -> bool:
+    """Poll until the broker reports zero open positions (or timeout).
+
+    The EA fans CLOSEALL out asynchronously, so the command ack only means
+    "closes flighted" - this poll is the actual truth, and it costs one
+    50 ms tick past the fills instead of serializing N blocking closes.
+    """
+    deadline = time.monotonic() + max(0.5, timeout)
+    while time.monotonic() < deadline:
+        n = _open_count(acc, pair)
+        if n == 0:
+            return True
+        time.sleep(0.05)
+    return _open_count(acc, pair) == 0
+
 def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, str]:
     ok, detail = False, ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            ok, detail = sender_for(acc).close_all(pair, timeout=FIRE_DEADLINE)
+            ok, detail = sender_for(acc).close_all(pair, timeout=8.0)
         except Exception as exc:
             detail = f"exception: {exc}"
-        if ok:
+        # The ack only proves the closes were flighted (async fan-out);
+        # verify against the position book before claiming success.
+        if _positions_empty(acc, pair, timeout=5.0):
             if attempt > 1:
-                log.info(f"close acc{acc} {pair}: OK on retry {attempt} - {detail}")
+                log.info(f"close acc{acc} {pair}: verified empty on retry "
+                         f"{attempt} - {detail}")
             return True, detail
         if attempt < attempts:
-            log.warning(f"close acc{acc} {pair} failed ({detail}) - "
+            log.warning(f"close acc{acc} {pair} not empty after attempt "
+                        f"{attempt} ({detail}) - "
                         f"retry {attempt + 1}/{attempts} in {RETRY_DELAY_S * 1000:.0f} ms")
             time.sleep(RETRY_DELAY_S)
     log.error(f"close acc{acc} {pair} FAILED after {attempts} attempts: {detail}")

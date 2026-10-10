@@ -364,20 +364,6 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
 
 COMMON_JS = """
 function $id(x){return document.getElementById(x)}
-/* ASMR tap: soft satisfying click (quiet sine blip + haptic). Fast: <40 ms,
-   no assets, no blocking. Used by CLOSE ALL + ORDER buttons. */
-let _AC=null;
-function asmrTap(f){try{
-  if(navigator.vibrate)try{navigator.vibrate(8)}catch(e){}
-  const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
-  _AC=_AC||new C();
-  if(_AC.state==='suspended')_AC.resume();
-  const o=_AC.createOscillator(),g=_AC.createGain();
-  o.type='sine';o.frequency.value=f||1900;
-  g.gain.setValueAtTime(0.06,_AC.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.0001,_AC.currentTime+0.07);
-  o.connect(g);g.connect(_AC.destination);o.start();o.stop(_AC.currentTime+0.08);
- }catch(e){}}
 function asmrPop(el){if(!el)return;el.classList.remove('pop');void el.offsetWidth;el.classList.add('pop')}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
@@ -978,7 +964,7 @@ function buildPanel(n){
   '</div>'+
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
   '<div class="order-wrap"><button class="btn order-mini" id="ordBtn'+n+'" '+
-   'onclick="asmrTap(1900);asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
+   'onclick="asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
  '</div>'+ '<div class="sect"><h4>Open positions</h4><div class="right">'+
   '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
   '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
@@ -1052,12 +1038,10 @@ async function closeAll(n,el){
    immediate "closing..." toast, no artificial waits. */
 async function closeAllBoth(el){
  if(INFLIGHT['caall'])return;INFLIGHT['caall']=true;
- const b=el||$id('closeAllTopBtn');if(b){b.disabled=true;asmrPop(b)}
- asmrTap(1400);
- toast('closing ALL (both accounts)...',true);
- try{const j=await post('/api/close-all',{symbol:'ALL'});
-  asmrTap(2200);
-  toast((j.detail||'close-all sent')+'  -  '+(j.wall_ms||0)+' ms wall',true);refresh()}
+  const b=el||$id('closeAllTopBtn');if(b){b.disabled=true;asmrPop(b)}
+  toast('closing ALL (both accounts)...',true);
+  try{const j=await post('/api/close-all',{symbol:'ALL'});
+   toast((j.detail||'close-all sent')+'  -  '+(j.wall_ms||0)+' ms wall',true);refresh()}
  catch(e){toast('CLOSE ALL: '+e.message,false)}
  finally{INFLIGHT['caall']=false;if(b)b.disabled=false}}
 async function restartTerm(n){
@@ -1148,10 +1132,9 @@ function openOrderModal(n){
  fill()}
 async function submitOrder(n){
  if(INFLIGHT['o'+n])return;INFLIGHT['o'+n]=true;
- const b=$id('oBtn'+n),f=$id('ofb'+n);
- if(b){asmrPop(b);b.disabled=true}
- asmrTap(1900);
- const sym=($id('osym'+n)||{}).value||'',typ=($id('otyp'+n)||{}).value||'';
+  const b=$id('oBtn'+n),f=$id('ofb'+n);
+  if(b){asmrPop(b);b.disabled=true}
+  const sym=($id('osym'+n)||{}).value||'',typ=($id('otyp'+n)||{}).value||'';
  const lot=parseFloat(($id('olot'+n)||{}).value);
  const whole=($id('owl'+n)||{}).value,frac=($id('ofr'+n)||{}).value;
  let cnt=parseInt((($id('onum'+n)||{}).value||'1'),10);
@@ -1159,10 +1142,9 @@ async function submitOrder(n){
  if(!(lot>0)){f.className='feedback err';f.textContent='lot must be > 0';
   toast('lot must be > 0',false);if(b)b.disabled=false;delete INFLIGHT['o'+n];return}
  f.className='feedback';f.textContent='placing '+typ+' '+sym+(cnt>1?' x'+cnt:'')+' ...';
- try{const j=await post('/api/order',{account:+n,symbol:sym,type:typ,lot:lot,
-   level_whole:whole,level_frac:frac,n:cnt});
-  asmrTap(2200);
-  f.className='feedback ok';
+  try{const j=await post('/api/order',{account:+n,symbol:sym,type:typ,lot:lot,
+    level_whole:whole,level_frac:frac,n:cnt});
+   f.className='feedback ok';
   const got=(j.n||j.ok||1), tk=j.tickets||(j.ticket?[j.ticket]:[]);
   f.textContent='PLACED '+(got>1?got+'/'+cnt+' ':'#'+j.ticket+' ')+typ+' '+sym+' @ '+j.price+' ('+j.ms+' ms)';
   toast(typ+' '+sym+(cnt>1?' x'+cnt:'')+' @ '+j.price+' placed'+
