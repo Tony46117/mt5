@@ -86,6 +86,22 @@ SYNC_POLL_S = 0.5
 NO_ATTEMPT_S = 15.0
 STATUS_CACHE_TTL_S = 1.0
 MAX_OPS_KEPT = 40
+# Change-triggered waits: the wait loops below used to sleep a FIXED
+# 150/400/500 ms per iteration, so success/failure was noticed up to half a
+# second AFTER the broker delivered it (and every iteration re-ran the full
+# header parse + journal scan whether anything moved or not).  stat() on two
+# files costs microseconds (measured 0.005 ms), and the EA rewrites
+# trades.csv on every tick while live, so the loops now nap in 50 ms slices
+# and wake the instant trades.csv or the journal moves.  Same gates, same
+# timeouts, same caps: worst case is exactly today's cadence (dead terminal
+# = fingerprint never changes = full cap slept), best case notices in
+# ~50 ms.  Tune with MT5_ENGINE_NAP.
+CHANGE_NAP_S = float(os.getenv("MT5_ENGINE_NAP", "0.05") or 0.05)
+if not 0.005 <= CHANGE_NAP_S <= 1.0:
+    CHANGE_NAP_S = 0.05
+# Journal file list (a directory glob, ~0.34 ms) is re-resolved at most this
+# often inside a wait; rotation across midnight is still picked up.
+JOURNAL_PATHS_TTL_S = 5.0
 
 TRADE_MODE_LABELS = {"0": "demo", "1": "contest", "2": "live"}
 
@@ -200,6 +216,65 @@ class TerminalWorker(threading.Thread):
         if op is not None and op.state == "running":
             op.detail = text
 
+    def _journal_paths(self) -> list:
+        """Newest journal files, re-globbed at most every few seconds.
+
+        The glob costs ~0.34 ms - nothing once per wait, too much at every
+        50 ms nap.  The TTL still picks up rotation across midnight."""
+        now = time.monotonic()
+        cached = getattr(self, "_journal_paths_cache", None)
+        if cached and now - cached[0] < JOURNAL_PATHS_TTL_S:
+            return cached[1]
+        try:
+            paths = _spot()._journal_files(self.inst)
+        except Exception:
+            paths = []
+        self._journal_paths_cache = (now, paths)
+        return paths
+
+    def _finger(self):
+        """Cheap change fingerprint: trades.csv + journal mtimes/sizes.
+
+        Never raises (None on any error, which simply reads as 'changed' or
+        'unchanged' and keeps the wait safe).  stat() is microseconds; the
+        header parse and journal decode it gates run only on change."""
+        try:
+            st = (config.TERMINALS[self.inst]["dir"] / "MQL5" / "Files"
+                  / "trades.csv").stat()
+            t = (st.st_mtime_ns, st.st_size)
+        except (OSError, KeyError, TypeError):
+            t = None
+        try:
+            stats = []
+            for p in self._journal_paths():
+                try:
+                    s = p.stat()
+                    stats.append((s.st_mtime_ns, s.st_size))
+                except OSError:
+                    stats.append(None)
+            j = tuple(stats) or None
+        except Exception:
+            j = None
+        return (t, j)
+
+    def _nap_until_change(self, prev, cap: float):
+        """Sleep up to `cap` seconds, waking early when files move.
+
+        Returns the new fingerprint.  Same cap the fixed sleep used, so a
+        silent terminal waits exactly as before; a live one is noticed
+        within ~CHANGE_NAP_S instead of a full period later."""
+        deadline = time.monotonic() + max(0.02, cap)
+        while True:
+            time.sleep(CHANGE_NAP_S)
+            try:
+                cur = self._finger()
+            except Exception:
+                return prev
+            if cur != prev:
+                return cur
+            if time.monotonic() >= deadline:
+                return cur
+
     def _authorized(self, want: str, h: dict, started_at: float) -> bool:
         """Has the trade server actually ACCEPTED this login?
 
@@ -284,6 +359,7 @@ class TerminalWorker(threading.Thread):
         matched_at = 0.0
         last_progress = 0.0
         self._progress(f"waiting for {want}...")
+        finger = self._finger()
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
             got = str(h.get("login", ""))
@@ -341,7 +417,10 @@ class TerminalWorker(threading.Thread):
                     state = "logged out / still starting"
                 self._progress(f"waiting for {want}: terminal reports "
                                f"{state} ({elapsed:.0f}s elapsed)")
-            time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
+            # Change-triggered nap: same cap as the old fixed sleep, but a
+            # tick/journal write wakes us in ~50 ms instead of a full period.
+            finger = self._nap_until_change(
+                finger, FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
         else:
             h = br.header_for(self.inst)
         matched_in = time.monotonic() - t0
@@ -355,8 +434,8 @@ class TerminalWorker(threading.Thread):
         if h.get("currency"):
             return h, matched_in, True
         sync_deadline = time.monotonic() + SYNC_TIMEOUT_S
+        finger = self._finger()
         while time.monotonic() < sync_deadline:
-            time.sleep(SYNC_POLL_S)
             h = br.header_for(self.inst)
             if str(h.get("login", "")) != want:
                 break              # terminal moved away - re-check below
@@ -365,6 +444,7 @@ class TerminalWorker(threading.Thread):
             rejected = self._broker_rejection(want, started_at, server)
             if rejected:
                 raise EngineError(rejected)
+            finger = self._nap_until_change(finger, SYNC_POLL_S)
         h = br.header_for(self.inst)
         if str(h.get("login", "")) != want:
             raise EngineError(f"terminal left {want} while waiting for the "
@@ -556,8 +636,8 @@ class TerminalWorker(threading.Thread):
             self._progress(f"adopting {login} - waiting for the broker "
                            f"sync...")
             deadline = time.monotonic() + SYNC_TIMEOUT_S
+            finger = self._finger()
             while time.monotonic() < deadline:
-                time.sleep(SYNC_POLL_S)
                 h = br.header_for(self.inst)
                 cur = str(h.get("login", ""))
                 if cur in ("", "0", "?"):
@@ -567,6 +647,7 @@ class TerminalWorker(threading.Thread):
                 login = cur
                 if h.get("currency"):
                     break
+                finger = self._nap_until_change(finger, SYNC_POLL_S)
             else:
                 h = br.header_for(self.inst)
                 login = str(h.get("login", "")) or login

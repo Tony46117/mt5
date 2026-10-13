@@ -7,8 +7,10 @@ import os
 import re
 import select
 import sys
+import threading
 import time
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 
 from config import CONFIG, setup_logging
 
@@ -20,6 +22,17 @@ SEC = CONFIG.ms_candle_seconds
 WINDOW_DEFAULT = CONFIG.ms_window
 MAX_BARS = CONFIG.ms_max_bars
 SYMBOL_DEFAULT = CONFIG.default_symbol
+
+# Switchable timeframes: 15s/30s aggregate live ticks; 1m+ resample the M1
+# history (candles.csv) plus the live forming minute.  Labels double as the
+# --tf CLI values and the button row.
+TFS: tuple[tuple[str, int], ...] = (
+    ("15s", 15), ("30s", 30), ("1m", 60), ("2m", 120),
+    ("3m", 180), ("5m", 300), ("15m", 900),
+)
+TF_SECS = {lab: sec for lab, sec in TFS}
+TF_LABELS = {sec: lab for lab, sec in TFS}
+DEFAULT_TF = 15
 
 GLYPH_WICK = "│"
 GLYPH_BODY = "█"
@@ -108,47 +121,26 @@ def _quote_ts_recent(ts: str, max_age_s: float = 120.0) -> bool:
 
 class CandleBuilder:
 
-    __slots__ = ("bars", "cur", "last_mid", "symbol")
+    __slots__ = ("bars", "cur", "last_mid", "symbol", "m1")
 
     def __init__(self, symbol: str):
-        self.bars: list[dict] = []
+        self.bars: list[dict] = []   # live 15 s bars (SEC buckets)
+        self.m1: list[dict] = []     # M1 history seed (minute buckets)
         self.cur: dict | None = None
         self.last_mid = 0.0
         self.symbol = symbol
 
-    def seed_from_m1(self) -> None:
-        self.bars = []
-        # Shared history: suffixed variants fall back to the base symbol's
-        # M1 bars (candles.csv carries base names) so every pair starts from
-        # the same bars instead of an empty chart.
-        rows: list = []
-        for cand in _history_candidates(self.symbol):
-            try:
-                rows = candles(cand, limit=MAX_BARS)
-            except Exception:
-                rows = []
-            if rows:
-                break
-        for b in rows:
-            self.bars.append({
-                "t": int(b["t"]) * 60,
-                "o": float(b["o"]), "h": float(b["h"]),
-                "l": float(b["l"]), "c": float(b["c"]),
-                "v": int(b["v"]),
-            })
-
-    def tick(self) -> bool:
-        bid, ask, _ = _live_quote(self.symbol)
-        if not bid or not ask:
-            return False
+    def tick_mid(self, mid: float, now: float | None = None) -> bool:
+        """Fold one mid price into the live 15 s bars.  No I/O: the caller
+        supplies the quote, so one spots read feeds every pair."""
         try:
-            mid = (float(bid) + float(ask)) / 2.0
-        except ValueError:
+            mid = float(mid)
+        except (TypeError, ValueError):
             return False
         if mid <= 0:
             return False
-
-        bucket = int(time.time() // SEC) * SEC
+        now = time.time() if now is None else now
+        bucket = int(now // SEC) * SEC
         changed = False
 
         if self.cur and bucket != self.cur["t"]:
@@ -171,9 +163,271 @@ class CandleBuilder:
         self.last_mid = mid
         return changed
 
+    def tick(self) -> bool:
+        bid, ask, _ = _live_quote(self.symbol)
+        if not bid or not ask:
+            return False
+        try:
+            mid = (float(bid) + float(ask)) / 2.0
+        except ValueError:
+            return False
+        return self.tick_mid(mid)
+
     def window(self, n: int) -> list[dict]:
         all_bars = self.bars + ([self.cur] if self.cur else [])
         return all_bars[-max(1, n):]
+
+    def view(self, tf: int, n: int) -> list[dict]:
+        """Bars for timeframe `tf` (seconds), oldest-first, at most `n`.
+
+        tf < 60 resamples the live 15 s bars, fronted by M1 history older
+        than the session (same mixed-resolution context as before, so a
+        fresh launch still paints instantly); tf >= 60 resamples the M1
+        history merged with the live forming minutes (seed minutes at or
+        after the first live minute are dropped so nothing double-counts).
+        """
+        n = max(1, n)
+        live = self.bars + ([self.cur] if self.cur else [])
+        if tf < 60:
+            if not live:
+                return []
+            try:
+                first_min = (min(int(b["t"]) for b in live) // 60) * 60
+            except (TypeError, ValueError, KeyError):
+                return resample(live, tf)[-n:]
+            ctx = [b for b in self.m1
+                   if int(b.get("t", 0)) < first_min][-MAX_BARS:]
+            return (ctx + resample(live, tf))[-n:]
+        full = _m1_with_live(self.m1, live)
+        return resample(full, tf)[-n:]
+
+
+def resample(bars: list[dict], tf: int) -> list[dict]:
+    """Bucket `bars` (ascending t, seconds) into `tf`-second candles.
+
+    Exchange-style alignment: bucket = t // tf * tf, so 15m bars align to
+    hour quarters on every pair identically."""
+    tf = max(1, int(tf))
+    out: list[dict] = []
+    for b in bars:
+        try:
+            bucket = (int(b["t"]) // tf) * tf
+        except (TypeError, ValueError, KeyError):
+            continue
+        if out and out[-1]["t"] == bucket:
+            o = out[-1]
+            try:
+                o["h"] = max(o["h"], b["h"])
+                o["l"] = min(o["l"], b["l"])
+                o["c"] = b["c"]
+                o["v"] = int(o.get("v", 0)) + int(b.get("v", 0))
+            except (TypeError, ValueError, KeyError):
+                continue
+        else:
+            try:
+                out.append({"t": bucket, "o": float(b["o"]),
+                            "h": float(b["h"]), "l": float(b["l"]),
+                            "c": float(b["c"]), "v": int(b.get("v", 0))})
+            except (TypeError, ValueError, KeyError):
+                continue
+    return out
+
+
+def _m1_with_live(seed_m1: list[dict], live15: list[dict]) -> list[dict]:
+    """M1 history with live forming minutes appended (no double-count)."""
+    if not live15:
+        return list(seed_m1)
+    try:
+        first_min = min((int(b["t"]) // 60) * 60 for b in live15)
+    except (TypeError, ValueError, KeyError):
+        return list(seed_m1)
+    mins: dict[int, dict] = {}
+    for b in live15:
+        try:
+            m = (int(b["t"]) // 60) * 60
+        except (TypeError, ValueError, KeyError):
+            continue
+        o = mins.get(m)
+        if o is None:
+            try:
+                mins[m] = {"t": m, "o": float(b["o"]), "h": float(b["h"]),
+                           "l": float(b["l"]), "c": float(b["c"]),
+                           "v": int(b.get("v", 0))}
+            except (TypeError, ValueError, KeyError):
+                continue
+        else:
+            try:
+                o["h"] = max(o["h"], b["h"])
+                o["l"] = min(o["l"], b["l"])
+                o["c"] = b["c"]
+                o["v"] = int(o.get("v", 0)) + int(b.get("v", 0))
+            except (TypeError, ValueError, KeyError):
+                continue
+    full = [b for b in seed_m1 if int(b.get("t", 0)) < first_min]
+    full.extend(mins[m] for m in sorted(mins))
+    return full
+
+
+class ChartStore:
+    """All pairs, all timeframes, kept live concurrently.
+
+    One CandleBuilder per symbol holds the M1 seed + live 15 s bars; every
+    timeframe resamples from that shared state, so switching pair or TF is
+    instant and every view agrees by construction.  A background ticker
+    folds each feed update into EVERY builder (one spots read per cycle),
+    while M1 seeds load in a thread pool so a slow candles.csv parse never
+    stalls the first paint.  Each builder has its own lock; snapshots for
+    rendering never race the ticker.
+    """
+
+    def __init__(self, interval: float = 0.1, seed_workers: int = 4):
+        self._states: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._interval = max(0.02, float(interval))
+        self._pool = ThreadPoolExecutor(max_workers=seed_workers,
+                                        thread_name_prefix="ms-seed")
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def ensure(self, symbol: str) -> None:
+        """Create the builder if missing and seed its M1 history (pooled)."""
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            return
+        with self._lock:
+            st = self._states.get(symbol)
+            if st is None:
+                st = {"cb": CandleBuilder(symbol), "lock": threading.Lock(),
+                      "seeding": False, "seeded": False}
+                self._states[symbol] = st
+            if st["seeded"] or st["seeding"]:
+                return
+            st["seeding"] = True
+        self._pool.submit(self._seed_one, symbol)
+
+    def _seed_one(self, symbol: str) -> None:
+        try:
+            with self._lock:
+                st = self._states.get(symbol)
+            if st is None:
+                return
+            cb = st["cb"]
+            m1: list[dict] = []
+            rows: list = []
+            for cand in _history_candidates(symbol):
+                try:
+                    rows = candles(cand, limit=MAX_BARS)
+                except Exception:
+                    rows = []
+                if rows:
+                    break
+            for b in rows:
+                try:
+                    m1.append({
+                        "t": int(b["t"]) * 60,
+                        "o": float(b["o"]), "h": float(b["h"]),
+                        "l": float(b["l"]), "c": float(b["c"]),
+                        "v": int(b["v"]),
+                    })
+                except (TypeError, ValueError, KeyError):
+                    continue
+            with st["lock"]:
+                cb.m1 = m1
+                st["seeded"] = True
+        except Exception as exc:
+            log.debug(f"ms seed {symbol} failed: {exc}")
+        finally:
+            try:
+                with self._lock:
+                    if symbol in self._states:
+                        self._states[symbol]["seeding"] = False
+            except Exception:
+                pass
+
+    def seed_blocking(self, symbol: str) -> None:
+        """Synchronous M1 seed (for --once: no threads needed)."""
+        self.ensure(symbol)
+        with self._lock:
+            st = self._states.get(symbol)
+        if st is not None and not st["seeded"]:
+            self._seed_one(symbol)
+
+    def tick_all(self) -> int:
+        """Fold the current feed into every builder.  Returns builders fed."""
+        try:
+            spots = read_spots()
+        except Exception:
+            return 0
+        now = time.time()
+        fed = 0
+        with self._lock:
+            items = list(self._states.items())
+        for symbol, st in items:
+            try:
+                q = spots.get(symbol)
+                if not q or not q[0]:
+                    for cand in _history_candidates(symbol):
+                        q = spots.get(cand)
+                        if q and q[0]:
+                            break
+                    else:
+                        up = symbol.upper()
+                        for k, v in spots.items():
+                            if v and v[0] and str(k).upper() == up:
+                                q = v
+                                break
+                if not q or not q[0] or not q[1]:
+                    continue
+                mid = (float(q[0]) + float(q[1])) / 2.0
+            except (TypeError, ValueError, IndexError):
+                continue
+            try:
+                with st["lock"]:
+                    if st["cb"].tick_mid(mid, now):
+                        fed += 1
+            except Exception:
+                continue
+        return fed
+
+    def bars(self, symbol: str, tf: int, n: int) -> list[dict]:
+        """Resampled view for (symbol, tf); empty when nothing yet."""
+        with self._lock:
+            st = self._states.get(symbol)
+        if st is None:
+            return []
+        try:
+            with st["lock"]:
+                return st["cb"].view(tf, n)
+        except Exception:
+            return []
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="ms-ticker")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            if self._thread:
+                self._thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.tick_all()
+            except Exception as exc:
+                log.debug(f"ms ticker: {exc}")
+            self._stop.wait(self._interval)
 
 def _row_of(p: float, hi: float, lo: float, rows: int) -> int:
     r = int((hi - p) / (hi - lo) * (rows - 1))
@@ -294,11 +548,11 @@ def _key_for(i: int) -> str:
 
 
 def render_bar(symbols: list[str], sel: int,
-               width: int) -> tuple[list[str], list[tuple[int, int, int, str]]]:
-    """Symbol buttons.  Returns (lines, [(line, x0, x1, symbol), ...])
-    with plain-text coordinates for click mapping."""
+               width: int) -> tuple[list[str], list[tuple[int, int, int, str, str]]]:
+    """Symbol buttons.  Returns (lines, [(line, x0, x1, kind, value), ...])
+    with plain-text coordinates for click mapping (kind is "sym")."""
     lines: list[str] = []
-    mapping: list[tuple[int, int, int, str]] = []
+    mapping: list[tuple[int, int, int, str, str]] = []
     parts: list[str] = []
     plain = ""
     li = 0
@@ -312,11 +566,29 @@ def render_bar(symbols: list[str], sel: int,
         x0 = len(plain)
         parts.append((f"{BOLD}{BLUE}{label}{RESET}" if i == sel
                       else f"{DIM}{label}{RESET}") + " ")
-        mapping.append((li, x0, x0 + len(label), s))
+        mapping.append((li, x0, x0 + len(label), "sym", s))
         plain += label + " "
     if parts:
         lines.append("".join(parts))
     return lines, mapping
+
+
+def render_tf_row(tf: int, width: int) -> tuple[list[str], list[tuple[int, int, int, str, int]]]:
+    """Timeframe buttons (15s..15m), one row.  Selected TF highlighted;
+    mapping entries are (line, x0, x1, "tf", seconds)."""
+    line = ""
+    plain = ""
+    mapping: list[tuple[int, int, int, str, int]] = []
+    for lab, sec in TFS:
+        label = f"[{lab}]"
+        if len(plain) + len(label) + 1 > width:
+            break  # 7 short buttons always fit any sane width; guard anyway
+        x0 = len(plain)
+        line += ((f"{BOLD}{BLUE}{label}{RESET}" if sec == tf
+                  else f"{DIM}{label}{RESET}") + " ")
+        plain += label + " "
+        mapping.append((0, x0, x0 + len(label), "tf", sec))
+    return ([line] if line else [], mapping)
 
 _MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([mM])")
 
@@ -462,10 +734,10 @@ def render_candles(bars: list[dict], width: int, height: int,
         lines.append(lab + "".join(cell(ch, tag) for ch, tag in grid[r]))
     return "\n".join(lines)
 
-def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
+def draw(store: ChartStore, symbol: str, tf: int, width: int, height: int,
          window_n: int, symbols: list[str],
-         sel: int) -> tuple[str, list[tuple[int, int, int, str]]]:
-    bars = cb.window(window_n)
+         sel: int) -> tuple[str, list[tuple[int, int, int, str, object]]]:
+    bars = store.bars(symbol, tf, window_n)
     # Spots merge both terminals: live when EITHER feed is fresh (was
     # feed_age(1) only, so a stale T1 masked a live T2 for every pair).
     try:
@@ -473,6 +745,7 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
     except Exception:
         age = feed_age(1)
     now = dt.datetime.now().strftime("%H:%M:%S")
+    tf_lab = TF_LABELS.get(tf, f"{tf}s")
 
     if age > 30:
         status = f"{RED}STALE {age:.0f}s{RESET}"
@@ -482,24 +755,30 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
         status = f"{BLUE}LIVE {age*1000:.0f}ms{RESET}"
 
     digits = digits_for(symbol)
+    tf_lines, tf_map = render_tf_row(tf, width)
     bar_lines, bar_map = render_bar(symbols, sel, width)
-    bar_map = [(li + 3, x0, x1, s) for li, x0, x1, s in bar_map]
-    bar_txt = "\n".join(bar_lines)
-    hint = (f"{DIM}click a button or press 1-9,0,a-z · [ ] cycle · q quit{RESET}"
+    # Layout: 3 head lines, then the TF row, then symbol rows - absolute
+    # line numbers so clicks land on the right button.
+    mapping = [(li + 3, x0, x1, kind, val) for li, x0, x1, kind, val in tf_map]
+    mapping += [(li + 3 + len(tf_lines), x0, x1, kind, val)
+                for li, x0, x1, kind, val in bar_map]
+    bar_txt = "\n".join(tf_lines + bar_lines)
+    hint = (f"{DIM}click a button or press 1-9,0,a-z · t/T timeframe · "
+            f"[ ] cycle · q quit{RESET}"
             if symbols else "")
 
     if len(bars) < 1:
-        return ((f"{BOLD}{CYAN}┌─ MS {SEC}s ─────────────────────────────────────────┐{RESET}\n"
+        return ((f"{BOLD}{CYAN}┌─ MS {tf_lab} ─────────────────────────────────────────┐{RESET}\n"
                  f"{BOLD}{CYAN}│{RESET} {symbol:<7} {DIM}{now}{RESET}  {status}  "
                  f"{DIM}warming up...{RESET}\n"
                  f"{BOLD}{CYAN}└──────────────────────────────────────────────────┘{RESET}\n"
-                 f"{bar_txt}\n{hint}"), bar_map)
+                 f"{bar_txt}\n{hint}"), mapping)
 
     last, first = bars[-1], bars[0]
     delta = last["c"] - first["o"]
     dcol = BLUE if delta >= 0 else RED
 
-    head = (f"{BOLD}{CYAN}┌─ MS {SEC}s ─────────────────────────────────────────┐{RESET}\n"
+    head = (f"{BOLD}{CYAN}┌─ MS {tf_lab} ─────────────────────────────────────────┐{RESET}\n"
             f"{BOLD}{CYAN}│{RESET} {CYAN}{symbol:<7}{RESET} {DIM}{now}{RESET}  {status}  "
             f"last {BOLD}{last['c']:.{digits}f}{RESET}  "
             f"{dcol}{delta:+.{digits}f}{RESET}  "
@@ -507,11 +786,13 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
             f"{BOLD}{CYAN}└──────────────────────────────────────────────────┘{RESET}")
 
     return (head + "\n" + bar_txt + "\n" + hint + "\n"
-            + render_candles(bars, width, height, digits), bar_map)
+            + render_candles(bars, width, height, digits), mapping)
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Live 15s candlestick terminal chart")
+    ap = argparse.ArgumentParser(description="Live multi-timeframe candlestick terminal chart")
     ap.add_argument("--symbol", default=SYMBOL_DEFAULT)
+    ap.add_argument("--tf", "--timeframe", default="15s",
+                    help="initial timeframe: 15s,30s,1m,2m,3m,5m,15m (default 15s)")
     ap.add_argument("--once", action="store_true", help="draw one frame and exit")
     ap.add_argument("--interval", type=float, default=0.1,
                     help="tick poll seconds (default 0.1)")
@@ -521,16 +802,9 @@ def main() -> int:
                     help=f"candles shown (default {WINDOW_DEFAULT})")
     args = ap.parse_args()
     window_n = max(2, args.window)
+    tf = TF_SECS.get(str(args.tf).strip().lower(), DEFAULT_TF)
 
-    builders: dict[str, CandleBuilder] = {}
-
-    def builder_for(sym: str) -> CandleBuilder:
-        cb = builders.get(sym)
-        if cb is None:
-            cb = CandleBuilder(sym)
-            cb.seed_from_m1()
-            builders[sym] = cb
-        return cb
+    store = ChartStore(interval=args.interval)
 
     symbols = available_symbols(args.symbol)
     try:
@@ -539,34 +813,53 @@ def main() -> int:
         sel = 0
         symbols.insert(0, args.symbol)
     symbol = symbols[sel]
-    cb = builder_for(symbol)
+    for s in symbols:
+        store.ensure(s)
 
     if args.once:
-        cb.tick()
-        frame, _ = draw(cb, symbol, args.width, args.height, window_n,
-                        symbols, sel)
+        store.seed_blocking(symbol)
+        store.tick_all()
+        frame, _ = draw(store, symbol, tf, args.width, args.height,
+                        window_n, symbols, sel)
         print(frame)
+        store.stop()
         return 0
 
-    log.info(f"MS {SEC}s {symbol} chart starting ({window_n}-candle window)")
+    log.info(f"MS {TF_LABELS[tf]} {symbol} chart starting ({window_n}-candle window)")
     if not CONFIG.wineprefix.exists():
         log.warning(f"no MT5 wine prefix found at {CONFIG.wineprefix} - waiting for the bridge")
 
+    store.start()
     ui = UiInput()
-    bar_map: list[tuple[int, int, int, str]] = []
+    bar_map: list[tuple[int, int, int, str, object]] = []
     last_frame = ""
     first = True
     no_data_warned = False
     last_relist = 0.0
+    tf_order = [sec for _lab, sec in TFS]
 
     def switch(ns: int) -> None:
-        nonlocal sel, symbol, cb, last_frame
+        nonlocal sel, symbol, last_frame
         if not symbols:
             return
         sel = ns % len(symbols)
         symbol = symbols[sel]
-        cb = builder_for(symbol)
+        store.ensure(symbol)
         last_frame = ""          # force full redraw on switch
+
+    def switch_tf(ntf: int) -> None:
+        nonlocal tf, last_frame
+        if ntf == tf:
+            return
+        tf = ntf
+        last_frame = ""          # same data, new resampling - redraw
+
+    def cycle_tf(step: int) -> None:
+        try:
+            i = tf_order.index(tf)
+        except ValueError:
+            i = 0
+        switch_tf(tf_order[(i + step) % len(tf_order)])
 
     try:
         while True:
@@ -575,12 +868,15 @@ def main() -> int:
             if data:
                 clicks, data = parse_clicks(data)
                 for x, y in clicks:
-                    for li, x0, x1, s in bar_map:
+                    for li, x0, x1, kind, val in bar_map:
                         if li == y - 1 and x0 <= x - 1 <= x1:
-                            try:
-                                switch(symbols.index(s))
-                            except ValueError:
-                                pass
+                            if kind == "tf":
+                                switch_tf(int(val))
+                            else:
+                                try:
+                                    switch(symbols.index(str(val)))
+                                except ValueError:
+                                    pass
                             break
                 for ch in data:
                     if ch in ("q", "Q", "\x03"):
@@ -593,6 +889,10 @@ def main() -> int:
                         idx = 10 + (ord(ch) - ord("a"))
                         if idx < len(symbols):
                             switch(idx)
+                    elif ch == "t":
+                        cycle_tf(1)
+                    elif ch == "T":
+                        cycle_tf(-1)
                     elif ch == "[":
                         switch(sel - 1)
                     elif ch == "]":
@@ -604,15 +904,17 @@ def main() -> int:
                 fresh = available_symbols(symbol)
                 if fresh != symbols:
                     symbols = fresh
+                    for s in symbols:
+                        store.ensure(s)
                     try:
                         sel = symbols.index(symbol)
                     except ValueError:
                         sel = 0
                         symbol = symbols[0]
-                        cb = builder_for(symbol)
                     last_frame = ""
-            cb.tick()
-            frame, bar_map = draw(cb, symbol, args.width, args.height,
+            # Ticks run in the background thread for every pair; render the
+            # selected pair/TF from shared state (instant on switch).
+            frame, bar_map = draw(store, symbol, tf, args.width, args.height,
                                   window_n, symbols, sel)
 
             if "warming up" in frame and not no_data_warned:
@@ -633,6 +935,7 @@ def main() -> int:
         sys.stdout.write("\033[?25h\nbye!\n")
     finally:
         ui.close()
+        store.stop()
     return 0
 
 if __name__ == "__main__":
