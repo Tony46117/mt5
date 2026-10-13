@@ -7,12 +7,19 @@ terminal, built on top of the existing session / spot / bridge plumbing
 
   * one worker thread per terminal - logins never fight each other and
     never block the web panel or the executor
-  * every operation is validated BEFORE a terminal is touched
-  * every operation is verified AFTER it runs (EA-reported login must
-    match what was requested)
+  * every operation is validated BEFORE a terminal is touched - including
+    whether MT5 can reach the trade server at all (a server this install
+    has never seen needs an access point; without one MT5 never dials)
+  * every operation is verified AFTER it runs, against the BROKER's own
+    authorization (account details, or MT5's `authorized on <server>`
+    journal line) - the EA echoing the requested login number is not proof
+    of anything, and treating it as one is what made a CXM account look
+    logged in while it was never connected
   * adopts an account already logged in on the terminal (password pulled
     from the known-accounts book when available)
   * demo/real detection from the EA header (ACCOUNT_TRADE_MODE)
+  * access-point registry so a brand-new broker is a one-line addition
+    (`--access-point` / `/api/engine/access-point` / the panel button)
   * an operation registry so the web panel and CLI can show live status
 
 Deliberately NOT touched: executor.py, the scheduler, database schema,
@@ -26,10 +33,12 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import re
 import threading
 import time
 import datetime as dt
 
+import config
 from config import setup_logging
 import session
 import accounts as known_accounts
@@ -64,6 +73,17 @@ STUCK_LOGIN_S = 30.0
 # instead of burning the whole login timeout and failing.
 SYNC_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.5
+# A header that reports the wanted login is NOT proof of a login.  MT5 fills
+# ACCOUNT_LOGIN/ACCOUNT_SERVER straight from the start config, so a terminal
+# whose trade-server name this install does not know reports the requested
+# login FOREVER while never opening a connection.  Treating that as a match
+# is what made a CXM login report "logged in ... broker still syncing" (and
+# left terminal 1 wedged) while terminal 2 burned the full 90 s timeout and
+# blamed the password.  A login is only real once the broker itself says so:
+# account details arrive (currency non-empty) or MT5's journal carries
+# `'<login>': authorized on <server>`.  Neither within this window, past the
+# boot grace, means MT5 never even attempted it - fail fast and say why.
+NO_ATTEMPT_S = 15.0
 STATUS_CACHE_TTL_S = 1.0
 MAX_OPS_KEPT = 40
 
@@ -180,11 +200,75 @@ class TerminalWorker(threading.Thread):
         if op is not None and op.state == "running":
             op.detail = text
 
+    def _authorized(self, want: str, h: dict, started_at: float) -> bool:
+        """Has the trade server actually ACCEPTED this login?
+
+        The EA header echoes the login the start config asked for even when
+        MT5 never dialled out, so the login number alone proves nothing.
+        Proof is either the broker's account details (currency non-empty) or
+        MT5's own `'<login>': authorized on <server>` journal line.
+        """
+        if h.get("currency"):
+            return True
+        try:
+            return bool(_spot().last_auth_success(self.inst, want, started_at))
+        except Exception:
+            return False
+
+    def _access_point_hint(self, server: str) -> str:
+        """The exact, actionable way to make an unknown server loginable."""
+        try:
+            ap = config.access_point_for(server)
+        except Exception:
+            ap = ""
+        name = server or "SERVER"
+        if ap:
+            return (f"An access point ({ap}) IS configured for {server or '?'} "
+                    f"but no connection came up - check that host:port is "
+                    f"still reachable (and that it is the right one).")
+        key = "MT5_AP_" + re.sub(r"\W+", "_", str(name)).upper().strip("_")
+        return (f"Fix it once and every later login to {server or '?'} works:\n"
+                f"    add a line  \"{name} = host:port\"  to "
+                f"access_points.env   (or export {key}=host:port), then "
+                f"retry - the port is the broker's MT5 access port, e.g.\n"
+                f"    {name} = mt5.<broker>.com:443\n"
+                f"Alternatively log in once by hand inside MT5 (File -> "
+                f"Login to Trade Account) and press ADOPT: after that one "
+                f"connect the server is in MT5's own list and plain name "
+                f"logins work.")
+
+    def _never_attempted_error(self, want: str, server: str) -> str:
+        """MT5 took the credentials into its config but never dialled out.
+
+        This state has the same signature as a slow broker sync (no
+        rejection line, no balance) which is exactly why it used to be
+        reported as success for the whole timeout.  The cause is almost
+        always a trade-server name this MT5 install does not know: MT5 only
+        dials a server it already lists, or one handed to it as an ACCESS
+        POINT (host:port) in the boot config.
+        """
+        return (f"terminal {self.inst}: MT5 never attempted login {want} @ "
+                f"{server or '?'} - the EA echoed the requested login but no "
+                f"connection was made (no authorized / authorization-failed "
+                f"line in MT5's journal).  "
+                + self._access_point_hint(server))
+
+    def _login_event(self, sp, want: str, started_at: float) -> tuple[str, str]:
+        try:
+            return sp.last_login_event(self.inst, want, started_at)
+        except Exception:
+            return "", ""
+
     def _wait_login(self, want: str, timeout: float = WAIT_LOGIN_TIMEOUT_S,
                     server: str = "", boot_ts: float = 0.0) -> tuple[dict, float, bool]:
-        """Two-phase check the terminal is in `want`: EA login match, then
-        broker sync (currency).  Returns (header, matched_in_s, synced).
-        Matched-but-unsynced is success-with-sync-pending, not failure."""
+        """Two-phase check the terminal is in `want`: the trade server must
+        ACCEPT the credentials, then deliver account details.
+
+        Returns (header, matched_in_s, synced).  Matched-but-unsynced is
+        success-with-sync-pending, not failure - but only once authorization
+        is actually proven, so a login MT5 never even attempted can no longer
+        masquerade as success.
+        """
         br = _bridge()
         sp = _spot()
         t0 = time.monotonic()
@@ -197,26 +281,40 @@ class TerminalWorker(threading.Thread):
                            f"{BOOT_GRACE_S - boot_age:.0f}s to connect...)")
         h: dict = {}
         stuck_since = 0.0
+        matched_at = 0.0
         last_progress = 0.0
         self._progress(f"waiting for {want}...")
         while time.monotonic() < deadline:
             h = br.header_for(self.inst)
-            if str(h.get("login", "")) == want:
+            got = str(h.get("login", ""))
+            if got == want and self._authorized(want, h, started_at):
                 break
             rejected = self._broker_rejection(want, started_at, server)
             if rejected:
                 raise EngineError(rejected)
-            got = str(h.get("login", ""))
             # Boot grace: a young process reporting the old login (or
             # nothing yet) is still starting, NOT stuck.  Only a settled
-            # (past-grace) terminal counts toward the stuck shortcut.
+            # (past-grace) terminal counts toward the shortcuts below.
             past_grace = (not boot_ts
                           or time.monotonic() - boot_ts >= BOOT_GRACE_S)
-            if got and got not in ("0", "?"):
-                try:
-                    live = sp.feed_age(self.inst) < 5.0
-                except Exception:
-                    live = False
+            try:
+                live = sp.feed_age(self.inst) < 5.0
+            except Exception:
+                live = False
+            if got == want:
+                # MT5 took the credentials but the trade server has not
+                # accepted them yet.  Give it the boot window, then stop
+                # pretending: no journal event at all means no dial happened.
+                if not matched_at:
+                    matched_at = time.monotonic()
+                settled = time.monotonic() - matched_at > NO_ATTEMPT_S
+                if settled and past_grace and live:
+                    kind, _detail = self._login_event(sp, want, started_at)
+                    if not kind:
+                        raise EngineError(
+                            self._never_attempted_error(want, server))
+                stuck_since = 0.0
+            elif got and got not in ("0", "?"):
                 if live and past_grace:
                     if not stuck_since:
                         stuck_since = time.monotonic()
@@ -234,8 +332,13 @@ class TerminalWorker(threading.Thread):
             elapsed = time.monotonic() - t0
             if elapsed - last_progress > 2.0:
                 last_progress = elapsed
-                state = (got if got and got not in ("0", "?")
-                         else "logged out / still starting")
+                if got == want:
+                    state = (f"{want} (waiting for the trade server to "
+                             f"authorize)")
+                elif got and got not in ("0", "?"):
+                    state = got
+                else:
+                    state = "logged out / still starting"
                 self._progress(f"waiting for {want}: terminal reports "
                                f"{state} ({elapsed:.0f}s elapsed)")
             time.sleep(FAST_POLL_S if elapsed < FAST_POLL_WINDOW_S else SLOW_POLL_S)
@@ -267,6 +370,10 @@ class TerminalWorker(threading.Thread):
             raise EngineError(f"terminal left {want} while waiting for the "
                               f"broker sync (now reports "
                               f"{h.get('login', '') or 'logged out'})")
+        if not self._authorized(want, h, started_at):
+            # Never authorized, and the sync window is over: this is the
+            # phantom-login state, not a slow broker.
+            raise EngineError(self._never_attempted_error(want, server))
         return h, matched_in, False
 
     def _broker_rejection(self, want: str, since: float, server: str) -> str:
@@ -307,61 +414,59 @@ class TerminalWorker(threading.Thread):
         exe = sp.TERMINALS[self.inst]["dir"] / "terminal64.exe"
         if not exe.exists():
             raise EngineError(f"terminal {self.inst} is not installed ({exe})")
-        # Grade the server BEFORE touching anything: booting a server
-        # no install on this box has ever seen silently never connects
-        # (the terminal keeps its last account) - a restart plus a long
-        # burn for nothing.  A server only the SIBLING install knows is
-        # attempted anyway with a warning (MT5 may still resolve it); a
-        # server known nowhere needs an access point or one manual login.
-        from config import access_point_for
+        # Grade the server BEFORE touching anything.  Booting a server name
+        # this install has never seen is not a slow login, it is a NO login:
+        # the terminal adopts the login into its config (so the EA header
+        # echoes it and the engine used to call that "logged in"), never
+        # dials anything, and the operator waits out the whole timeout for an
+        # account that was never attempted.  Observed live with
+        # CXMDirect-Live.  So: known to THIS install -> go; known only to the
+        # sibling -> attempt with a warning; known nowhere and with no access
+        # point -> stop now with the exact one-line fix.
+        # MT5_STRICT_UNKNOWN_SERVER=1 keeps its old meaning (always refuse).
+        # MT5_TRY_UNKNOWN_SERVER=1 forces the old attempt-by-name behaviour.
+        ap = config.access_point_for(server)
         new_here_note = ""
-        if (not sp.server_known(self.inst, server)
-                and not access_point_for(server)):
-            if sp.server_known_anywhere(server):
+        if not sp.server_known(self.inst, server):
+            if ap:
+                new_here_note = (f" (server {server} is new to this MT5 "
+                                 f"install - booting via access point {ap})")
+                log.info(f"terminal {self.inst}: booting new server {server} "
+                         f"via access point {ap}")
+            elif sp.server_known_anywhere(server):
                 new_here_note = (f" (server {server} is new to terminal "
                                  f"{self.inst} - attempting anyway)")
                 log.info(f"terminal {self.inst}: server {server} known to "
                          f"sibling install only - attempting login anyway")
-            elif os.getenv("MT5_STRICT_UNKNOWN_SERVER", "") == "1":
-                import re as _re
-                ap_key = ("MT5_AP_"
-                          + _re.sub(r"\W+", "_", server).upper().strip("_"))
+            elif (os.getenv("MT5_STRICT_UNKNOWN_SERVER", "") == "1"
+                  or os.getenv("MT5_TRY_UNKNOWN_SERVER", "") != "1"):
                 raise EngineError(
-                    f"terminal {self.inst} has never seen server {server!r} - "
-                    f"MT5 cannot log into it by name yet (it would just keep "
-                    f"the current account). Double-check the exact spelling "
-                    f"against your broker's account email, or log in once "
-                    f"manually inside MT5 (File -> Login to Trade Account), "
-                    f"then press ADOPT - after that one-click logins work. "
-                    f"(Alternatively set {ap_key} to the "
-                    f"broker's host:port and restart the stack.)")
+                    f"terminal {self.inst} has never seen trade server "
+                    f"{server!r} and has no access point for it - MT5 does "
+                    f"not dial a server that is missing from its own list, "
+                    f"so this login would be attempted forever without ever "
+                    f"connecting (the EA header would still echo "
+                    f"{login!r}).  " + self._access_point_hint(server))
             else:
-                # MT5 resolves trade servers from MetaQuotes' public server
-                # list, so a broker this install has never CONNECTED to -
-                # a Deriv account on an HFM install, a brand-new broker -
-                # is still loginable by name.  "Bases/<server>" only
-                # appears AFTER the first successful connect, so refusing
-                # here made that first connect impossible without a manual
-                # UI login: exactly the "need the Deriv MT5 setup" wall.
-                # Attempt it; a genuine rejection is reported by the
-                # settled-terminal check in _wait_login.
                 new_here_note = (f" (server {server} is new to this MT5 "
                                  f"install - attempting the login by name)")
                 log.warning(
                     f"terminal {self.inst}: server {server} is not in this "
-                    f"install's Bases yet - attempting the login anyway (MT5 "
-                    f"can resolve it from the public server list; set "
-                    f"MT5_STRICT_UNKNOWN_SERVER=1 to refuse instead)")
+                    f"install's Bases yet - attempting the login anyway "
+                    f"(MT5_TRY_UNKNOWN_SERVER=1 is set)")
 
         # Fast path: already there.  A repeat click (or a manual UI switch
-        # the supervisor already adopted) must NOT bounce a healthy
-        # terminal through a full wine reboot - verify in place instead.
+        # the supervisor already adopted) must NOT bounce a healthy terminal
+        # through a full wine reboot - verify in place instead.  Only for a
+        # login the broker actually accepted: a mere echoed login number is
+        # the phantom state, and that one needs the restart below.
         br = _bridge()
         try:
             cur = br.header_for(self.inst)
         except Exception:
             cur = {}
-        if str(cur.get("login", "")) == login:
+        cur_login = str(cur.get("login", ""))
+        if cur_login == login and self._authorized(login, cur, 0.0):
             accs = session.load()
             accs[self.inst] = {"login": login, "password": password,
                                "server": server}
@@ -370,6 +475,8 @@ class TerminalWorker(threading.Thread):
                 known_accounts.remember(login, password, server)
             except ValueError:
                 pass
+            if ap:
+                config.register_access_point(server, ap)
             self._progress(f"already on {login} - verifying sync...")
             h, matched_in, synced = self._wait_login(login, server=server,
                                                      boot_ts=0.0)
@@ -381,7 +488,7 @@ class TerminalWorker(threading.Thread):
 
         # write the slot (the other terminal's slot stays untouched)
         prev = session.load()
-        accs = session.load()
+        accs = dict(prev)
         accs[self.inst] = {"login": login, "password": password,
                            "server": server}
         session.set_accounts(accs, persist=True)
@@ -413,6 +520,14 @@ class TerminalWorker(threading.Thread):
             except Exception:
                 pass
             raise
+        if ap and synced:
+            # Prove-and-remember: this access point just delivered a live
+            # account, so later logins to this server resolve without the
+            # operator keeping the registry line around.
+            learned = config.register_access_point(server, ap)
+            if learned:
+                log.info(f"terminal {self.inst}: learned access point "
+                         f"{server} -> {learned}")
         mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "unknown")
         base = (f"logged into {login} @ {server} "
                 f"[{mode}] bal {h.get('balance', '-')} "
@@ -421,7 +536,7 @@ class TerminalWorker(threading.Thread):
                 + new_here_note)
         if synced:
             return base
-        return (base + " - broker still syncing account details "
+        return (base + " - authorized, broker still syncing account details "
                 "(no currency yet); balances fill in once MT5 finishes "
                 "syncing")
 
@@ -455,6 +570,20 @@ class TerminalWorker(threading.Thread):
             else:
                 h = br.header_for(self.inst)
                 login = str(h.get("login", "")) or login
+                # No account details after the whole sync window: only adopt
+                # if the trade server REALLY authorized this login.  Without
+                # this check a terminal that merely echoed a configured login
+                # (see _never_attempted_error) could be adopted as a live
+                # account, and the whole stack would then trade against a
+                # phantom.
+                if not self._authorized(login, h, 0.0):
+                    raise EngineError(
+                        f"terminal {self.inst} is not really logged in: MT5 "
+                        f"only echoes {login} from its last config and the "
+                        f"trade server never authorized it (no account "
+                        f"details after {SYNC_TIMEOUT_S:.0f}s).  "
+                        + self._access_point_hint(
+                            str(h.get("server", "")) or "?"))
                 log.warning(f"terminal {self.inst}: adopting account {login} "
                             f"before the broker delivered account details "
                             f"(no currency after {SYNC_TIMEOUT_S:.0f}s)")
@@ -635,8 +764,24 @@ class AccountEngine:
             if got == "0":
                 got = ""
             synced_acct = bool(h and h.get("currency"))
-            verified = bool(want and got == want)
+            checked_srv = str(stored.get("server", "")) or ""
+            echoed = bool(want and got == want)
+            # `verified` means the BROKER accepted this login, not merely that
+            # the EA echoed the configured number.  MT5 fills ACCOUNT_LOGIN
+            # from the start config even when the trade server is unknown and
+            # nothing is ever dialled, so "login matches" alone is precisely
+            # the phantom state that made a CXM account look logged in.
+            recent_auth = False
+            if echoed and not synced_acct and checked_srv:
+                try:
+                    from spot import last_auth_success as _auth_ok
+                    recent_auth = bool(_auth_ok(inst, want,
+                                                time.time() - 1800.0))
+                except Exception:
+                    recent_auth = False
+            verified = bool(echoed and (synced_acct or recent_auth))
             syncing = bool(verified and not synced_acct)
+            phantom = bool(echoed and not verified)
             # Stalled sync: matched login but the broker hasn't delivered
             # account details for 10+ minutes (unreachable server rather
             # than a slow sync).  Tracked in shared kv so every process
@@ -662,12 +807,17 @@ class AccountEngine:
                         _db.kv_set(skey, 0.0)
                 except Exception:
                     pass
-            mode = TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "") if h else ""
+            # Trade mode is only meaningful once the broker delivered account
+            # details: a logged-out terminal reports 0, which would show up as
+            # a reassuring [demo] next to an account that isn't connected.
+            mode = (TRADE_MODE_LABELS.get(str(h.get("trade_mode", "")), "")
+                    if (h and synced_acct) else "")
             try:
                 from spot import server_known as _srv_known
                 srv_known = _srv_known(inst, stored.get("server", ""))
             except Exception:
                 srv_known = True
+            want_ap = config.access_point_for(checked_srv)
             age = ages.get(inst)
             with self._lock:
                 active = self._active.get(inst)
@@ -688,9 +838,15 @@ class AccountEngine:
                 "feed_age_s": round(age, 1) if age is not None else None,
                 "verified": verified,
                 "syncing": syncing,
+                "phantom": phantom,
                 "stalled": stalled,
                 "sync_age_s": sync_age_s,
                 "server_known": srv_known,
+                "access_point": want_ap,
+                # The stored account's trade server cannot be dialled at all:
+                # no way to log in until an access point or one manual login.
+                "want_unreachable": bool(want and not srv_known
+                                         and not want_ap),
                 "running": running,
             })
         with self._lock:
@@ -711,6 +867,34 @@ class AccountEngine:
     def remember(self, login: str, password: str = "", server: str = "",
                  label: str = "") -> dict:
         return known_accounts.remember(login, password, server, label)
+
+    def set_access_point(self, server: str, address: str) -> dict:
+        """Register an access point (host:port) for a trade server.
+
+        This is the one missing piece when incorporating a broker whose
+        server is not in MT5's own list: the terminal then boots through the
+        access point, MT5 learns the server, and every later name login
+        works - no manual UI step, no 90 s phantom wait.
+        """
+        server = str(server or "").strip()
+        if not server:
+            raise EngineError("server is required (e.g. CXMDirect-Live)")
+        norm = config.register_access_point(server, address)
+        if not norm:
+            raise EngineError(
+                f"access point {address!r} is not usable - MT5 needs "
+                f"host:port (e.g. mt5.example.com:443)")
+        log.info(f"account-engine: access point {server} -> {norm}")
+        return {"ok": True, "server": server, "access_point": norm}
+
+    def servers(self) -> dict:
+        """What this box knows about reaching each broker."""
+        try:
+            stored = _spot().known_servers()
+        except Exception:
+            stored = []
+        return {"ok": True, "known_servers": stored,
+                "access_points": config.all_access_points()}
 
     # ---- internals ----
 
@@ -765,8 +949,11 @@ def _print_status() -> None:
         if s["verified"] and not s.get("syncing"):
             state = f"verified in {s['login']}"
         elif s["verified"]:
-            state = (f"in {s['login']} - login matched, broker SYNCING "
+            state = (f"in {s['login']} - authorized, broker SYNCING "
                      f"(no currency yet, balances pending)")
+        elif s.get("phantom"):
+            state = (f"NOT logged in - MT5 only echoes {s['login']} from its "
+                     f"config; the trade server was never reached")
         elif s["login"]:
             state = f"in {s['login']} (session wants {s['want_login']})"
         else:
@@ -775,9 +962,15 @@ def _print_status() -> None:
               f"{'  [' + s['mode'] + ']' if s['mode'] else ''}")
         print(f"  server : {s['server'] or '-'}   broker: {s['broker'] or '-'}")
         if s.get("want_login") and not s.get("server_known", True):
-            print(f"  !! server {s.get('want_server') or '?'} is not in this "
-                  f"MT5 install's Bases yet - the login is still attempted "
-                  f"by name (set MT5_STRICT_UNKNOWN_SERVER=1 to refuse)")
+            ap = s.get("access_point") or ""
+            if ap:
+                print(f"  !! server {s.get('want_server') or '?'} is new to "
+                      f"this MT5 install - booting via access point {ap}")
+            else:
+                print(f"  !! server {s.get('want_server') or '?'} is not in "
+                      f"this MT5 install's list and has NO access point - "
+                      f"logins to it cannot connect. Add one to "
+                      f"access_points.env (see --access-point)")
         print(f"  balance: {s['balance'] or '-'}   equity: {s['equity'] or '-'}"
               f"   feed: {s['feed_age_s'] if s['feed_age_s'] is not None else '-'}s")
         if s["running"]:
@@ -810,11 +1003,45 @@ def main() -> int:
                     help="list known accounts (the quick-switch book)")
     ap.add_argument("--forget", metavar="LOGIN",
                     help="remove an account from the known book")
+    ap.add_argument("--access-point", nargs="+", dest="access_point",
+                    metavar=("SERVER", "HOST:PORT"),
+                    help="remember an access point for a trade server so "
+                         "logins to it can connect (e.g. --access-point "
+                         "CXMDirect-Live mt5.cxmdirect.com:443)")
+    ap.add_argument("--servers", action="store_true",
+                    help="list the trade servers MT5 can log into plus every "
+                         "access point this box knows")
     args = ap.parse_args()
 
     eng = get_engine()
 
     try:
+        if args.servers:
+            info = eng.servers()
+            known = info["known_servers"]
+            print(f"trade servers MT5 can log into by name ({len(known)}):")
+            for name in known:
+                print(f"  {name}")
+            points = info["access_points"]
+            print(f"\naccess points ({len(points)}):")
+            for name, meta in sorted(points.items()):
+                print(f"  {name:<36} {meta['address']:<34} [{meta['source']}]")
+            return 0
+
+        if args.access_point:
+            if len(args.access_point) < 2:
+                print("usage: account_engine.py --access-point <SERVER> "
+                      "<HOST:PORT>")
+                return 1
+            try:
+                res = eng.set_access_point(args.access_point[0],
+                                           args.access_point[1])
+            except EngineError as exc:
+                print(f"rejected: {exc}")
+                return 1
+            print(f"OK: {res['server']} -> {res['access_point']}")
+            return 0
+
         if args.list:
             for a in eng.known():
                 label = f"  {a['label']}" if a["label"] else ""

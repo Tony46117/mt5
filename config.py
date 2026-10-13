@@ -17,6 +17,16 @@ DB_PATH = Path(__file__).resolve().parent / "trades.db"
 ENV_FILE = Path(__file__).resolve().parent / "acc.env"
 SESSION_FILE = Path(__file__).resolve().parent / "session.json"
 SPOT_DUMP_SRC = Path(__file__).resolve().parent / "SpotDump.mq5"
+# Operator-supplied trade-server access points ("<server> = host:port" per
+# line, or "<server> host port").  MT5 refuses to connect to a server that
+# is not in its own server list unless it is handed host:port, so this file
+# is the one place to add a brand-new broker.
+ACCESS_POINT_FILE = Path(__file__).resolve().parent / "access_points.env"
+# Access points the software PROVED reachable ("learned"): written once a
+# login or a TCP probe succeeds, so a name login keeps working after the
+# first manual/one-click success without retyping host:port.  Runtime state,
+# not config - safe to delete.
+ACCESS_POINT_CACHE_FILE = Path(__file__).resolve().parent / "access_points.json"
 
 TERMINALS = {
     1: {
@@ -104,16 +114,200 @@ SERVER_ACCESS_POINTS: dict[str, str] = {
                                     "mt5-ga-8.dcglobalfarm.com:21501"),
 }
 
-def access_point_for(server: str) -> str:
-    """Access point (host:port) for a server NAME MT5 can't resolve, or ''.
-    Covers listed servers plus MT5_AP_<NAME> env overrides."""
+_ACCESS_POINT_RE = re.compile(r"^([^\s:/]+):(\d{1,5})$")
+
+
+def _access_point_env_key(server: str) -> str:
+    return "MT5_AP_" + re.sub(r"\W+", "_", str(server or "")).upper().strip("_")
+
+
+def normalize_access_point(address: str) -> str:
+    """'host:port' or 'host port' -> 'host:port' ('' when unusable).
+
+    A bare hostname is deliberately rejected: MT5 needs the port, and
+    accepting a portless value is how a login silently never connects."""
+    text = str(address or "").strip().strip("\"'")
+    if not text:
+        return ""
+    m = _ACCESS_POINT_RE.match(text)
+    if not m:
+        host, _, port = text.partition(" ")
+        if not port.strip():
+            return ""
+        m = _ACCESS_POINT_RE.match(f"{host.strip()}:{port.strip()}")
+        if not m:
+            return ""
+    host, port = m.group(1), int(m.group(2))
+    if not host or not (1 <= port <= 65535):
+        return ""
+    return f"{host}:{port}"
+
+
+_AP_FILE_CACHE: tuple[float, tuple[int, int] | None, dict[str, str]] | None = None
+_AP_FILE_TTL_S = 5.0
+
+
+def _parse_access_point_text(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        server, sep, address = line.partition("=")
+        if not sep:
+            # Whitespace form: "<server name> <host> <port>" - the last two
+            # tokens are the address, everything before them is the server
+            # (so multi-word server names still work without the '=').
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            server, address = " ".join(parts[:-2]), " ".join(parts[-2:])
+        server = server.strip()
+        address = normalize_access_point(address)
+        if server and address:
+            out[server] = address
+    return out
+
+
+def _registry_file_points() -> dict[str, str]:
+    """Operator registry from access_points.env (mtime-validated)."""
+    global _AP_FILE_CACHE
+    import time
+    now = time.monotonic()
+    try:
+        st = ACCESS_POINT_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if _AP_FILE_CACHE and now - _AP_FILE_CACHE[0] < _AP_FILE_TTL_S \
+            and _AP_FILE_CACHE[1] == key:
+        return _AP_FILE_CACHE[2]
+    points: dict[str, str] = {}
+    if key is not None:
+        try:
+            points = _parse_access_point_text(
+                ACCESS_POINT_FILE.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            points = {}
+    _AP_FILE_CACHE = (now, key, points)
+    return points
+
+
+_AP_LEARNED_CACHE: tuple[float, tuple[int, int] | None, dict[str, str]] | None = None
+
+
+def learned_access_points() -> dict[str, str]:
+    """Access points proven to work (written by login/probe successes).
+
+    Memoized on the file's (mtime_ns, size): the supervisor and the account
+    engine both ask on every poll, and this is on the panel's status path.
+    """
+    global _AP_LEARNED_CACHE
+    import time
+    try:
+        st = ACCESS_POINT_CACHE_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    now = time.monotonic()
+    if (_AP_LEARNED_CACHE and _AP_LEARNED_CACHE[1] == key
+            and now - _AP_LEARNED_CACHE[0] < _AP_FILE_TTL_S):
+        return _AP_LEARNED_CACHE[2]
+    points: dict[str, str] = {}
+    if key is not None:
+        try:
+            import json
+            doc = json.loads(ACCESS_POINT_CACHE_FILE.read_text())
+            if isinstance(doc, dict):
+                points = {str(k): str(v) for k, v in doc.items()
+                          if normalize_access_point(str(v))}
+        except (OSError, ValueError):
+            points = {}
+    _AP_LEARNED_CACHE = (now, key, points)
+    return points
+
+
+def access_point_candidates(server: str) -> list[str]:
+    """Every access point worth trying for `server`, best first.
+
+    One place answers "how do I reach this broker": env override, then the
+    learned cache, then the operator registry file, then the built-in table.
+    Anything that speaks host:port qualifies; bare server names do not (MT5
+    cannot resolve those when it does not already list the server).
+    """
     name = str(server or "").strip()
     if not name:
+        return []
+    out: list[str] = []
+    env = os.getenv(_access_point_env_key(name), "").strip()
+    for cand in (env, learned_access_points().get(name, ""),
+                 _registry_file_points().get(name, ""),
+                 SERVER_ACCESS_POINTS.get(name, "")):
+        norm = normalize_access_point(cand) if cand else ""
+        if norm and norm not in out:
+            out.append(norm)
+    return out
+
+
+def access_point_for(server: str) -> str:
+    """Preferred access point (host:port) for a server NAME MT5 can't
+    resolve, or '' when the name is all we have."""
+    cands = access_point_candidates(server)
+    return cands[0] if cands else ""
+
+
+def register_access_point(server: str, address: str) -> str:
+    """Remember a proven access point.  Returns the normalized address.
+
+    Called when a login or a TCP probe proves host:port reaches `server`,
+    so the operator never has to retype it and later name logins resolve.
+    """
+    name = str(server or "").strip()
+    norm = normalize_access_point(address)
+    if not name or not norm:
         return ""
-    if name in SERVER_ACCESS_POINTS:
-        return SERVER_ACCESS_POINTS[name]
-    env_key = "MT5_AP_" + re.sub(r"\W+", "_", name).upper().strip("_")
-    return os.getenv(env_key, "").strip()
+    import json
+    import tempfile
+    points = dict(learned_access_points())     # never mutate the memo
+    if points.get(name) == norm:
+        return norm
+    points[name] = norm
+    global _AP_FILE_CACHE, _AP_LEARNED_CACHE
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(ACCESS_POINT_CACHE_FILE.parent),
+                                  prefix=".ap.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(points, fh, separators=(",", ":"), sort_keys=True)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, ACCESS_POINT_CACHE_FILE)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        _AP_FILE_CACHE = None
+        _AP_LEARNED_CACHE = None
+    except OSError:
+        return ""
+    return norm
+
+
+def all_access_points() -> dict[str, dict]:
+    """Merged registry for the UI/CLI: server -> {address, source}."""
+    out: dict[str, dict] = {}
+    for server, addr in SERVER_ACCESS_POINTS.items():
+        out[server] = {"address": normalize_access_point(addr), "source": "builtin"}
+    for server, addr in _registry_file_points().items():
+        out[server] = {"address": addr, "source": "registry"}
+    for server, addr in learned_access_points().items():
+        out[server] = {"address": addr, "source": "learned"}
+    for key, value in os.environ.items():
+        if key.startswith("MT5_AP_") and value.strip():
+            out[f"env:{key}"] = {"address": normalize_access_point(value),
+                                 "source": "env"}
+    return out
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -201,6 +395,10 @@ def setup_logging(name: str | None = None, level: int = logging.INFO) -> logging
     handler.setLevel(level)
     logger.addHandler(handler)
     logger.setLevel(level)
+    # Without this every record also bubbles to the root logger, so each
+    # line appears TWICE in app_run.log (once formatted, once as
+    # "WARNING:broker_prober:...") - observed 2026-10-13 10:22:29.
+    logger.propagate = False
     return logger
 
 if __name__ == "__main__":

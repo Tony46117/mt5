@@ -13,3 +13,5 @@ __pycache__/
 nohup.out
 data/
 known_accounts.json
+access_points.env
+access_points.json

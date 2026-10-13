@@ -99,10 +99,53 @@ def candles_csv_paths() -> list[Path]:
 # symbols forever.
 _SYMBOL_CAT_CACHE: dict[int, tuple[tuple | None, dict, float]] = {}
 SYMBOL_CAT_STALE_S = 120.0
+# The EA rewrites symbols.csv every SYMBOL_DUMP_SEC (60 s) while the trade
+# account is authorized.  A catalogue that has not been rewritten for this
+# long is therefore NOT this account's, and MUST NOT be served: a file left
+# behind by the previous broker kept being reported as the new account's
+# quote universe (observed: HFM cent "EURUSDc.Z" pairs shown for a different
+# broker's account after a switch, and on the panel as if they were live).
+SYMBOL_CAT_MAX_AGE_S = float(os.getenv("MT5_SYMBOL_CAT_MAX_AGE_S", "180"))
+# inst -> (login the catalogue was last known to belong to, mtime_ns floor)
+_SYMBOL_CAT_OWNER: dict[int, tuple[str, int]] = {}
 
 def catalogue_path(inst: int) -> Path:
     """The symbols.csv THIS terminal writes (never a sibling's)."""
     return exec_in_path(inst) / "symbols.csv"
+
+def _catalogue_trusted(inst: int, stamp: tuple | None,
+                       age: float | None) -> bool:
+    """Does THIS symbols.csv really describe the account the terminal is in?
+
+    Two ways it can lie: it belongs to the login the terminal was in before
+    the switch (different broker, entirely different symbol universe), or it
+    has simply stopped being rewritten (only an AUTHORIZED account makes the
+    EA dump, so silence means the terminal is not connected to a broker).
+    """
+    mtime_ns = stamp[0] if stamp else None
+    if age is not None and age > SYMBOL_CAT_MAX_AGE_S:
+        return False
+    try:
+        own = str(read_header(catalogue_path(inst).with_name("trades.csv"))
+                  .get("login", "") or "")
+    except Exception:
+        own = ""
+    if not own or own in ("0", "?"):
+        return stamp is not None          # nobody logged in - trust freshness
+    owner = _SYMBOL_CAT_OWNER.get(inst)
+    if owner is None:
+        # First look in this process: trust a fresh file, otherwise require
+        # the EA to rewrite it before any of it is reported.
+        fresh = age is not None and age <= SYMBOL_CAT_MAX_AGE_S
+        _SYMBOL_CAT_OWNER[inst] = (own, 0 if fresh else (mtime_ns or 0))
+    elif owner[0] != own:
+        # The terminal changed account: everything on disk is the previous
+        # broker's.  Serve nothing until the EA writes the new one.
+        _SYMBOL_CAT_OWNER[inst] = (own, mtime_ns or 0)
+        _SYMBOL_CAT_CACHE.pop(inst, None)
+        return False
+    floor = _SYMBOL_CAT_OWNER[inst][1]
+    return mtime_ns is not None and mtime_ns > floor
 
 def read_symbol_catalogue(inst: int) -> dict[str, list[str]]:
     """Every symbol `inst`'s account can see, as {broker_symbol: fields}.
@@ -123,12 +166,18 @@ def read_symbol_catalogue(inst: int) -> dict[str, list[str]]:
     try:
         st = path.stat()
         stamp: tuple | None = (st.st_mtime_ns, st.st_size)
+        age: float | None = time.time() - st.st_mtime
     except OSError:
         stamp = None
+        age = None
     now = time.monotonic()
     cached = _SYMBOL_CAT_CACHE.get(inst)
     if cached and cached[0] == stamp and stamp is not None:
-        return cached[1]                    # unchanged since the last read
+        return cached[1] if _catalogue_trusted(inst, stamp, age) else {}
+    if not _catalogue_trusted(inst, stamp, age):
+        # Wrong account or stale: report nothing rather than another broker's
+        # quotes.  The cache is left alone so a rewrite is picked up at once.
+        return {}
     rows = _parse_catalogue(path) if stamp else {}
     if not rows and cached and now - cached[2] < SYMBOL_CAT_STALE_S:
         # torn read (EA mid-rewrite), or the file went away a moment ago -
@@ -872,6 +921,129 @@ def purge_exec_channel(inst: int) -> None:
     except OSError as exc:
         log.debug(f"terminal {inst}: exec purge skipped: {exc}")
 
+JOURNAL_TAIL_BYTES = 131072
+_JOURNAL_TEXT_CACHE: dict[str, tuple[int, int, str]] = {}
+_TS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}$")
+
+
+def _journal_files(inst: int) -> list[Path]:
+    """The newest (at most two) MT5 journal files for terminal `inst`."""
+    try:
+        return sorted((TERMINALS[inst]["dir"] / "logs").glob("*.log"),
+                      key=lambda p: p.stat().st_mtime)[-2:]
+    except (OSError, KeyError, TypeError):
+        return []
+
+
+def _journal_text(path: Path) -> str:
+    """Decoded tail of one journal file, memoized on (mtime, size).
+
+    Verification polls the journal up to ~7x/second while a login is in
+    flight; re-reading and re-decoding 128 KB of UTF-16 each time was pure
+    overhead, so an unchanged file is decoded once.  The BOM lives at the
+    START of the file, never at the tail we read - checking raw[:2] after
+    seeking picked the wrong codec and decoded UTF-16 into noise.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    cached = _JOURNAL_TEXT_CACHE.get(str(path))
+    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2)
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - JOURNAL_TAIL_BYTES)
+            if head == b"\xff\xfe" and start % 2:      # keep UTF-16 alignment
+                start += 1
+            fh.seek(start)
+            raw = fh.read()
+    except OSError:
+        return ""
+    text = raw.decode("utf-16-le" if head == b"\xff\xfe" else "utf-8",
+                      errors="replace")
+    _JOURNAL_TEXT_CACHE[str(path)] = (st.st_mtime_ns, st.st_size, text)
+    return text
+
+
+def _journal_day(path: Path) -> float:
+    m = re.match(r"(\d{4})(\d{2})(\d{2})", path.stem)
+    if not m:
+        return 0.0
+    try:
+        return dt.datetime(int(m.group(1)), int(m.group(2)),
+                           int(m.group(3))).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _journal_line_stamp(line: str, day: float) -> float:
+    for field in line.split("\t"):
+        field = field.strip()
+        if _TS_RE.match(field):
+            try:
+                t = dt.datetime.strptime(field, "%H:%M:%S.%f")
+            except ValueError:
+                return 0.0
+            return (day + t.hour * 3600 + t.minute * 60 + t.second
+                    + t.microsecond / 1e6)
+    return 0.0
+
+
+def last_login_event(inst: int, login: str,
+                     since: float = 0.0) -> tuple[str, str]:
+    """Newest MT5 network event for `login`: (kind, detail).
+
+    `kind` is one of:
+
+      * ``"authorized"``   - `'<login>': authorized on <server>`: the trade
+        server ACCEPTED the credentials.  This is the only proof that a
+        login actually happened (the EA header echoes the login the start
+        config asked for even when MT5 never connected).
+      * ``"rejected"``     - `'<login>': authorization ... failed (...)`: the
+        trade server refused it (bad password, expired demo, wrong server).
+      * ``"no_connection"``- `'<login>': no connection to <access point>`: a
+        connection was attempted and did not come up (server known, host
+        unreachable).
+      * ``""``             - nothing at all: MT5 never attempted this login
+        (the trade server name is not in this install's server list and no
+        access point was supplied).
+
+    ``since`` (wall-clock epoch) ignores older attempts.  A journal is read
+    per (mtime, size) so the hot polling loop stays cheap.
+    """
+    login = str(login or "").strip()
+    if not login:
+        return "", ""
+    needle = f"'{login}'"
+    for path in reversed(_journal_files(inst)):
+        text = _journal_text(path)
+        if not text or needle not in text:
+            continue
+        day = _journal_day(path)
+        for line in reversed(text.splitlines()):
+            if needle not in line:
+                continue
+            low = line.lower()
+            if "authorized on" in low:
+                kind = "authorized"
+            elif "authorization" in low and "failed" in low:
+                kind = "rejected"
+            elif "no connection to" in low:
+                kind = "no_connection"
+            else:
+                continue
+            stamp = _journal_line_stamp(line, day)
+            if since and stamp and stamp < since - 2.0:
+                continue                          # an older attempt
+            parts = line.split("\t")
+            return kind, (parts[-1].strip() if parts else line.strip())
+    return "", ""
+
+
 def last_auth_failure(inst: int, login: str, since: float = 0.0) -> str:
     """Tail MT5's own journal for a broker AUTHORIZATION REJECTION of
     `login` at or after `since` (wall-clock epoch).  Returns the broker's
@@ -882,63 +1054,21 @@ def last_auth_failure(inst: int, login: str, since: float = 0.0) -> str:
     MT5 logs `'<login>': authorization on <server> failed (Invalid
     account)` the moment the trade server says no.
     """
-    login = str(login or "").strip()
-    if not login:
-        return ""
-    try:
-        logs = sorted((TERMINALS[inst]["dir"] / "logs").glob("*.log"),
-                      key=lambda p: p.stat().st_mtime)[-2:]
-    except (OSError, KeyError, TypeError):
-        return ""
-    needle = f"'{login}'"
-    for path in reversed(logs):
-        try:
-            with open(path, "rb") as fh:
-                # the BOM lives at the START of the file, never at the tail
-                # we read - checking raw[:2] after seeking therefore always
-                # picked the wrong codec and decoded UTF-16 into noise
-                head = fh.read(2)
-                fh.seek(0, 2)
-                size = fh.tell()
-                start = max(0, size - 131072)
-                if head == b"\xff\xfe" and start % 2:   # keep UTF-16 alignment
-                    start += 1
-                fh.seek(start)
-                raw = fh.read()
-        except OSError:
-            continue
-        txt = raw.decode("utf-16-le" if head == b"\xff\xfe" else "utf-8",
-                         errors="replace")
-        day = 0.0
-        m = re.match(r"(\d{4})(\d{2})(\d{2})", path.stem)
-        if m:
-            try:
-                day = dt.datetime(int(m.group(1)), int(m.group(2)),
-                                  int(m.group(3))).timestamp()
-            except ValueError:
-                day = 0.0
-        for line in reversed(txt.splitlines()):
-            low = line.lower()
-            if "authorization" not in low or "failed" not in low:
-                continue
-            if needle not in line:
-                continue
-            parts = line.split("\t")
-            stamp = 0.0
-            for field in parts:
-                field = field.strip()
-                if re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3}$", field):
-                    try:
-                        t = dt.datetime.strptime(field, "%H:%M:%S.%f")
-                    except ValueError:
-                        break
-                    stamp = (day + t.hour * 3600 + t.minute * 60 + t.second
-                             + t.microsecond / 1e6)
-                    break
-            if since and stamp and stamp < since - 2.0:
-                continue                          # an older attempt
-            return parts[-1].strip() if parts else line.strip()
-    return ""
+    kind, detail = last_login_event(inst, login, since)
+    return detail if kind == "rejected" else ""
+
+
+def last_auth_success(inst: int, login: str, since: float = 0.0) -> str:
+    """MT5's own `'<login>': authorized on <server>` line, or ''.
+
+    An EA header reporting `login` is NOT proof of a login: MT5 fills
+    `ACCOUNT_LOGIN`/`ACCOUNT_SERVER` from the start config even when the
+    trade server is unknown and no connection happens.  This journal line is
+    that proof, and it is what lets "broker still syncing" be told apart
+    from "MT5 never even tried".
+    """
+    kind, detail = last_login_event(inst, login, since)
+    return detail if kind == "authorized" else ""
 
 def _xdo_env() -> tuple[str | None, dict]:
     xdo = shutil.which("xdotool")
@@ -1217,6 +1347,60 @@ def launch_terminal(inst: int = 1, jitter: float | None = None,
     minimize_terminal(inst)
     return True
 
+_BASES_NAMES_CACHE: dict[int, tuple[float, dict[str, str] | None]] = {}
+BASES_CACHE_TTL_S = 10.0
+
+
+def _bases_names(inst: int) -> dict[str, str] | None:
+    """Trade servers this install has ever used: lowercase -> real name.
+
+    `None` means "cannot tell" (no Bases dir / unreadable), which callers
+    treat as "do not block the login".  Cached because the account engine
+    asks on every status poll: a fresh directory walk per request was pure
+    I/O on the panel's hot path.
+    """
+    now = time.monotonic()
+    cached = _BASES_NAMES_CACHE.get(inst)
+    if cached and now - cached[0] < BASES_CACHE_TTL_S:
+        return cached[1]
+    names: dict[str, str] | None = None
+    try:
+        inst_dir = TERMINALS[inst]["dir"]
+        bases = inst_dir / "Bases"
+        if not bases.is_dir():
+            # wine masks case; the second install uses lowercase "bases"
+            bases = inst_dir / "bases"
+        if bases.is_dir():
+            names = {p.name.lower(): p.name
+                     for p in bases.iterdir() if p.is_dir()}
+    except (OSError, KeyError, TypeError):
+        names = None
+    _BASES_NAMES_CACHE[inst] = (now, names)
+    return names
+
+
+# Bases/ subdirectories that are MT5's own bookkeeping, not trade servers.
+_NON_SERVER_BASES = frozenset({"custom", "default", "signals", "mail",
+                               "news", "symbols", "history", "ticks",
+                               "trades", "subscriptions"})
+
+
+def known_servers() -> list[str]:
+    """Every trade server either install has connected to at least once.
+
+    These are the names MT5 can log into WITHOUT an access point, so the
+    panel/CLI can show the operator what already works and what still
+    needs one.  MT5's own Bases subdirectories are filtered out.
+    """
+    out: dict[str, str] = {}
+    for inst in (1, 2):
+        for low, real in (_bases_names(inst) or {}).items():
+            if low in _NON_SERVER_BASES:
+                continue
+            out.setdefault(low, real)
+    return sorted(out.values())
+
+
 def server_known(inst: int, server: str) -> bool:
     """Has this terminal's MT5 install ever seen trade server `server`
     (Bases/ dir)?  Unknown-by-name boots silently keep the last account."""
@@ -1228,48 +1412,19 @@ def server_known(inst: int, server: str) -> bool:
             return True
     except Exception:
         pass
-    try:
-        inst_dir = TERMINALS[inst]["dir"]
-        bases = inst_dir / "Bases"
-        if not bases.is_dir():
-            # wine masks case; the second install uses lowercase "bases"
-            bases = inst_dir / "bases"
-    except (KeyError, TypeError):
+    names = _bases_names(inst)
+    if names is None:
         return True                      # cannot tell - do not block
-    try:
-        if not bases.is_dir():
-            return True                  # cannot tell - do not block
-        if (bases / name).is_dir():
-            return True
-        low = name.lower()
-        return any(p.name.lower() == low
-                   for p in bases.iterdir() if p.is_dir())
-    except OSError:
-        return True                      # cannot tell - do not block
+    return name.lower() in names
 
-def _bases_dirs() -> list:
-    """All per-install Bases dirs (case differs between installs)."""
-    out = []
-    for inst in (1, 2):
-        try:
-            d = TERMINALS[inst]["dir"]
-        except (KeyError, TypeError):
-            continue
-        for cand in (d / "Bases", d / "bases"):
-            try:
-                if cand.is_dir():
-                    out.append(cand)
-                    break
-            except OSError:
-                continue
-    return out
 
 def server_known_anywhere(server: str) -> bool:
     """Has ANY terminal install on this box ever seen `server`?
 
     Used to grade unknown-server logins: known here -> go; known only
     on the sibling install -> attempt anyway with a warning (MT5 may
-    still resolve it); known nowhere and no access point -> fail fast.
+    still resolve it); known nowhere and no access point -> the login
+    needs an access point or one manual login first.
     """
     name = str(server or "").strip()
     if not name:
@@ -1280,18 +1435,12 @@ def server_known_anywhere(server: str) -> bool:
     except Exception:
         pass
     low = name.lower()
-    try:
-        for bases in _bases_dirs():
-            try:
-                if (bases / name).is_dir():
-                    return True
-                if any(p.name.lower() == low
-                       for p in bases.iterdir() if p.is_dir()):
-                    return True
-            except OSError:
-                continue
-    except Exception:
-        pass
+    for inst in (1, 2):
+        names = _bases_names(inst)
+        if names is None:
+            return True                  # cannot tell - do not block
+        if low in names:
+            return True
     return False
 
 RESTART_MARK_TTL_S = 180.0

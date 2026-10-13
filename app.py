@@ -187,14 +187,31 @@ def _lot_check(account: int, broker_symbol: str, lot: float) -> str | None:
 
     Returns an error string, or None when the lot is fine (or when no
     probe data exists yet - never block trading on missing metadata).
+    DISABLED symbols (broker trade_mode=0, retcode 10017 - e.g. HFM's
+    unsuffixed base pairs while only the .Z variants trade) are rejected
+    here too, so manual /api/trade and /api/order get the same guard the
+    scheduler already had.  Observed 2026-10-13 as repeated 10017s.
     """
     try:
         syms = broker_prober.get_prober().report()["terminals"].get(str(account), {})
         info = syms.get(broker_symbol)
+        if info is None:
+            # case-insensitive fallback (Deriv "Boom 1000 Index" etc.)
+            for k, v in syms.items():
+                if str(k).upper() == str(broker_symbol).upper():
+                    info = v
+                    break
     except Exception:
         return None
     if not info:
         return None
+    try:
+        if int(info.get("trade_mode", 4)) == 0:
+            return (f"{broker_symbol} is DISABLED for trading by the broker "
+                    f"on account {account} (trade_mode=0, retcode 10017) - "
+                    f"pick the tradeable variant (e.g. {broker_symbol}.Z)")
+    except (TypeError, ValueError):
+        pass
     try:
         vmin = float(info.get("volume_min", 0) or 0)
         vmax = float(info.get("volume_max", 0) or 0)
@@ -354,6 +371,40 @@ def api_engine_save():
                             "label": label or str(known.get("label", "")),
                             "has_password": has_pw},
                 "detail": f"{login_id} saved - one click logs it in"})
+
+@app.get("/api/engine/servers")
+@rate_limit(max_requests=60, window=60)
+def api_engine_servers():
+    """Trade servers MT5 can log into by name, plus every access point."""
+    try:
+        return jsonify(account_engine.get_engine().servers())
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+
+@app.post("/api/engine/access-point")
+@rate_limit(max_requests=20, window=60)
+def api_engine_access_point():
+    """Remember an access point (host:port) for a trade server.
+
+    The one-step fix for a broker MT5 does not list yet: MT5 only dials a
+    server it already knows, so a name it has never seen needs host:port
+    once - after that the terminal learns the server and name logins work.
+    """
+    d = request.get_json(silent=True) or {}
+    server = str(d.get("server", "")).strip()
+    address = str(d.get("access_point", "") or d.get("address", "")).strip()
+    if not server or not address:
+        return _fail("server and access_point (host:port) are required")
+    try:
+        res = account_engine.get_engine().set_access_point(server, address)
+    except account_engine.EngineError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok({"server": res["server"],
+                "access_point": res["access_point"],
+                "detail": f"access point saved for {res['server']} - log in "
+                          f"again and it will be used"})
 
 @app.get("/api/debug")
 @rate_limit(max_requests=30, window=60)

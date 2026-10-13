@@ -885,6 +885,24 @@ PANEL_TMPL = """<!doctype html>
             works for any account, live or demo, in either terminal - the
             terminal restarts into it and the whole software follows.</div>
         </div>
+        <div id="engApForm" style="display:none;margin-top:12px;
+          border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
+          padding-top:10px">
+          <div class="sect"><h4>Access point for <span id="engApServer">-</span></h4>
+            <div class="right"><button class="btn mini" onclick="engApClose()">CANCEL</button></div></div>
+          <div class="frow" style="margin-top:8px">
+            <div class="fgroup" style="grid-column:span 4"><label>host:port</label>
+              <input id="engApAddrIn" type="text" autocomplete="off" placeholder="e.g. mt5.cxmdirect.com:443"></div>
+          </div>
+          <div class="feedback" id="engApFeedback"></div>
+          <div class="frow" style="margin-top:6px">
+            <button class="btn blue" style="grid-column:span 2" onclick="engApSubmit()">SAVE</button>
+          </div>
+          <div class="body mut" style="font-size:11px;padding-top:6px">
+            MT5 only dials a trade server it already lists, so a server it has
+            never seen needs its host:port once - after that the terminal
+            learns it and plain name logins keep working.</div>
+        </div>
         <div class="body mut" style="font-size:11px;padding-top:8px">
           log any account (live or demo) into either terminal - verified
           against the EA feed, one at a time per terminal, the whole software
@@ -1239,6 +1257,7 @@ refresh();setInterval(refresh,600);
 function engState(s){
  if(s.running)return '<span style="color:var(--yellow,#eab308)">● '+esc(s.running.op)+'…</span>';
  if(s.verified)return '<span style="color:#22c55e">● synced</span>';
+ if(s.phantom)return '<span style="color:#ef4444">● NOT LOGGED IN</span>';
  if(s.login)return '<span style="color:var(--yellow,#eab308)">● adopted '+esc(s.login)+'</span>';
  return '<span class="mut">○ logged out</span>'}
 function engMode(s){
@@ -1250,8 +1269,19 @@ function engMode(s){
 function engRender(){
  if(!ENG)return;
  const slots=ENG.slots||[];
- $id('engSlots').innerHTML=slots.map(s=>
-  '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;'+
+ $id('engSlots').innerHTML=slots.map(s=>{
+  const srv=s.want_server||s.server||'?';
+  /* An unknown trade server with no access point can never connect: MT5
+     echoes the requested login but dials nothing. Say so here instead of
+     letting the row look 'adopted'. */
+  const warn=s.want_unreachable
+   ?'<div class="mut sub" style="width:100%;color:#ef4444;padding-top:4px">'+
+    'MT5 has never seen server '+esc(srv)+' and has no access point - '+
+    'logins to it cannot connect '+
+    '<button class="btn mini blue" onclick="engApOpen(\\''+esc(srv)+'\\')">ADD ACCESS POINT</button></div>'
+   :(s.access_point?'<div class="mut sub" style="width:100%;padding-top:4px">'+
+     'via access point '+esc(s.access_point)+'</div>':'');
+  return '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;'+
    'padding:10px 0;border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent)">'+
    '<b>T'+s.terminal+'</b>'+
    '<span class="mono">'+esc(s.login||'-')+'</span>'+engMode(s)+
@@ -1265,7 +1295,7 @@ function engRender(){
    '<button class="btn mini" onclick="engAdopt('+s.terminal+')">ADOPT</button>'+
    '<button class="btn mini" onclick="engRestart('+s.terminal+')">RESTART</button>'+
    '<button class="btn mini danger" onclick="engLogout('+s.terminal+')">LOGOUT</button>'+
-   '</div>').join('')+
+   warn+'</div>'}).join('')+
   (ENGOPS&&ENGOPS.length?'<div class="mut" style="font-size:11px;padding-top:8px">'+
    ENGOPS.slice(0,4).map(o=>'['+esc(o.state)+'] T'+o.terminal+' '+esc(o.op)+' - '
     +esc(o.detail||'…')).join('<br>')+'</div>':'');
@@ -1322,6 +1352,28 @@ function engOpenForm(t){
  const f=$id('engLoginIn');if(f)f.focus()}
 function engCloseForm(){
  ENGFORM_T=null;$id('engForm').style.display='none'}
+/* access point: the one-time fix for a broker MT5 does not list yet. */
+let ENGAP_SERVER=null;
+function engApOpen(server){
+ ENGAP_SERVER=server;
+ $id('engApServer').textContent=server;
+ $id('engApForm').style.display='';
+ $id('engApFeedback').textContent='';
+ $id('engApFeedback').className='feedback';
+ const f=$id('engApAddrIn');if(f){f.value='';f.focus()}}
+function engApClose(){ENGAP_SERVER=null;$id('engApForm').style.display='none'}
+async function engApSubmit(){
+ if(ENGAP_SERVER==null)return;
+ const addr=($id('engApAddrIn').value||'').trim();
+ const fb=$id('engApFeedback');
+ if(!addr){fb.textContent='host:port is required (e.g. mt5.cxmdirect.com:443)';
+  fb.className='feedback err';return}
+ fb.textContent='saving...';fb.className='feedback';
+ try{const j=await post('/api/engine/access-point',
+   {server:ENGAP_SERVER,access_point:addr});
+  fb.textContent='';fb.className='feedback ok';
+  toast(j.detail||'access point saved',true);engApClose();engPoll()}
+ catch(e){fb.textContent=e.message;fb.className='feedback err'}}
 async function engSubmitLogin(){
  if(ENGFORM_T==null)return;
  const login=($id('engLoginIn').value||'').trim();

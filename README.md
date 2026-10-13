@@ -58,7 +58,8 @@ One command starts everything; Ctrl+C stops everything.
 | `close.py`      | Database-free concurrent close of all positions (one atomic `CLOSEALL` per terminal). |
 | `monitor.py`    | Dual-account live dashboard: open positions only, strict identity checks, no event log. |
 | `session.py`    | Obfuscated credential store (`session.json`), stat-validated on every read so account changes propagate live across all processes. |
-| `account_engine.py` | Account Integration Engine: concurrent per-terminal login/switch/adopt/logout of any account (live or demo) with pre-validation, EA-verified results, demo/live detection, an operation registry, CLI (`--login/--adopt/--status/...`) and `/api/engine/*` endpoints for the panel. |
+| `config.py`     | Paths, tunables and the access-point registry (`access_points.env` + `MT5_AP_*` env + the auto-learned `access_points.json`). |
+| `account_engine.py` | Account Integration Engine: concurrent per-terminal login/switch/adopt/logout of any account (live or demo) with pre-validation, broker-verified results (a login only counts once the trade server authorized it, not when the EA merely echoes the number), demo/live detection, access-point registry (`--access-point`, `--servers`), an operation registry, CLI (`--login/--adopt/--status/...`) and `/api/engine/*` endpoints for the panel. |
 | `database.py`   | SQLite/Postgres storage for schedules and the fired log. |
 | `broker_prober.py` | Probes the account's full quote universe and order-fill behaviour. The EA writes every symbol the account can see to `symbols.csv`, so the prober reports the whole broker catalogue (including Deriv's Boom/Crash/Jump/Volatility indices and any symbol a broker renames with extra letters, e.g. `XAUUSD247`, `EURUSD.Z`) with no exec round trips, then only PROBEs what the catalogue is missing. Both terminals probe concurrently. |
 | `metrics.py`    | Closed-trade and equity observation. |
@@ -161,6 +162,42 @@ anyone with read access to your account. During boot the password is also
 written into the terminal's start config (0600) and scrubbed once the feed
 is live.
 
+### Incorporating a new broker (access points)
+
+MT5 logs in by trade-server NAME, and it only dials a name that is already
+in its own server list. A broker this install has never connected to (a
+brand-new account, a second broker alongside your existing one) cannot be
+reached by name alone: MT5 adopts the login into its config - so the EA
+header even echoes it back - but never opens a connection and never writes
+a single line to its journal. That is the "login takes forever and then
+says the password is wrong" symptom.
+
+The fix is to hand MT5 the server's **access point** (host:port) once. Add
+it to `access_points.env` in this directory:
+
+```
+# server name exactly as the broker writes it = host:port
+CXMDirect-Live = mt5.cxmdirect.com:443
+```
+
+or set `MT5_AP_<SERVERNAME>=host:port` (non-alphanumerics become `_`, e.g.
+`MT5_AP_CXMDIRECT_LIVE=...`), or use the panel's **ADD ACCESS POINT**
+button / the CLI:
+
+```bash
+python account_engine.py --access-point CXMDirect-Live mt5.cxmdirect.com:443
+python account_engine.py --servers     # what MT5 can already reach + every AP
+```
+
+After one successful connect MT5 knows the server itself, the access point
+is remembered automatically (`access_points.json`), and plain name logins
+keep working. Logging in once by hand inside MT5 (File -> Login to Trade
+Account) and pressing **ADOPT** has the same effect.
+
+A wrong or unreachable server no longer costs a 90 s wait that blames the
+password: the engine detects "MT5 never attempted this login" in seconds
+and tells you exactly which access point to add.
+
 ## Run
 
 ```bash
@@ -218,7 +255,9 @@ python monitor.py                                  # live dual-account book
 |----------|---------|---------|
 | `MT5_TRADING_DAYS` | `0,1,2,3,4` | Weekdays (0=Mon) schedules may fire on |
 | `MT5_MAX_PROBE_SYMBOLS` | `2000` | Ceiling on symbols the prober reports per account |
-| `MT5_STRICT_UNKNOWN_SERVER` | unset | Set to `1` to refuse logins to a trade server the terminal has never connected to (default: attempt it by name) |
+| `MT5_STRICT_UNKNOWN_SERVER` | unset | Set to `1` to always refuse a login to a trade server this box has never seen, even with an access point |
+| `MT5_TRY_UNKNOWN_SERVER` | unset | Set to `1` to force the old attempt-by-name behaviour for a server no install has ever seen (default: fail fast with the access-point fix) |
+| `MT5_SYMBOL_CAT_MAX_AGE_S` | `180` | Age after which a terminal's `symbols.csv` is no longer trusted as that account's quote universe |
 | `MT5_CLOSE_VERIFY_TIMEOUT` | `15` | Seconds a close waits for the broker to report the position book empty |
 | `MT5_IGNORE_AUTH_FAILURE` | unset | Set to `1` to ignore `authorization ... failed` lines from MT5's journal during a login |
 | `MT5_NO_LAUNCH_JITTER` | unset | Set to `1` to disable anti-detect launch jitter |

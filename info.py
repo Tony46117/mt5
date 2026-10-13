@@ -27,6 +27,49 @@ def _probed_filling(inst: int, sym: str) -> str:
     except Exception:
         return ""
 
+def _probe_infos(inst: int) -> dict:
+    """Full broker-probed capability map for `inst` (catalogue-first).
+
+    Catalogue (symbols.csv) carries the whole 316-symbol universe with zero
+    round trips; only when it is empty do we fall back to a live PROBE of
+    the watchlist.  Keys are broker-exact symbols."""
+    try:
+        import broker_prober
+        p = broker_prober.get_prober()
+        rep = p.report()["terminals"].get(str(inst), {})
+        if rep:
+            return rep
+        try:
+            cat = p.load_catalogue(inst)
+            if cat:
+                return cat
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {}
+
+def _sizing_map(inst: int) -> dict:
+    """Per-symbol sizing from sizer (broker probe + balance/margin).
+
+    Returns {broker_symbol: sizing_dict}.  Empty when the broker has not
+    been probed yet or leverage is unknown - callers must render '-'."""
+    try:
+        import sizer
+        return sizer.account_sizing(inst).get("symbols", {})
+    except Exception as exc:
+        log.debug(f"info: sizing unavailable for terminal {inst}: {exc}")
+        return {}
+
+def _usd_equiv(amount: float, currency: str, spots: dict) -> dict:
+    """USD equivalent via the enhanced converter (USC cents, KES live, ...)."""
+    try:
+        import sizer
+        return sizer.to_usd(amount, currency, spots)
+    except Exception:
+        return {"usd": None, "rate": None, "method": "converter unavailable",
+                "currency": str(currency or '?')}
+
 _PROBE_TS = 0.0
 
 def _ensure_probed() -> None:
@@ -41,7 +84,17 @@ def _ensure_probed() -> None:
             accs = read_accounts()
             for inst in (1, 2):
                 if accs.get(inst, {}).get("login"):
-                    p.probe_terminal(inst)
+                    # catalogue first: full universe, no exec round trips.
+                    # Only gap-PROBE when the catalogue is missing (older EA).
+                    try:
+                        if p.load_catalogue(inst):
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        p.probe_terminal(inst)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -120,13 +173,72 @@ def snapshot() -> dict:
         lev_raw = head.get("leverage", "")
         trade_allowed = head.get("account_trade_allowed", "1")
         mql_allowed = head.get("mql_allowed", "1")
+        # --- broker probing: full capabilities + sizing + USD equivalent ---
+        # Catalogue-first (no round trips); sizing derives min/max lot,
+        # max positions and margins from the broker's own volume limits,
+        # contract/tick economics and this account's balance + leverage.
+        currency = cur or ("USD" if bal > 0 else "?")
+        try:
+            import sizer as _sizer
+            _lev_ratio = _sizer.parse_leverage(
+                f"1:{lev_raw}" if lev_raw and lev_raw != "0" else "")
+            _infos = _probe_infos(inst)
+            _upper = {str(k).upper(): v for k, v in _infos.items()}
+            _conv_bal = _sizer.to_usd(bal, currency, spots)
+            _conv_eq = _sizer.to_usd(eq, currency, spots)
+            _conv_pf = _sizer.to_usd(profit, currency, spots)
+            _conv_mg = _sizer.to_usd(f(head.get("margin", "")), currency, spots)
+            _conv_mf = _sizer.to_usd(f(head.get("margin_free", "")), currency, spots)
+            _probe: dict = {}
+            _sizing: dict = {}
+            for sym in spots:
+                info = _infos.get(sym) or _upper.get(str(sym).upper(), {})
+                if info:
+                    _probe[sym] = {
+                        "volume_min": info.get("volume_min"),
+                        "volume_max": info.get("volume_max"),
+                        "volume_step": info.get("volume_step"),
+                        "contract_size": info.get("contract_size"),
+                        "tick_value": info.get("tick_value"),
+                        "tick_size": info.get("tick_size"),
+                        "spread_pts": info.get("spread_pts"),
+                        "trade_mode": info.get("trade_mode"),
+                        "trade_mode_name": info.get("trade_mode_name"),
+                        "best": info.get("best"),
+                        "allowed": info.get("filling_allowed"),
+                    }
+                else:
+                    _probe[sym] = {}
+                if info and _lev_ratio:
+                    s = _sizer.size_symbol(sym, info, bal, _lev_ratio,
+                                           currency, spots)
+                    _sizing[sym] = {
+                        "min_lot": s.get("volume_min"),
+                        "max_lot": s.get("max_lot"),
+                        "max_positions_min_lot": s.get(
+                            "max_positions_min_lot"),
+                        "margin_per_min": s.get("margin_per_min"),
+                        "margin_per_lot": s.get("margin_per_lot"),
+                        "affordable_min": s.get("affordable_min"),
+                        "tradeable": s.get("tradeable"),
+                    }
+                else:
+                    _sizing[sym] = {}
+        except Exception:
+            _conv_bal = {"usd": None, "rate": None, "method": "unavailable"}
+            _conv_eq = {"usd": None, "rate": None, "method": "unavailable"}
+            _conv_pf = {"usd": None, "rate": None, "method": "unavailable"}
+            _conv_mg = {"usd": None, "rate": None, "method": "unavailable"}
+            _conv_mf = {"usd": None, "rate": None, "method": "unavailable"}
+            _probe = {}
+            _sizing = {}
         out["accounts"][str(inst)] = {
             "terminal": inst,
             "login": login_got or expected,
             "holder": holder or ("? (not reported by live server)" if tmode == "real" and not holder else "?"),
             "broker": broker or ("? (not reported by live server)" if tmode == "real" and not broker else "?"),
             "server": head.get("server", "") or accs.get(inst, {}).get("server", "?"),
-            "currency": cur or ("USD" if bal > 0 else "?"),
+            "currency": currency,
             "leverage": f"1:{lev_raw}" if lev_raw and lev_raw != "0" else "not reported (ECN/raw)",
             "trade_mode": tmode,
             "margin_mode": mmode,
@@ -136,6 +248,13 @@ def snapshot() -> dict:
             "margin": round(f(head.get("margin", "")), 2),
             "margin_free": round(f(head.get("margin_free", "")), 2),
             "margin_level": round(f(head.get("margin_level", "")), 2),
+            "balance_usd": _conv_bal.get("usd"),
+            "equity_usd": _conv_eq.get("usd"),
+            "profit_usd": _conv_pf.get("usd"),
+            "margin_usd": _conv_mg.get("usd"),
+            "margin_free_usd": _conv_mf.get("usd"),
+            "usd_rate": _conv_bal.get("rate"),
+            "usd_rate_method": _conv_bal.get("method"),
             "positions": head.get("positions", 0),
             "algo_allowed": head.get("trade_allowed", ""),
             "mql_allowed": mql_allowed,
@@ -147,6 +266,8 @@ def snapshot() -> dict:
             "trade_disabled": trade_allowed == "0",
             "spreads": {sym: spread_pts(sym, spots) for sym in spots},
             "fillings": {sym: _probed_filling(inst, sym) for sym in spots},
+            "probe": _probe,
+            "sizing": _sizing,
         }
     return out
 
@@ -218,6 +339,20 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
     out.append(acc_line("Floating P/L", f"{pf_c}{profit} {cur_display}{RESET}"))
     out.append(acc_line("Margin used", f"{marg} {cur_display}"))
     out.append(acc_line("Margin free", f"{mfree} {cur_display}"))
+    # USD equivalent via the enhanced converter (USC cents, KES live, ...),
+    # straight from broker probing economics - not a hardcoded rate.
+    try:
+        _conv = _usd_equiv(f(bal), cur_display, spots)
+        if _conv.get("usd") is not None:
+            out.append(acc_line(
+                "Balance USD",
+                f"≈ ${_conv['usd']:,.2f} ({_conv.get('method', '')})"))
+        else:
+            out.append(acc_line(
+                "Balance USD",
+                f"{YELLOW}n/a ({_conv.get('method', 'no rate')}){RESET}"))
+    except Exception:
+        pass
     if mlevel and f(mlevel) > 0:
         ml_c = RED if f(mlevel) < 100 else (YELLOW if f(mlevel) < 300 else GREEN)
         out.append(acc_line("Margin level", f"{ml_c}{mlevel} %{RESET}"))
@@ -235,9 +370,16 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
         out.append(f"  {YELLOW}[!] MQL TRADE DISABLED{RESET}")
         out.append(f"  {YELLOW}    EA/automated trading is blocked on this account.{RESET}")
     out.append("")
+    # Broker-probed sizing per symbol: volume limits, biggest single lot and
+    # how many minimum lots fit the balance (sizer.py economics).  DISABLED
+    # symbols are the broker's own trade_mode=0 (retcode 10017 if ordered).
+    sizing = _sizing_map(inst)
+    probes = _probe_infos(inst)
+    upper_probe = {str(k).upper(): v for k, v in probes.items()}
     quoted = [s for s in spots if s in ("EURUSD", "GBPUSD", "XAUUSD")]
     quoted += sorted(s for s in spots if s not in quoted)
-    out.append(f"  {DIM}{'SYMBOL':<8}{'BID':>11}{'ASK':>11}{'SPREAD':>10}{'FILLING':>9}{RESET}")
+    out.append(f"  {DIM}{'SYMBOL':<12}{'BID':>11}{'ASK':>11}{'SPREAD':>10}"
+               f"{'FILL':>6}{'MIN':>7}{'MAXLOT':>9}{'MAXPOS':>8}{RESET}")
     for sym in quoted:
         bid, ask, _ = spots.get(sym, ("", "", ""))
         digits = _digits_for(sym, bid)
@@ -247,8 +389,38 @@ def render_account(inst: int, head: dict, spots: dict, expected: str) -> str:
         except ValueError:
             b = a = "-"
         fill = _probed_filling(inst, sym)
-        fill_s = f"{GREEN}{fill}{RESET}" if fill else f"{DIM}probe...{RESET}"
-        out.append(f"  {sym:<8}{b:>11}{a:>11}  {spread(sym, spots):>10}  {fill_s}")
+        info = probes.get(sym) or upper_probe.get(str(sym).upper(), {})
+        tradeable = True
+        try:
+            tradeable = int(info.get("trade_mode", 4)) != 0
+        except (TypeError, ValueError):
+            pass
+        if info and not tradeable:
+            fill_s = f"{RED}DISABLED{RESET}"
+        elif fill:
+            fill_s = f"{GREEN}{fill}{RESET}"
+        else:
+            fill_s = f"{DIM}probe...{RESET}"
+        s = sizing.get(sym) or {}
+        if s and s.get("margin_per_lot") is not None:
+            min_s = f"{float(s.get('volume_min', 0)):>7.2f}"
+            max_s = f"{float(s.get('max_lot', 0)):>9.2f}"
+            pos_s = f"{int(s.get('max_positions_min_lot', 0)):>8d}"
+        elif info and not tradeable:
+            min_s, max_s, pos_s = f"{DIM}   -   {RESET}", f"{DIM}   -    {RESET}", f"{DIM}   -    {RESET}"
+        elif info:
+            try:
+                min_s = f"{float(info.get('volume_min', 0)):>7.2f}"
+            except (TypeError, ValueError):
+                min_s = f"{DIM}   -   {RESET}"
+            max_s, pos_s = f"{DIM}   -    {RESET}", f"{DIM}   -    {RESET}"
+        else:
+            min_s, max_s, pos_s = f"{DIM}   -   {RESET}", f"{DIM}   -    {RESET}", f"{DIM}   -    {RESET}"
+        out.append(f"  {sym:<12}{b:>11}{a:>11}  {spread(sym, spots):>10}  "
+                   f"{fill_s:>6}  {min_s}{max_s}{pos_s}")
+    out.append(f"  {DIM}MIN=broker min lot  MAXLOT=biggest one-position lot on "
+               f"balance  MAXPOS=# of MIN lots that fit  DISABLED=broker "
+               f"trade_mode=0 (order would fail 10017){RESET}")
     return "\n".join(out)
 
 def build_frame() -> str:

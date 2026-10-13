@@ -821,6 +821,30 @@ class FutureTradeScheduler(threading.Thread):
         except Exception as exc:
             log.warning(f"schedule #{sch['id']}: quote pre-check failed: {exc}")
 
+        # Pre-flight: broker-disabled symbol?  HFM keeps unsuffixed base
+        # pairs quoted but DISABLED (trade_mode=0) while only the .Z
+        # variants trade - firing those burns retries into retcode 10017
+        # (observed 2026-10-13 x15).  Never fire what the broker forbids.
+        try:
+            import broker_prober as _bp
+            _rep = _bp.get_prober().report()["terminals"].get(str(acc), {})
+            _info = _rep.get(mapped)
+            if _info is None:
+                for _k, _v in _rep.items():
+                    if str(_k).upper() == str(mapped).upper():
+                        _info = _v
+                        break
+            if _info is not None and int(_info.get("trade_mode", 4)) == 0:
+                reason = (f"{mapped} is DISABLED by the broker "
+                          f"(trade_mode=0, retcode 10017)")
+                log.error(f"schedule #{sch['id']} acc{acc} {pair}: NOT firing "
+                          f"- {reason}")
+                db.log_fired(sch["id"], acc, pair, side, lot, "open",
+                             "", False, f"blocked: {reason}", ms=0.0)
+                return
+        except Exception as exc:
+            log.debug(f"schedule #{sch['id']}: disabled-symbol check failed: {exc}")
+
         # Pre-flight: check account trading permission from the EA header
         try:
             from spot import read_accounts, pick_terminal, read_header

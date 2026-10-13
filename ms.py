@@ -27,6 +27,85 @@ GLYPH_GRID = "·"
 
 CANDLE_COLORS = {"up": BLUE, "down": RED, "dim": DIM}
 
+# Broker-suffixed quote names (EURUSD.Z, XAUUSDb, XAUUSD247T, USDAEDr, ...)
+# share one price history with their base symbol: candles.csv is written
+# with base names (EURUSD, GBPUSD) while the feed carries both base and
+# suffixed variants at the same price.  Looking history up by every
+# candidate keeps every pair rendering from the same bars instead of leaving
+# 90 of 92 pairs stuck on "warming up".
+_FX_CODES = frozenset({
+    "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "CNH", "CNY",
+    "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", "ZAR", "MXN", "SGD", "HKD",
+    "TRY", "RUB", "AED", "THB", "KES", "UGX", "TZS", "NGN", "GHS", "ZMW",
+    "XAU", "XAG",
+})
+
+
+def _history_candidates(symbol: str) -> list[str]:
+    """History lookup names for `symbol`, most specific first.
+
+    EURUSD.Z -> [EURUSD.Z, EURUSD]; XAUUSD247 -> [XAUUSD247, XAUUSD];
+    XAUUSDb -> [XAUUSDb, XAUUSD]; USDAEDr -> [USDAEDr, USDAED].
+    """
+    s = str(symbol or "").strip()
+    if not s:
+        return []
+    cands = [s]
+    if "." in s:
+        head = s.split(".", 1)[0].strip()
+        if head and head not in cands:
+            cands.append(head)
+    for base in (cands[-1], s):
+        b = str(base).upper()
+        if len(b) >= 6 and b[:3] in _FX_CODES and b[3:6] in _FX_CODES:
+            six = str(base)[:6]
+            if six not in cands:
+                cands.append(six)
+            if six.upper() not in cands:
+                cands.append(six.upper())
+            break
+    up = s.upper()
+    if up not in cands:
+        cands.append(up)
+    return cands
+
+
+def _live_quote(symbol: str) -> tuple[str, str, str]:
+    """Live (bid, ask, ts) for `symbol`, exact first then shared history
+    candidates (case-insensitive).  ("", "", "") when unquoted."""
+    try:
+        spots = read_spots()
+    except Exception:
+        return ("", "", "")
+    hit = spots.get(symbol)
+    if hit and hit[0]:
+        return hit
+    up = str(symbol or "").upper()
+    for cand in _history_candidates(symbol):
+        hit = spots.get(cand)
+        if hit and hit[0]:
+            return hit
+    for k, v in spots.items():
+        if v and v[0] and str(k).upper() == up:
+            return v
+    return ("", "", "")
+
+
+def _quote_ts_recent(ts: str, max_age_s: float = 120.0) -> bool:
+    """Fresh-quote guard (same rule as the broker prober): the feed keeps
+    dead symbols with live-looking bids (XAUUSD.FIX from 2024), which must
+    not become chart buttons or probe targets."""
+    s = str(ts or "").strip()[:19]
+    if not s:
+        return True
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            stamp = dt.datetime.strptime(s, fmt).timestamp()
+            return (time.time() - stamp) <= max_age_s
+        except ValueError:
+            continue
+    return True
+
 class CandleBuilder:
 
     __slots__ = ("bars", "cur", "last_mid", "symbol")
@@ -39,7 +118,18 @@ class CandleBuilder:
 
     def seed_from_m1(self) -> None:
         self.bars = []
-        for b in candles(self.symbol, limit=MAX_BARS):
+        # Shared history: suffixed variants fall back to the base symbol's
+        # M1 bars (candles.csv carries base names) so every pair starts from
+        # the same bars instead of an empty chart.
+        rows: list = []
+        for cand in _history_candidates(self.symbol):
+            try:
+                rows = candles(cand, limit=MAX_BARS)
+            except Exception:
+                rows = []
+            if rows:
+                break
+        for b in rows:
             self.bars.append({
                 "t": int(b["t"]) * 60,
                 "o": float(b["o"]), "h": float(b["h"]),
@@ -48,7 +138,7 @@ class CandleBuilder:
             })
 
     def tick(self) -> bool:
-        bid, ask, _ = read_spots().get(self.symbol, ("", "", ""))
+        bid, ask, _ = _live_quote(self.symbol)
         if not bid or not ask:
             return False
         try:
@@ -89,8 +179,52 @@ def _row_of(p: float, hi: float, lo: float, rows: int) -> int:
     r = int((hi - p) / (hi - lo) * (rows - 1))
     return max(0, min(rows - 1, r))
 
+def _base_key(symbol: str) -> str:
+    """Ranking key: normalised base name so EURUSD and EURUSD.Z sort as one
+    group (majors-first keeps working for suffixed broker symbols)."""
+    u = str(symbol or "").upper().split(".", 1)[0]
+    if len(u) >= 6 and u[:3] in _FX_CODES and u[3:6] in _FX_CODES:
+        return u[:6]
+    return u
+
+
+def _disabled_symbols() -> set[str]:
+    """Broker-disabled symbols (trade_mode=0), upper-cased.  Best effort:
+    empty when the prober has no data yet - ordering just skips the
+    tradeable-first preference then."""
+    try:
+        import broker_prober
+        p = broker_prober.get_prober()
+        rep = p.report().get("terminals", {})
+        if not rep:
+            # Fresh process: prime from the catalogue file (zero round
+            # trips) so the first frame already prefers tradeable variants.
+            for inst in (1, 2):
+                try:
+                    p.load_catalogue(inst)
+                except Exception:
+                    continue
+            rep = p.report().get("terminals", {})
+        out: set[str] = set()
+        for _inst, syms in rep.items():
+            for k, v in syms.items():
+                try:
+                    if int((v or {}).get("trade_mode", 4)) == 0:
+                        out.add(str(k).upper())
+                except (TypeError, ValueError):
+                    continue
+        return out
+    except Exception:
+        return set()
+
+
 def available_symbols(prefer: str = "") -> list[str]:
-    """Quoted symbols, stable order (preferred + majors first)."""
+    """Quoted symbols, stable order (preferred + majors first).
+
+    Uniform across pairs: only freshly-quoted symbols become buttons (dead
+    2024 quotes excluded), each base group ranks together, and the broker's
+    tradeable variant sorts before its disabled twin (EURUSD.Z before
+    EURUSD) so the first press always lands on a live chart."""
     try:
         spots = read_spots()
     except Exception:
@@ -98,7 +232,7 @@ def available_symbols(prefer: str = "") -> list[str]:
     live: list[str] = []
     for s, q in spots.items():
         try:
-            if float(q[0]) > 0:
+            if float(q[0]) > 0 and _quote_ts_recent(q[2] if len(q) > 2 else ""):
                 live.append(s)
         except (TypeError, ValueError, IndexError):
             continue
@@ -107,7 +241,15 @@ def available_symbols(prefer: str = "") -> list[str]:
     majors = ("EURUSD", "XAUUSD247", "XAUUSD", "GBPUSD", "USDJPY",
               "GBPJPY", "AUDUSD", "USDCAD", "XAGUSD")
     rank = {s: i for i, s in enumerate(majors)}
-    live.sort(key=lambda s: (rank.get(s, 99), s))
+    disabled = _disabled_symbols()
+
+    def _key(s: str) -> tuple:
+        u = str(s).upper()
+        base = _base_key(s)
+        r = rank.get(u, rank.get(base, 99))
+        return (r, 0 if u not in disabled else 1, base, u)
+
+    live.sort(key=_key)
     if prefer and prefer in live:
         live.remove(prefer)
         live.insert(0, prefer)
@@ -115,16 +257,41 @@ def available_symbols(prefer: str = "") -> list[str]:
         live.insert(0, prefer)
     return live
 
+
 def digits_for(symbol: str) -> int:
-    """Quote precision off a live price (right for suffixed variants)."""
+    """Quote precision off a live price (right for suffixed variants).
+
+    Live quote first (exact, then shared candidates), so USDJPY.Z reads 3
+    off its own bid just like USDJPY does - every pair formats uniformly.
+    Static fallback only when unquoted: XAG 3, XAU 2, JPY 3, else 5."""
     try:
-        bid = (read_spots().get(symbol) or ("",))[0] or ""
+        bid = (_live_quote(symbol)[0]) or ""
         if "." in str(bid):
             return max(0, len(str(bid).split(".")[1]))
     except Exception:
         pass
     s = symbol.upper()
-    return 3 if s.startswith("XAG") else (2 if s.startswith("XAU") else 5)
+    if s.startswith("XAG"):
+        return 3
+    if s.startswith("XAU"):
+        return 2
+    if "JPY" in s:
+        return 3
+    return 5
+
+def _key_for(i: int) -> str:
+    """Button shortcut: 1-9,0 for the first ten, then a-z.  Uniform with the
+    input handler below (which used to stop at 10 and left 80+ pairs
+    key-less)."""
+    if i < 9:
+        return str(i + 1)
+    if i == 9:
+        return "0"
+    n = i - 10
+    if 0 <= n < 26:
+        return chr(ord("a") + n)
+    return "-"
+
 
 def render_bar(symbols: list[str], sel: int,
                width: int) -> tuple[list[str], list[tuple[int, int, int, str]]]:
@@ -136,7 +303,7 @@ def render_bar(symbols: list[str], sel: int,
     plain = ""
     li = 0
     for i, s in enumerate(symbols):
-        key = str((i + 1) % 10) if i < 10 else "-"
+        key = _key_for(i)
         label = f"[{key}]{s}"
         if plain and len(plain) + len(label) + 1 > width:
             lines.append("".join(parts))
@@ -238,7 +405,12 @@ def render_candles(bars: list[dict], width: int, height: int,
     slot = chart_w / n
     # Floor 1 (was 2): with 30 narrow candles a 2-wide body bleeds into the
     # neighbours; proportional width keeps wide candles wide when few bars.
+    # Forced ODD so the wick column is the exact centre of the body: an even
+    # body has no single centre column (centre falls between two cells) and
+    # the wick rendered 0.5 cells off-centre on every candle.
     body_w = max(1, int(slot * 0.62))
+    if body_w % 2 == 0:
+        body_w = max(1, body_w - 1)
 
     grid: list[list[tuple[str, str]]] = [
         [(" ", "") for _ in range(chart_w)] for _ in range(rows)]
@@ -249,9 +421,15 @@ def render_candles(bars: list[dict], width: int, height: int,
 
     for i, b in enumerate(bars):
         col = "up" if b["c"] >= b["o"] else "down"
-        cx = min(chart_w - 1, int(i * slot + slot / 2))
-        x0 = max(0, cx - body_w // 2)
-        x1 = min(chart_w - 1, x0 + body_w - 1)
+        # Body span centred on the wick column.  body_w is odd so the wick
+        # is the exact middle cell.  The span is clamped into the chart and
+        # the wick follows the body centre, so edge candles keep full width
+        # AND a centred wick (clipping the body instead would narrow edge
+        # candles; shifting the body without the wick would de-centre it).
+        cx_slot = min(chart_w - 1, int(i * slot + slot / 2))
+        x0 = max(0, min(cx_slot - body_w // 2, chart_w - body_w))
+        x1 = x0 + body_w - 1
+        cx = x0 + body_w // 2
 
         r_top, r_bot = _row_of(b["h"], hi, lo, rows), _row_of(b["l"], hi, lo, rows)
         r_ob = _row_of(max(b["o"], b["c"]), hi, lo, rows)
@@ -288,7 +466,12 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
          window_n: int, symbols: list[str],
          sel: int) -> tuple[str, list[tuple[int, int, int, str]]]:
     bars = cb.window(window_n)
-    age = feed_age(1)
+    # Spots merge both terminals: live when EITHER feed is fresh (was
+    # feed_age(1) only, so a stale T1 masked a live T2 for every pair).
+    try:
+        age = min(feed_age(1), feed_age(2))
+    except Exception:
+        age = feed_age(1)
     now = dt.datetime.now().strftime("%H:%M:%S")
 
     if age > 30:
@@ -302,10 +485,10 @@ def draw(cb: CandleBuilder, symbol: str, width: int, height: int,
     bar_lines, bar_map = render_bar(symbols, sel, width)
     bar_map = [(li + 3, x0, x1, s) for li, x0, x1, s in bar_map]
     bar_txt = "\n".join(bar_lines)
-    hint = (f"{DIM}click a button or press 1-9 · [ ] cycle · q quit{RESET}"
+    hint = (f"{DIM}click a button or press 1-9,0,a-z · [ ] cycle · q quit{RESET}"
             if symbols else "")
 
-    if len(bars) < 2:
+    if len(bars) < 1:
         return ((f"{BOLD}{CYAN}┌─ MS {SEC}s ─────────────────────────────────────────┐{RESET}\n"
                  f"{BOLD}{CYAN}│{RESET} {symbol:<7} {DIM}{now}{RESET}  {status}  "
                  f"{DIM}warming up...{RESET}\n"
@@ -404,6 +587,10 @@ def main() -> int:
                         raise KeyboardInterrupt
                     elif ch in "1234567890":
                         idx = (int(ch) - 1) % 10
+                        if idx < len(symbols):
+                            switch(idx)
+                    elif "a" <= ch <= "z" and ch != "q":
+                        idx = 10 + (ord(ch) - ord("a"))
                         if idx < len(symbols):
                             switch(idx)
                     elif ch == "[":

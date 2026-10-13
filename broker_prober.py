@@ -59,15 +59,36 @@ def catalogue_symbols_for(inst: int) -> list[str]:
         return (quoted + rest)[:MAX_PROBE_SYMBOLS]
     return list(probe_symbols_for(inst))
 
+def _quote_ts_recent(ts: str, max_age_s: float = 120.0) -> bool:
+    """Is this spots quote timestamp fresh?  Unparseable -> keep (conservative).
+
+    The feed keeps dead symbols with live-looking bids (e.g. XAUUSD.FIX from
+    2024, XAUUSD.F from August) - probing them is pure exec noise, and right
+    after a broker switch the file briefly carries the PREVIOUS broker's
+    symbols (the c.Z / SP500m 'unknown symbol' storm in 2026-10-13 10:22).
+    """
+    import datetime as _dt
+    s = str(ts or "").strip()[:19]
+    if not s:
+        return True
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            stamp = _dt.datetime.strptime(s, fmt).timestamp()
+            return (time.time() - stamp) <= max_age_s
+        except ValueError:
+            continue
+    return True
+
+
 def probe_symbols_for(inst: int) -> tuple[str, ...]:
-    """Every quoted symbol on this terminal (classic pairs first), capped
-    for one fast batch.  Falls back to classic pairs with no feed yet."""
+    """Every FRESHLY quoted symbol on this terminal (classic pairs first),
+    capped for one fast batch.  Falls back to classic pairs with no feed yet."""
     try:
         from spot import read_spots
         spots = read_spots(max_age=5.0)
         classic = set(classic_pairs_for(inst))
-        available = [sym for sym, (bid, ask, _) in spots.items()
-                     if bid and float(bid) > 0.0]
+        available = [sym for sym, (bid, ask, ts) in spots.items()
+                     if bid and float(bid) > 0.0 and _quote_ts_recent(ts)]
         if available:
             result = [s for s in available if s in classic]
             result.extend(s for s in available if s not in classic)
@@ -76,6 +97,16 @@ def probe_symbols_for(inst: int) -> tuple[str, ...]:
         pass
     # Fallback: use classic pairs for this terminal
     return tuple(classic_pairs_for(inst)[:MAX_PROBE_SYMBOLS])
+
+
+def is_disabled(info: dict | None) -> bool:
+    """Did the broker disable this symbol (trade_mode=0 -> retcode 10017)?"""
+    if not info:
+        return False
+    try:
+        return int(info.get("trade_mode", 4)) == 0
+    except (TypeError, ValueError):
+        return False
 
 def parse_probe_fields(fields: list[str]) -> dict | None:
     """PROBE reply / catalogue row -> one capability dict.
@@ -125,19 +156,6 @@ def parse_probe_fields(fields: list[str]) -> dict | None:
     info["trade_mode_name"] = MODE_NAMES.get(info["trade_mode"], str(info["trade_mode"]))
     info["exec_mode_name"] = EXEC_NAMES.get(info["trade_exemode"], str(info["trade_exemode"]))
     return info
-
-ACCESS_POINTS: dict[str, list[str]] = {
-    "HFMarketsKE-Demo2": [
-        "mt5-europe3.dcglobalfarm.com:1953",
-        "mt5-europe2.dcglobalfarm.com:1953",
-        "mt5-europe4.dcglobalfarm.com:1953",
-        "mt5-asia1.dcglobalfarm.com:1953",
-        "mt5-asia6.dcglobalfarm.com:1953",
-        "mt5-asia7.dcglobalfarm.com:1953",
-        "mt5-samerica.dcglobalfarm.com:1953",
-    ],
-}
-ACCESS_POINTS["MetaQuotes-Demo"] = []
 
 OPT_TTL_S = 1800.0
 FILL_SLOW_MS = 1500.0
@@ -198,7 +216,18 @@ def tcp_ms(address: str, timeout: float = 3.0) -> float | None:
         return None
 
 def rank_access_points(server: str) -> list[tuple[str, float]]:
-    cands = ACCESS_POINTS.get(server) or ([server] if server else [])
+    """Access points for `server`, fastest reachable first.
+
+    Candidates come from the ONE shared registry
+    (config.access_point_candidates: env override, learned cache,
+    access_points.env, built-ins) instead of a second hardcoded table - so a
+    broker added in one place is rankable everywhere, which is what makes
+    `--access-point` useful for probing too.
+    """
+    from config import access_point_candidates
+    cands = list(access_point_candidates(server))
+    if not cands and server and ":" in str(server):
+        cands = [str(server)]
     out: list[tuple[str, float]] = []
     if not cands:
         return out
@@ -296,9 +325,24 @@ class BrokerProber:
             pass
         out: dict[str, dict] = {}
         cmd = self._sender(inst)
-        ok, detail = cmd.ping()
+        # PING is the round-trip health check before a PROBE batch.  The 1 s
+        # default is too tight while the EA is busy (login switch, heavy
+        # fill) - 2026-10-13 10:22:29 logged both terminals as dead mid-login
+        # with a confusing tail of OLD probe errors.  Retry 3x at 2 s, keep
+        # the full diagnosis at debug and the warning to one line.
+        ok, detail = False, ""
+        for attempt in range(1, 4):
+            try:
+                ok, detail = cmd.send("PING", timeout=2.0)
+            except Exception as exc:
+                ok, detail = False, str(exc)
+            if ok:
+                break
+            time.sleep(0.3)
         if not ok:
-            log.warning(f"prober: terminal {inst} does not answer PING ({detail})")
+            log.warning(f"prober: terminal {inst} does not answer PING "
+                        f"(3 tries) - skipping probe")
+            log.debug(f"prober: terminal {inst} PING diagnosis: {detail[:500]}")
             return out
         for off in range(0, len(symbols), PROBE_CHUNK):
             chunk = symbols[off:off + PROBE_CHUNK]

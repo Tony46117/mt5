@@ -250,12 +250,58 @@ class Supervisor:
         self._sess_changed_at = 0.0
         self._fast_frame = False
         self._restart_noticed: set[int] = set()
+        self._warned_srv: set[tuple[int, str]] = set()
 
     def log(self, text: str) -> None:
         self.events.insert(0, f"{DIM}{now_ts()}{RESET}  {text}")
         self.events = self.events[:MAX_EVENTS]
         clean = text.replace(GREEN, "").replace(RED, "").replace(YELLOW, "").replace(DIM, "").replace(RESET, "").replace(BOLD, "")
         log.info(clean)
+
+    def _server_reachable(self, inst: int, acc: dict) -> bool:
+        """Can MT5 dial this account's trade server AT ALL?
+
+        False only when the server is missing from this install's own list
+        AND no access point is configured - a state in which no amount of
+        restarting the terminal can ever produce a connection (MT5 just
+        echoes the configured login).  "Cannot tell" returns True so healing
+        is never suppressed on a guess.
+        """
+        server = str(acc.get("server", "") or "")
+        if not server:
+            return True
+        try:
+            import config
+            from spot import server_known
+            return (server_known(inst, server)
+                    or bool(config.access_point_for(server)))
+        except Exception:
+            return True
+
+    def _warn_unreachable_server(self, inst: int, acc: dict) -> None:
+        """Tell the operator ONCE when a stored account cannot connect at all.
+
+        MT5 does not dial a trade server that is missing from its own list
+        unless it is handed an access point (host:port), and without one it
+        silently echoes the requested login forever - the terminal looks
+        live, the EA keeps writing, and nothing ever connects.
+        """
+        server = str(acc.get("server", "") or "")
+        login = str(acc.get("login", "") or "")
+        if not login or not server:
+            return
+        reachable = self._server_reachable(inst, acc)
+        key = (inst, server)
+        if reachable:
+            self._warned_srv.discard(key)
+            return
+        if key in self._warned_srv:
+            return
+        self._warned_srv.add(key)
+        self.log(f"{YELLOW}terminal {inst}: {login} @ {server} cannot connect "
+                 f"- MT5 has never seen that server and it has no access "
+                 f"point. Add \"{server} = host:port\" to access_points.env "
+                 f"(or log in once by hand inside MT5 and press ADOPT){RESET}")
 
     def _adjust_poll_interval(self) -> None:
         buckets = {st.bucket() for st in self.terms.values()}
@@ -286,6 +332,7 @@ class Supervisor:
         now = time.monotonic()
         for inst, st in self.terms.items():
             expected = accs.get(inst, {}).get("login", "?")
+            self._warn_unreachable_server(inst, accs.get(inst, {}))
             exe_ok = (TERMINALS[inst]["dir"] / "terminal64.exe").exists()
             
             running = term_running(inst)
@@ -372,7 +419,12 @@ class Supervisor:
             no_identity = ((not (st.header or {}).get("currency"))
                            or h_login in ("", "0"))
             if (b == "live" and st.header and no_identity
-                    and expected not in ("", "?")):
+                    and expected not in ("", "?")
+                    # A server MT5 cannot dial never syncs, no matter how
+                    # many times the terminal is rebooted: stand the sync-heal
+                    # down instead of cycling a healthy terminal every few
+                    # minutes.  The operator already got the exact fix.
+                    and self._server_reachable(inst, accs.get(inst, {}))):
                 if st.sync_dead_since == 0.0:
                     st.sync_dead_since = time.monotonic()
                 if (time.monotonic() - st.sync_dead_since > SYNC_DEAD_S
@@ -404,7 +456,11 @@ class Supervisor:
                                   f"manual onboarding of {srv}")
             else:
                 st.sync_dead_since = 0.0
-                st.heal_sync_fails = 0
+                # Only a broker-synced account clears the cap.  Resetting it
+                # on every laggy/stale frame let the sync-heal restart a
+                # terminal whose account can never connect, forever.
+                if (st.header or {}).get("currency"):
+                    st.heal_sync_fails = 0
 
             if time.monotonic() - st.last_check > (1.0 if (not st.login or st.login != expected) else 5.0):
                 st.last_check = time.monotonic()
@@ -524,7 +580,19 @@ class Supervisor:
             raw_login = h.get("login", "")
             logged_out = raw_login in ("", "0")
             login = "-" if logged_out else raw_login
-            ok = (not logged_out and login == exp)
+            # "logged in" must mean the BROKER accepted it.  MT5 echoes the
+            # configured login even when the trade server is unknown and
+            # nothing was ever dialled, so a matching number with no account
+            # details is NOT ok - show (no broker) instead of a reassuring
+            # (ok) over an account that cannot trade.
+            authorized = bool(h.get("currency"))
+            ok = (not logged_out and login == exp and authorized)
+            if ok:
+                mark = f"{GREEN}(ok){RESET}"
+            elif login != exp:
+                mark = f"{RED}(want {exp}){RESET}"
+            else:
+                mark = f"{YELLOW}(no broker){RESET}"
             age = feed_age(inst)
             age_s = f"{age*1000:.0f} ms" if age < 5 else f"{age:.0f} s"
             bal = "-" if logged_out else h.get("balance", "-")
@@ -544,7 +612,7 @@ class Supervisor:
                 f"  T{inst}  {bcol}{btxt:<6}{RESET}  "
                 f"feed {age_s:>8}  {algo_s}  "
                 f"login {login:<11}"
-                f"{'(ok)' if ok else f'{RED}(want {exp}){RESET}'}  "
+                f"{mark}  "
                 f"{DIM}bal {bal}  eq {eq}{RESET}")
         
         out.append("")
