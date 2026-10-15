@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.78"
+#property version   "1.79"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -186,11 +186,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    int i = AsyncIndex(result.request_id);
    if(i < 0)
       return;
-   if(result.retcode == TRADE_RETCODE_DONE ||
-      result.retcode == TRADE_RETCODE_PLACED ||
-      result.retcode == TRADE_RETCODE_DONE_PARTIAL)
-     {
-      ProvenFillRemember(g_async[i].sym, (ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
+    if(result.retcode == TRADE_RETCODE_DONE ||
+       result.retcode == TRADE_RETCODE_PLACED ||
+       result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+      {
+       // Tracked REMOVEs flight with fill 0 (no filling mode) - they must
+       // never overwrite the proven fill that DEAL closes rely on.
+       if(g_async[i].fill != 0)
+          ProvenFillRemember(g_async[i].sym, (ENUM_ORDER_TYPE_FILLING)g_async[i].fill);
 
       ulong tk = result.order;
       if(result.deal > 0 && HistoryDealSelect(result.deal))
@@ -251,6 +254,42 @@ double NormalizeVolume(string sym, double vol)
 
    return(NormalizeDouble(v, 8));
   }
+
+// Fire REMOVE for every matching pending stop/limit order via
+// OrderSendAsync - back-to-back with zero waiting, so a book of N
+// stops/limits clears in ~one flight time instead of N serial broker
+// round trips.  Returns the flighted count (`failed` takes the ones
+// the terminal would not even flight).  The ack only ever claims
+// "flighted": Python polls the order book until it reads empty, so
+// speed costs no truth.
+int FanOutRemoves(string sym, bool all, int &failed)
+   {
+    failed = 0;
+    int flighted = 0;
+    int total = OrdersTotal();
+    for(int oi = total - 1; oi >= 0; oi--)
+      {
+       ulong ot = OrderGetTicket(oi);
+       if(ot == 0 || !OrderSelect(ot))
+          continue;
+       if(!all && OrderGetString(ORDER_SYMBOL) != sym)
+          continue;
+       MqlTradeRequest dreq;
+       MqlTradeResult  dres;
+       ZeroMemory(dreq);
+       ZeroMemory(dres);
+       dreq.action = TRADE_ACTION_REMOVE;
+       dreq.order  = ot;
+       if(OrderSendAsync(dreq, dres) &&
+          (dres.retcode == TRADE_RETCODE_PLACED ||
+           dres.retcode == TRADE_RETCODE_DONE ||
+           dres.retcode == TRADE_RETCODE_DONE_PARTIAL))
+          flighted++;
+       else
+          failed++;
+      }
+    return(flighted);
+   }
 
 bool SendDealWithFallback(MqlTradeRequest &req, MqlTradeResult &res)
   {
@@ -1161,28 +1200,36 @@ void ExecuteLine(string line)
         {
          // Not an open position - it may be a pending stop/limit order
          // (StopExe straddle, manual ORDER ticket).  Delete it instead so
-         // the panel's CLOSE buttons flatten pending orders too.
-         if(OrderSelect(ticket))
-           {
-            string osym = OrderGetString(ORDER_SYMBOL);
-            MqlTradeRequest delreq;
-            MqlTradeResult  delres;
-            ZeroMemory(delreq);
-            ZeroMemory(delres);
-            delreq.action = TRADE_ACTION_REMOVE;
-            delreq.order  = ticket;
-            if(!OrderSend(delreq, delres) ||
-               (delres.retcode != TRADE_RETCODE_DONE &&
-                delres.retcode != TRADE_RETCODE_PLACED))
-              {
-               AppendOut(id, "ERR", "cancel retcode " +
-                         IntegerToString((long)delres.retcode) + " " + delres.comment);
-               return;
-              }
-            DumpOrders();
-            AppendOut(id, "OK", "deleted pending " + osym + "|" + p[2] + "|0.00");
-            return;
-           }
+          // the panel's CLOSE buttons flatten pending orders too.
+          if(OrderSelect(ticket))
+            {
+             // Async flight, tracked like a position close: the EA never
+             // blocks on the broker round trip, and the ack (ok or retcode)
+             // still comes back through OnTradeTransaction.
+             string osym = OrderGetString(ORDER_SYMBOL);
+             double ovol = OrderGetDouble(ORDER_VOLUME_CURRENT);
+             int odigits = (int)SymbolInfoInteger(osym, SYMBOL_DIGITS);
+             MqlTradeRequest delreq;
+             MqlTradeResult  delares;
+             ZeroMemory(delreq);
+             ZeroMemory(delares);
+             delreq.action = TRADE_ACTION_REMOVE;
+             delreq.order  = ticket;
+             if(!OrderSendAsync(delreq, delares) || delares.retcode == 0 ||
+                (delares.retcode != TRADE_RETCODE_PLACED &&
+                 delares.retcode != TRADE_RETCODE_DONE &&
+                 delares.retcode != TRADE_RETCODE_DONE_PARTIAL))
+               {
+                AppendOut(id, "ERR", "cancel retcode " +
+                          IntegerToString((long)delares.retcode) + " " + delares.comment);
+                return;
+               }
+             // fill 0 (none): a REMOVE carries no filling mode and must
+             // never overwrite the symbol's proven fill used by DEAL closes.
+             AsyncTrack(delares.request_id, id, false, osym, ovol, odigits,
+                        0, delreq);
+             return;
+            }
          AppendOut(id, "ERR", "no position or pending order " + p[2]);
          return;
         }
@@ -1297,77 +1344,44 @@ void ExecuteLine(string line)
                               IntegerToString(failed) + ")");
             return;
            }
-         else
-           {
-            // Positions are flighted async (tracked) - pendings delete
-            // synchronously right now, then one combined ack goes back.
-            int deld = 0, delfail = 0;
-            for(int oi = OrdersTotal() - 1; oi >= 0; oi--)
-              {
-               ulong ot = OrderGetTicket(oi);
-               if(ot == 0 || !OrderSelect(ot))
-                  continue;
-               if(!all && OrderGetString(ORDER_SYMBOL) != sym)
-                  continue;
-               MqlTradeRequest dreq;
-               MqlTradeResult  dres;
-               ZeroMemory(dreq);
-               ZeroMemory(dres);
-               dreq.action = TRADE_ACTION_REMOVE;
-               dreq.order  = ot;
-               if(OrderSend(dreq, dres) &&
-                  (dres.retcode == TRADE_RETCODE_DONE ||
-                   dres.retcode == TRADE_RETCODE_PLACED))
-                  deld++;
-               else
-                  delfail++;
-              }
-            DumpOrders();
-            AppendOut(id, "OK", "closed flighted " + IntegerToString(sent) +
-                      " deleted pendings " + IntegerToString(deld) +
-                      (delfail > 0 ? (" failed " + IntegerToString(failed + delfail)) : ""));
-            return;
-           }
-        }
-      // No positions at all - still sweep pending stop/limit orders so the
-      // red CLOSE bar deletes a StopExe straddle sitting on the broker.
-      {
-       int deld = 0, delfail = 0;
-       for(int oi = OrdersTotal() - 1; oi >= 0; oi--)
-         {
-          ulong ot = OrderGetTicket(oi);
-          if(ot == 0 || !OrderSelect(ot))
-             continue;
-          if(!all && OrderGetString(ORDER_SYMBOL) != sym)
-             continue;
-          MqlTradeRequest dreq;
-          MqlTradeResult  dres;
-          ZeroMemory(dreq);
-          ZeroMemory(dres);
-          dreq.action = TRADE_ACTION_REMOVE;
-          dreq.order  = ot;
-          if(OrderSend(dreq, dres) &&
-             (dres.retcode == TRADE_RETCODE_DONE ||
-              dres.retcode == TRADE_RETCODE_PLACED))
-             deld++;
           else
-             delfail++;
-         }
-       DumpOrders();
-       if(deld == 0 && delfail == 0)
-         {
-          AppendOut(id, "OK", "closed 0 failed 0");
-          return;
-         }
-       if(deld > 0 && delfail == 0)
-         {
-          AppendOut(id, "OK", "closed 0 deleted pendings " + IntegerToString(deld));
-          return;
-         }
-       AppendOut(id, "ERR", "deleted " + IntegerToString(deld) +
-                 " failed " + IntegerToString(delfail));
-       return;
-      }
+            {
+             // Positions flighted async (tracked) above - pending stops /
+             // limits fan out async too, so the whole book clears in ~one
+             // flight time.  Python polls the book until empty, so the ack
+             // claims flighted deletes, never done ones.
+             int delfail = 0;
+             int delFlight = FanOutRemoves(sym, all, delfail);
+             DumpOrders();
+             AppendOut(id, "OK", "closed flighted " + IntegerToString(sent) +
+                       " deleted pendings flighted " + IntegerToString(delFlight) +
+                       (delfail > 0 ? (" failed " + IntegerToString(failed + delfail)) : ""));
+             return;
+            }
+        }
+       // No positions at all - still sweep pending stop/limit orders so the
+       // red CLOSE bar deletes a StopExe straddle sitting on the broker.
+       // Async fan-out: every delete flights back-to-back, ack returns in
+       // ~one flight time, Python polls the book until it reads empty.
+       {
+        int delfail = 0;
+        int delFlight = FanOutRemoves(sym, all, delfail);
+        DumpOrders();
+        if(delFlight == 0 && delfail == 0)
+          {
+           AppendOut(id, "OK", "closed 0 failed 0");
+           return;
+          }
+        if(delfail == 0)
+          {
+           AppendOut(id, "OK", "closed 0 deleted pendings flighted " +
+                     IntegerToString(delFlight));
+           return;
+          }
+        AppendOut(id, "ERR", "deleted flighted " + IntegerToString(delFlight) +
+                  " failed " + IntegerToString(delfail));
+        return;
+       }
      }
 
    if(cmd == "PROBE" && k >= 3)
