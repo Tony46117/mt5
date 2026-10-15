@@ -719,7 +719,14 @@ def api_stopexe_preview():
     if not 0.5 <= dpips <= 100:
         return _fail("distance must be 0.5..100 pips")
     try:
-        lv = stopexe_mod.stopexe_levels(symbol, account, dpips)
+        slpips = float(request.args.get("sl_pips",
+                                        request.args.get("sl", 2.0)))
+    except (TypeError, ValueError):
+        return _fail("bad sl")
+    if not 0.5 <= slpips <= 100:
+        return _fail("sl must be 0.5..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips)
     except ValueError as exc:
         return _fail(str(exc))
     return _ok(lv)
@@ -730,7 +737,8 @@ def api_stopexe_preview():
 def api_stopexe():
     """StopExe: open a BUY STOP (ask + 2 pips) + SELL STOP (bid - 2 pips)
     straddle of `lot` around the live price - 4 pips bracket total
-    (gold at 4150 -> 4152 / 4148), both legs in one exec command."""
+    (gold at 4150 -> 4152 / 4148), both legs in one exec command, each
+    leg carrying its 2-pip protective SL from the same OrderSend."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
@@ -754,7 +762,13 @@ def api_stopexe():
     if not 0.5 <= dpips <= 100:
         return _fail("distance must be 0.5..100 pips")
     try:
-        lv = stopexe_mod.stopexe_levels(symbol, account, dpips)
+        slpips = float(d.get("sl_pips", d.get("sl", 2.0)))
+    except (TypeError, ValueError):
+        return _fail("bad sl")
+    if not 0.5 <= slpips <= 100:
+        return _fail("sl must be 0.5..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips)
     except ValueError as exc:
         return _fail(str(exc))
     try:
@@ -775,7 +789,7 @@ def api_stopexe():
     if lot_err:
         return _fail(lot_err)
     try:
-        res = stopexe_mod.place_stopexe(account, symbol, lot, dpips)
+        res = stopexe_mod.place_stopexe(account, symbol, lot, dpips, slpips)
     except ValueError as exc:
         return _fail(str(exc))
     except Exception as exc:

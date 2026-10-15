@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.77"
+#property version   "1.78"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -121,14 +121,60 @@ ENUM_ORDER_TYPE_FILLING ProvenFill(string sym)
   }
 
 ENUM_ORDER_TYPE_FILLING FillingFor(string sym)
-  {
-   long fill = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-   if((fill & SYMBOL_FILLING_IOC) != 0)
-      return(ORDER_FILLING_IOC);
-   if((fill & SYMBOL_FILLING_FOK) != 0)
-      return(ORDER_FILLING_FOK);
-   return(ORDER_FILLING_RETURN);
-  }
+   {
+    long fill = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+    if((fill & SYMBOL_FILLING_IOC) != 0)
+       return(ORDER_FILLING_IOC);
+    if((fill & SYMBOL_FILLING_FOK) != 0)
+       return(ORDER_FILLING_FOK);
+    return(ORDER_FILLING_RETURN);
+   }
+
+// One pip of price distance for `sym` quoted with `digits` - mirrors
+// stopexe.pip_size in Python so the EA derives the SAME 2-pip SL when
+// the caller does not send explicit SLs (legacy STOPEXE shape).
+double PipSizeFor(string sym, int digits)
+   {
+    string s = sym;
+    StringToUpper(s);
+    if(StringFind(s, "XAU") >= 0 || StringFind(s, "GOLD") >= 0)
+       return(1.0);
+    if(StringFind(s, "XAG") >= 0 || StringFind(s, "SILVER") >= 0 ||
+       StringFind(s, "XPT") >= 0 || StringFind(s, "XPD") >= 0)
+       return(0.1);
+    double point = MathPow(10.0, -(double)digits);
+    if(digits == 3 || digits == 5)
+       return(10.0 * point);
+    return(point);
+   }
+
+// Widen a protective SL to the broker minimum when it sits too tight
+// to its entry: buy SL must rest at least `gap` below `entry`, sell
+// SL at least `gap` above it.  A 2-pip SL already clears every sane
+// stops/freeze level; this only saves exotic symbols from a 10016.
+double StopexeBuySL(string sym, int digits, double point, double gap,
+                    double entry, double want)
+   {
+    double sl = NormalizeDouble(want, digits);
+    double mind = gap + point;
+    if(entry - sl < mind)
+       sl = NormalizeDouble(entry - mind, digits);
+    if(sl >= entry)
+       sl = NormalizeDouble(entry - point, digits);
+    return(sl);
+   }
+
+double StopexeSellSL(string sym, int digits, double point, double gap,
+                     double entry, double want)
+   {
+    double sl = NormalizeDouble(want, digits);
+    double mind = gap + point;
+    if(sl - entry < mind)
+       sl = NormalizeDouble(entry + mind, digits);
+    if(sl <= entry)
+       sl = NormalizeDouble(entry + point, digits);
+    return(sl);
+   }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
@@ -821,109 +867,147 @@ void ExecuteLine(string line)
       return;
      }
 
-   // STOPEXE\tsym\tvol\tbuyprice\tsellprice\t[magic]\t[comment]
-   // One file, one pass, both legs back-to-back: the straddle rests on
-   // the broker TOGETHER (a two-file batch could split across passes).
-   // Either both legs ack or neither stands: if the sell leg fails after
-   // the buy leg is placed, the buy leg is pulled before replying.
-   if(cmd == "STOPEXE" && k >= 6)
-     {
-      string sym = p[2];
-      if(!SymbolSelect(sym, true))
-        {
-         AppendOut(id, "ERR", "unknown symbol " + sym);
-         return;
-        }
-      double vol   = NormalizeVolume(sym, StringToDouble(p[3]));
-      double bprice = StringToDouble(p[4]);
-      double sprice = StringToDouble(p[5]);
-      long   mg    = (k > 6) ? StringToInteger(p[6]) : MAGIC_PY;
-      string cm    = (k > 7) ? p[7] : "stopexe";
-      int digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-      double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
-      double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
-      bprice = NormalizeDouble(bprice, digits);
-      sprice = NormalizeDouble(sprice, digits);
-      if(vol <= 0.0 || bprice <= 0.0 || sprice <= 0.0 || ask <= 0.0 || bid <= 0.0)
-        {
-         AppendOut(id, "ERR", "bad volume, price or no quote");
-         return;
-        }
-      double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
-      double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
-      double gap    = MathMax(stops, freeze);
-      if(bprice < ask + gap)
-        {
-         AppendOut(id, "ERR", "buy stop must sit ABOVE the ask (bid " +
-                   DoubleToString(bid, digits) + " ask " +
-                   DoubleToString(ask, digits) + ")");
-         return;
-        }
-      if(sprice > bid - gap)
-        {
-         AppendOut(id, "ERR", "sell stop must sit BELOW the bid (bid " +
-                   DoubleToString(bid, digits) + " ask " +
-                   DoubleToString(ask, digits) + ")");
-         return;
-        }
-      MqlTradeRequest breq;
-      MqlTradeResult  bres;
-      ZeroMemory(breq);
-      ZeroMemory(bres);
-      breq.action       = TRADE_ACTION_PENDING;
-      breq.symbol       = sym;
-      breq.volume       = vol;
-      breq.type         = ORDER_TYPE_BUY_STOP;
-      breq.price        = bprice;
-      breq.magic        = (ulong)mg;
-      breq.comment      = cm;
-      breq.type_time    = ORDER_TIME_GTC;
-      breq.type_filling = ORDER_FILLING_RETURN;
-      if(!OrderSend(breq, bres) ||
-         (bres.retcode != TRADE_RETCODE_DONE && bres.retcode != TRADE_RETCODE_PLACED))
-        {
-         AppendOut(id, "ERR", "buy stop retcode " +
-                   IntegerToString((long)bres.retcode) + " " + bres.comment);
-         return;
-        }
-      MqlTradeRequest sreq;
-      MqlTradeResult  sres;
-      ZeroMemory(sreq);
-      ZeroMemory(sres);
-      sreq.action       = TRADE_ACTION_PENDING;
-      sreq.symbol       = sym;
-      sreq.volume       = vol;
-      sreq.type         = ORDER_TYPE_SELL_STOP;
-      sreq.price        = sprice;
-      sreq.magic        = (ulong)mg;
-      sreq.comment      = cm;
-      sreq.type_time    = ORDER_TIME_GTC;
-      sreq.type_filling = ORDER_FILLING_RETURN;
-      if(!OrderSend(sreq, sres) ||
-         (sres.retcode != TRADE_RETCODE_DONE && sres.retcode != TRADE_RETCODE_PLACED))
-        {
-         // Pull the buy leg so a half straddle never stands alone.
-         MqlTradeRequest dreq;
-         MqlTradeResult  dres;
-         ZeroMemory(dreq);
-         ZeroMemory(dres);
-         dreq.action = TRADE_ACTION_REMOVE;
-         dreq.order  = bres.order;
-         OrderSend(dreq, dres);
-         DumpOrders();
-         AppendOut(id, "ERR", "sell stop retcode " +
-                   IntegerToString((long)sres.retcode) + " " + sres.comment +
-                   " - buy leg #" + IntegerToString((long)bres.order) + " pulled");
-         return;
-        }
-      DumpOrders();
-      AppendOut(id, "OK", DoubleToString(bprice, digits) + "|" +
-                IntegerToString((long)bres.order) + "|" +
-                DoubleToString(sprice, digits) + "|" +
-                IntegerToString((long)sres.order));
-      return;
-     }
+    // STOPEXESL\tsym\tvol\tbuyprice\tsellprice\tbuysl\tsellsl\t[magic]\t[comment]
+    // STOPEXE\tsym\tvol\tbuyprice\tsellprice\t[magic]\t[comment] (legacy)
+    // One file, one pass, both legs back-to-back with their protective
+    // SLs attached AT OrderSend time: the straddle rests on the broker
+    // TOGETHER and protected (a two-file batch could split across
+    // passes, a post-place MODIFY would leave an unprotected window).
+    // Either both legs ack or neither stands: if the sell leg fails
+    // after the buy leg is placed, the buy leg is pulled before replying.
+    // Legacy STOPEXE callers (no SL fields) get a 2-pip SL derived here,
+    // so every straddle is protected whatever Python sent.
+    if((cmd == "STOPEXESL" || cmd == "STOPEXE") && k >= 6)
+      {
+       string sym = p[2];
+       if(!SymbolSelect(sym, true))
+         {
+          AppendOut(id, "ERR", "unknown symbol " + sym);
+          return;
+         }
+       double vol   = NormalizeVolume(sym, StringToDouble(p[3]));
+       double bprice = StringToDouble(p[4]);
+       double sprice = StringToDouble(p[5]);
+       int digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+       double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+       double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
+       double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
+       bprice = NormalizeDouble(bprice, digits);
+       sprice = NormalizeDouble(sprice, digits);
+       if(vol <= 0.0 || bprice <= 0.0 || sprice <= 0.0 || ask <= 0.0 || bid <= 0.0)
+         {
+          AppendOut(id, "ERR", "bad volume, price or no quote");
+          return;
+         }
+       double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+       double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+       double gap    = MathMax(stops, freeze);
+       if(bprice < ask + gap)
+         {
+          AppendOut(id, "ERR", "buy stop must sit ABOVE the ask (bid " +
+                    DoubleToString(bid, digits) + " ask " +
+                    DoubleToString(ask, digits) + ")");
+          return;
+         }
+       if(sprice > bid - gap)
+         {
+          AppendOut(id, "ERR", "sell stop must sit BELOW the bid (bid " +
+                    DoubleToString(bid, digits) + " ask " +
+                    DoubleToString(ask, digits) + ")");
+          return;
+         }
+       // Explicit SLs ride in p[6]/p[7] on the v1.78 shape
+       // (STOPEXESL sym vol buy sell buysl sellsl magic comment).
+       // Anything shorter is a legacy STOPEXE: derive the 2-pip SLs
+       // here so the legs are still protected at OrderSend time.
+       double wantb, wants;
+       long   mg;
+       string cm;
+       if(k >= 10)
+         {
+          wantb = StringToDouble(p[6]);
+          wants = StringToDouble(p[7]);
+          mg    = StringToInteger(p[8]);
+          cm    = p[9];
+          if(mg == 0) mg = MAGIC_PY;
+          if(StringLen(cm) == 0) cm = "stopexe";
+         }
+       else
+         {
+          double pip = PipSizeFor(sym, digits);
+          wantb = bprice - 2.0 * pip;
+          wants = sprice + 2.0 * pip;
+          mg    = (k > 6) ? StringToInteger(p[6]) : MAGIC_PY;
+          cm    = (k > 7) ? p[7] : "stopexe";
+         }
+       double bsl = StopexeBuySL(sym, digits, point, gap, bprice, wantb);
+       double ssl = StopexeSellSL(sym, digits, point, gap, sprice, wants);
+       if(bsl <= 0.0 || ssl <= 0.0)
+         {
+          AppendOut(id, "ERR", "bad stop loss");
+          return;
+         }
+       MqlTradeRequest breq;
+       MqlTradeResult  bres;
+       ZeroMemory(breq);
+       ZeroMemory(bres);
+       breq.action       = TRADE_ACTION_PENDING;
+       breq.symbol       = sym;
+       breq.volume       = vol;
+       breq.type         = ORDER_TYPE_BUY_STOP;
+       breq.price        = bprice;
+       breq.sl           = bsl;
+       breq.magic        = (ulong)mg;
+       breq.comment      = cm;
+       breq.type_time    = ORDER_TIME_GTC;
+       breq.type_filling = ORDER_FILLING_RETURN;
+       if(!OrderSend(breq, bres) ||
+          (bres.retcode != TRADE_RETCODE_DONE && bres.retcode != TRADE_RETCODE_PLACED))
+         {
+          AppendOut(id, "ERR", "buy stop retcode " +
+                    IntegerToString((long)bres.retcode) + " " + bres.comment);
+          return;
+         }
+       MqlTradeRequest sreq;
+       MqlTradeResult  sres;
+       ZeroMemory(sreq);
+       ZeroMemory(sres);
+       sreq.action       = TRADE_ACTION_PENDING;
+       sreq.symbol       = sym;
+       sreq.volume       = vol;
+       sreq.type         = ORDER_TYPE_SELL_STOP;
+       sreq.price        = sprice;
+       sreq.sl           = ssl;
+       sreq.magic        = (ulong)mg;
+       sreq.comment      = cm;
+       sreq.type_time    = ORDER_TIME_GTC;
+       sreq.type_filling = ORDER_FILLING_RETURN;
+       if(!OrderSend(sreq, sres) ||
+          (sres.retcode != TRADE_RETCODE_DONE && sres.retcode != TRADE_RETCODE_PLACED))
+         {
+          // Pull the buy leg so a half straddle never stands alone.
+          MqlTradeRequest dreq;
+          MqlTradeResult  dres;
+          ZeroMemory(dreq);
+          ZeroMemory(dres);
+          dreq.action = TRADE_ACTION_REMOVE;
+          dreq.order  = bres.order;
+          OrderSend(dreq, dres);
+          DumpOrders();
+          AppendOut(id, "ERR", "sell stop retcode " +
+                    IntegerToString((long)sres.retcode) + " " + sres.comment +
+                    " - buy leg #" + IntegerToString((long)bres.order) + " pulled");
+          return;
+         }
+       DumpOrders();
+       AppendOut(id, "OK", DoubleToString(bprice, digits) + "|" +
+                 IntegerToString((long)bres.order) + "|" +
+                 DoubleToString(sprice, digits) + "|" +
+                 IntegerToString((long)sres.order) + "|" +
+                 DoubleToString(bsl, digits) + "|" +
+                 DoubleToString(ssl, digits));
+       return;
+      }
 
    // PENDING\tsym\tBUYLIMIT|BUYSTOP|SELLLIMIT|SELLSTOP\tvol\tprice\t[sl]\t[tp]\t[magic]\t[comment]
    // Placed synchronously (no async tracking) so the ticket comes straight
@@ -1000,13 +1084,77 @@ void ExecuteLine(string line)
                    " " + res.comment);
          return;
         }
-      AppendOut(id, "OK", DoubleToString(req.price, digits) + "|" +
-                IntegerToString((long)res.order) + "|" +
-                DoubleToString(req.volume, 2));
-      return;
-     }
+       AppendOut(id, "OK", DoubleToString(req.price, digits) + "|" +
+                 IntegerToString((long)res.order) + "|" +
+                 DoubleToString(req.volume, 2));
+       return;
+      }
 
-   if(cmd == "CLOSE" && k >= 3)
+    // MODIFY\torder_ticket\tsl\t[tp]
+    // Attach (or move) SL/TP on a resting pending order in place - no
+    // delete/re-place, so the queue slot survives.  Used to retrofit
+    // protection onto legs placed by an older EA.  Two MODIFYs travel
+    // in one Python batch, so both straddle legs patch concurrently.
+    if(cmd == "MODIFY" && k >= 4)
+      {
+       ulong ticket = (ulong)StringToInteger(p[2]);
+       double nsl = StringToDouble(p[3]);
+       double ntp = (k > 4) ? StringToDouble(p[4]) : 0.0;
+       if(!OrderSelect(ticket))
+         {
+          AppendOut(id, "ERR", "no pending order " + p[2]);
+          return;
+         }
+       string sym = OrderGetString(ORDER_SYMBOL);
+       long otype = OrderGetInteger(ORDER_TYPE);
+       double oprice = OrderGetDouble(ORDER_PRICE_OPEN);
+       int digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+       double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+       double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+       double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+       double gap    = MathMax(stops, freeze);
+       double mind   = gap + point;
+       nsl = NormalizeDouble(nsl, digits);
+       ntp = NormalizeDouble(ntp, digits);
+       if(nsl > 0.0)
+         {
+          if(otype == ORDER_TYPE_BUY_STOP || otype == ORDER_TYPE_BUY_LIMIT)
+            {
+             if(oprice - nsl < mind)
+                nsl = NormalizeDouble(oprice - mind, digits);
+            }
+          else
+            {
+             if(nsl - oprice < mind)
+                nsl = NormalizeDouble(oprice + mind, digits);
+            }
+         }
+       MqlTradeRequest mreq;
+       MqlTradeResult  mres;
+       ZeroMemory(mreq);
+       ZeroMemory(mres);
+       mreq.action = TRADE_ACTION_MODIFY;
+       mreq.order  = ticket;
+       mreq.symbol = sym;
+       mreq.price  = oprice;
+       mreq.sl     = (nsl > 0.0) ? nsl : OrderGetDouble(ORDER_SL);
+       mreq.tp     = (ntp > 0.0) ? ntp : OrderGetDouble(ORDER_TP);
+       if(!OrderSend(mreq, mres) ||
+          (mres.retcode != TRADE_RETCODE_DONE && mres.retcode != TRADE_RETCODE_PLACED))
+         {
+          AppendOut(id, "ERR", "modify retcode " +
+                    IntegerToString((long)mres.retcode) + " " + mres.comment);
+          return;
+         }
+       DumpOrders();
+       AppendOut(id, "OK", DoubleToString(oprice, digits) + "|" +
+                 IntegerToString((long)ticket) + "|" +
+                 DoubleToString(mreq.sl, digits) + "|" +
+                 DoubleToString(mreq.tp, digits));
+       return;
+      }
+
+    if(cmd == "CLOSE" && k >= 3)
      {
       ulong ticket = (ulong)StringToInteger(p[2]);
       if(!PositionSelectByTicket(ticket))

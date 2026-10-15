@@ -50,7 +50,7 @@ One command starts everything; Ctrl+C stops everything.
 
 | Component       | Role |
 |-----------------|------|
-| `SpotDump.mq5`  | MQL5 Expert Advisor attached to each terminal's chart. Writes the market feed, account header and the full broker symbol catalogue (`symbols.csv`) to `MQL5/Files`, consumes order commands (`OPEN`, `CLOSE`, `CLOSEALL`, `PING`, `PROBE`) from `exec_in.<id>.txt` - every pending file it finds each tick, pointer file first - and appends results to `exec_out.csv`. |
+| `SpotDump.mq5`  | MQL5 Expert Advisor attached to each terminal's chart. Writes the market feed, account header and the full broker symbol catalogue (`symbols.csv`) to `MQL5/Files`, consumes order commands (`OPEN`, `PENDING`, `STOPEXE`/`STOPEXESL`, `MODIFY`, `CLOSE`, `CLOSEALL`, `PING`, `PROBE`) from `exec_in.<id>.txt` - every pending file it finds each tick, pointer file first - and appends results to `exec_out.csv`. |
 | `spot.py`       | Terminal lifecycle (launch, stop, restart, minimal one-chart boot), start-config generation and credential scrubbing, feed readers. |
 | `bridge.py`     | Supervisor screen. Concurrent boot of both terminals, feed/watchdog auto-heal, hot account switching, antidetect scrubbing. |
 | `executor.py`   | The only way Python trades. `SendCommand` file protocol, batched concurrent orders, `FutureTradeScheduler` with CAS claims, fire-latency control, 500 ms retries. |

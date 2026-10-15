@@ -1039,8 +1039,10 @@ function buildPanel(n){
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
    '<div class="stex-bracket">'+
-    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 2 pips</div><div class="v buy" id="stexbuy'+n+'">-</div></div>'+
-    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 2 pips</div><div class="v sell" id="stexsell'+n+'">-</div></div>'+
+    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 2 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 2 pips</div></div>'+
+    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 2 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 2 pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
     '<div class="fgroup"><label>Lot (each leg)</label>'+
@@ -1056,7 +1058,7 @@ function buildPanel(n){
    '<div class="tradebtns" style="margin-top:2px">'+
     '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">EXECUTE STOPEXE</button>'+
    '</div>'+
-   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price</div>'+
+   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price · each leg carries a 2-pip SL from the same OrderSend</div>'+
   '</div>'+
   '<div class="sect"><h4>Open positions</h4><div class="right">'+
    '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
@@ -1192,14 +1194,18 @@ async function stexPreview(n,force){
   const now=Date.now();
   if(!force&&now-(STEX_TS[n]||0)<2000)return;
   STEX_TS[n]=now;
-  const sym=stexSel(n);
-  const buy=$id('stexbuy'+n),sell=$id('stexsell'+n);
-  if(!sym||sym==='-'){if(buy)buy.textContent='-';if(sell)sell.textContent='-';return}
-  try{const j=await api('/api/stopexe/preview?account='+n+
+   const sym=stexSel(n);
+   const buy=$id('stexbuy'+n),sell=$id('stexsell'+n);
+   const bsl=$id('stexbuysl'+n),ssl=$id('stexsellsl'+n);
+   if(!sym||sym==='-'){if(buy)buy.textContent='-';if(sell)sell.textContent='-';
+    if(bsl)bsl.textContent='-';if(ssl)ssl.textContent='-';return}
+   try{const j=await api('/api/stopexe/preview?account='+n+
     '&symbol='+encodeURIComponent(sym)+'&pips='+stexPips(n));
    if(stexSel(n)!==sym)return;             // stale reply after re-arm
    if(buy)buy.textContent=j.buy_price;
    if(sell)sell.textContent=j.sell_price;
+   if(bsl)bsl.textContent=j.buy_sl==null?'-':j.buy_sl;
+   if(ssl)ssl.textContent=j.sell_sl==null?'-':j.sell_sl;
    const br=$id('stexbr'+n);
    if(br)br.textContent='±'+j.distance_pips+' pips';
    const bk=$id('stexbuyk'+n);
@@ -1221,13 +1227,13 @@ async function doStopexe(n){
    fb.textContent='lot must be greater than 0';}return}
   INFLIGHT['sx'+n]=true;if(btn)btn.disabled=true;
   if(btn)asmrPop(btn);
-  if(fb){fb.className='feedback';
-   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips ... placing both legs';}
-  try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
-    distance_pips:stexPips(n)});
+   if(fb){fb.className='feedback';
+   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + 2-pip SLs ... placing both legs';}
+   try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
+    distance_pips:stexPips(n),sl_pips:2});
    if(fb){fb.className='feedback ok';
     fb.textContent='ARMED '+j.detail+' ('+j.ms+' ms) - CLOSE deletes both legs';}
-   toast('STOPEXE '+sym+': buy '+j.buy_price+' / sell '+j.sell_price,true);
+   toast('STOPEXE '+sym+': buy '+j.buy_price+' (SL '+j.buy_sl+') / sell '+j.sell_price+' (SL '+j.sell_sl+')',true);
    refresh()}
   catch(e){if(fb){fb.className='feedback err';fb.textContent='REJECTED: '+e.message}
    toast('STOPEXE: '+e.message,false)}

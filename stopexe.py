@@ -4,12 +4,17 @@
 
 One EXECUTE opens a two-leg straddle around the live price:
 
-    BUY STOP  at ask + 2 pips
-    SELL STOP at bid - 2 pips        (4-pip bracket total)
+    BUY STOP  at ask + 2 pips  with SL at entry - 2 pips
+    SELL STOP at bid - 2 pips  with SL at entry + 2 pips
 
-Both legs travel in ONE exec command (EA v1.77 STOPEXE): one file, one
-pass, back-to-back OrderSends, one ack - either both legs rest on the
-broker together or neither stands (a half straddle is pulled).
+Both legs travel in ONE exec command (EA v1.78 STOPEXESL): one file, one
+pass, back-to-back OrderSends with the SL attached AT OrderSend time,
+one ack - either both legs rest on the broker together or neither
+stands (a half straddle is pulled).  The SL rides on the same
+OrderSend, so protection is concurrent with the fill - no second
+round trip, no unprotected window.  Terminals still on an older EA
+(no STOPEXESL command) fall back to two PENDINGs with SLs in one
+batch (same single round trip).
 
 Pip size follows the quote itself:
 
@@ -33,6 +38,8 @@ log = setup_logging(__name__)
 
 STOPEXE_MAGIC = 777003
 STOPEXE_COMMENT = "stopexe"
+# Protective stop attached to every straddle leg at OrderSend time.
+STOPEXE_SL_PIPS = 2.0
 
 
 def pip_size(symbol: str, digits: int) -> float:
@@ -80,9 +87,10 @@ def digits_for(symbol: str, price: str = "") -> int:
 
 
 def stopexe_levels(symbol: str, account: int,
-                   distance_pips: float = 2.0) -> dict:
-    """Bracket prices for a StopExe straddle.  Raises ValueError with a
-    human message when there is no live quote."""
+                   distance_pips: float = 2.0,
+                   sl_pips: float = STOPEXE_SL_PIPS) -> dict:
+    """Bracket prices for a StopExe straddle, SLs included.  Raises
+    ValueError with a human message when there is no live quote."""
     from spot import read_spots, resolve_symbol
     broker_sym = resolve_symbol(symbol, account)
     spots = read_spots()
@@ -112,6 +120,18 @@ def stopexe_levels(symbol: str, account: int,
         buy_price = round(ask + 10 ** (-digits), digits)
     if sell_price >= bid:
         sell_price = round(bid - 10 ** (-digits), digits)
+    # Protective stops: 2 pips against the leg (buy SL below its entry,
+    # sell SL above its entry), attached AT OrderSend time - never a
+    # second trip, so the legs are never unprotected on the broker.
+    sl_pips = float(sl_pips)
+    sl_dist = sl_pips * pip
+    tick = 10 ** (-digits)
+    buy_sl = round(buy_price - sl_dist, digits)
+    sell_sl = round(sell_price + sl_dist, digits)
+    if buy_sl >= buy_price:
+        buy_sl = round(buy_price - tick, digits)
+    if sell_sl <= sell_price:
+        sell_sl = round(sell_price + tick, digits)
     return {
         "symbol": symbol,
         "broker_symbol": broker_sym,
@@ -124,38 +144,50 @@ def stopexe_levels(symbol: str, account: int,
         "distance_price": round(dist, digits + 2),
         "buy_price": buy_price,
         "sell_price": sell_price,
+        "sl_pips": sl_pips,
+        "sl_distance_price": round(sl_dist, digits + 2),
+        "buy_sl": buy_sl,
+        "sell_sl": sell_sl,
     }
 
 
 def place_stopexe(account: int, symbol: str, lot: float,
-                  distance_pips: float = 2.0,
-                  timeout: float = 10.0) -> dict:
-    """Place the two-leg StopExe straddle in ONE exec round trip.
+                   distance_pips: float = 2.0,
+                   sl_pips: float = STOPEXE_SL_PIPS,
+                   timeout: float = 10.0) -> dict:
+    """Place the two-leg StopExe straddle in ONE exec round trip, each
+    leg carrying its 2-pip protective SL from the same OrderSend.
 
     Returns a JSON-friendly dict.  The EA places both legs back-to-back
-    and acks `buyprice|buyticket|sellprice|sell...`; a half straddle is
-    pulled server-side, never left standing.  Terminals still on an EA
-    older than v1.77 (no STOPEXE command) fall back to the two-PENDING
-    batch path.
+    and acks `buyprice|buyticket|sellprice|sell...|buysl|sellsl`; a half
+    straddle is pulled server-side, never left standing.  Terminals
+    still on an EA without STOPEXESL fall back to the two-PENDING batch
+    path (same bracket + same SLs, one batch round trip).
     """
     import database as db
     from executor import sender_for
 
-    lv = stopexe_levels(symbol, account, distance_pips)
+    lv = stopexe_levels(symbol, account, distance_pips, sl_pips)
     broker_sym = lv["broker_symbol"]
     digits = lv["digits"]
     sender = sender_for(account)
     t0 = time.perf_counter()
     try:
+        # STOPEXESL (EA v1.78+): new name on purpose - an older EA
+        # answers "unknown cmd" WITHOUT placing anything, so the
+        # fallback below can retry with SLs instead of leaving a
+        # half-parsed, SL-less straddle on the broker.
         ok, detail = sender.send(
-            "STOPEXE", broker_sym, f"{lot:.2f}",
+            "STOPEXESL", broker_sym, f"{lot:.2f}",
             f"{lv['buy_price']:.{digits}f}", f"{lv['sell_price']:.{digits}f}",
+            f"{lv['buy_sl']:.{digits}f}", f"{lv['sell_sl']:.{digits}f}",
             str(STOPEXE_MAGIC), STOPEXE_COMMENT, timeout=timeout)
     except Exception as exc:
         raise ValueError(str(exc))
     ms = (time.perf_counter() - t0) * 1000.0
     if not ok and "unknown cmd" in detail:
-        # Old EA - same bracket through two PENDINGs in one batch.
+        # Old EA - same bracket + same SLs through two PENDINGs in one
+        # concurrent batch (PENDING has carried SL since long ago).
         return _place_stopexe_batch(account, symbol, lot, lv, ms_offset=ms)
     legs = _legs_from_stopexe_detail(lv, ok, detail)
     try:
@@ -175,6 +207,9 @@ def place_stopexe(account: int, symbol: str, lot: float,
         "buy_price": lv["buy_price"],
         "sell_price": lv["sell_price"],
         "distance_pips": lv["distance_pips"],
+        "buy_sl": lv["buy_sl"],
+        "sell_sl": lv["sell_sl"],
+        "sl_pips": lv["sl_pips"],
         "legs": legs,
         "ok": ok_cnt,
         "n": 2,
@@ -182,29 +217,70 @@ def place_stopexe(account: int, symbol: str, lot: float,
     }
     if ok_cnt == 2:
         out["detail"] = (f"STOPEXE {symbol} {lot:g} - BUY STOP @ "
-                         f"{lv['buy_price']} (#{legs[0]['ticket']}) + SELL STOP @ "
-                         f"{lv['sell_price']} (#{legs[1]['ticket']})")
+                         f"{lv['buy_price']} SL {lv['buy_sl']} "
+                         f"(#{legs[0]['ticket']}) + SELL STOP @ "
+                         f"{lv['sell_price']} SL {lv['sell_sl']} "
+                         f"(#{legs[1]['ticket']})")
         out["tickets"] = [legs[0]["ticket"], legs[1]["ticket"]]
         return out
     raise ValueError(f"STOPEXE rejected - {detail}")
 
 
 def _legs_from_stopexe_detail(lv: dict, ok: bool, detail: str) -> list[dict]:
-    """`buyprice|buyticket|sellprice|sell...` -> two leg dicts."""
+    """`buyprice|buyticket|sellprice|sell...[|buysl|sellsl]` -> leg dicts.
+
+    v1.78 acks 6 fields (SLs confirmed); older acks carry 4 (SLs then
+    are the levels we sent - the batch fallback always sets them).
+    """
     parts = str(detail or "").split("|")
     buy_ticket = parts[1] if ok and len(parts) > 1 else ""
     sell_ticket = parts[3] if ok and len(parts) > 3 else ""
+    try:
+        buy_sl = float(parts[4]) if ok and len(parts) > 4 and parts[4] else lv.get("buy_sl")
+    except (TypeError, ValueError):
+        buy_sl = lv.get("buy_sl")
+    try:
+        sell_sl = float(parts[5]) if ok and len(parts) > 5 and parts[5] else lv.get("sell_sl")
+    except (TypeError, ValueError):
+        sell_sl = lv.get("sell_sl")
     return [
         {"type": "BUYSTOP", "price": lv["buy_price"], "ok": ok,
-         "ticket": buy_ticket, "detail": detail},
+         "ticket": buy_ticket, "sl": buy_sl, "detail": detail},
         {"type": "SELLSTOP", "price": lv["sell_price"], "ok": ok,
-         "ticket": sell_ticket, "detail": detail},
+         "ticket": sell_ticket, "sl": sell_sl, "detail": detail},
     ]
 
 
+def modify_pending_sl(account: int, ticket: str | int, sl: float,
+                      tp: float = 0.0, timeout: float = 10.0) -> dict:
+    """Attach (or move) SL/TP on a resting pending order - EA v1.78+.
+
+    Sends MODIFY in its own round trip; callers patching two legs at
+    once should use `sender_for(account).send_batch` with two MODIFYs
+    so both patches fly concurrently.  Raises ValueError when the EA
+    predates MODIFY (restart the terminal to pick up v1.78).
+    """
+    from executor import sender_for
+
+    sender = sender_for(account)
+    try:
+        ok, detail = sender.send("MODIFY", str(ticket), f"{float(sl):.8f}",
+                                 f"{float(tp):.8f}", timeout=timeout)
+    except Exception as exc:
+        raise ValueError(str(exc))
+    if not ok and "unknown cmd" in detail:
+        raise ValueError("terminal EA predates MODIFY - restart terminal "
+                         "to pick up v1.78, then retry")
+    if not ok:
+        raise ValueError(f"MODIFY #{ticket} rejected - {detail}")
+    return {"ok": True, "ticket": str(ticket), "sl": float(sl),
+            "tp": float(tp), "detail": detail}
+
+
 def _place_stopexe_batch(account: int, symbol: str, lot: float,
-                         lv: dict, ms_offset: float = 0.0) -> dict:
-    """Fallback for pre-v1.77 EAs: two PENDINGs in one batch."""
+                          lv: dict, ms_offset: float = 0.0) -> dict:
+    """Fallback for EAs without STOPEXESL: two SL-carrying PENDINGs in
+    ONE concurrent batch (single round trip, same protection)."""
     import database as db
     from executor import sender_for
 
@@ -213,10 +289,10 @@ def _place_stopexe_batch(account: int, symbol: str, lot: float,
     sender = sender_for(account)
     commands = [
         ("PENDING", broker_sym, "BUYSTOP", f"{lot:.2f}",
-         f"{lv['buy_price']:.{digits}f}", "0", "0",
+         f"{lv['buy_price']:.{digits}f}", f"{lv['buy_sl']:.{digits}f}", "0",
          str(STOPEXE_MAGIC), STOPEXE_COMMENT),
         ("PENDING", broker_sym, "SELLSTOP", f"{lot:.2f}",
-         f"{lv['sell_price']:.{digits}f}", "0", "0",
+         f"{lv['sell_price']:.{digits}f}", f"{lv['sell_sl']:.{digits}f}", "0",
          str(STOPEXE_MAGIC), STOPEXE_COMMENT),
     ]
     t0 = time.perf_counter()
@@ -226,12 +302,13 @@ def _place_stopexe_batch(account: int, symbol: str, lot: float,
         raise ValueError(str(exc))
     ms = (time.perf_counter() - t0) * 1000.0 + ms_offset
     legs = []
-    for (ptype, price), (ok, detail) in zip(
-            (("BUYSTOP", lv["buy_price"]), ("SELLSTOP", lv["sell_price"])),
+    for (ptype, price, sl), (ok, detail) in zip(
+            (("BUYSTOP", lv["buy_price"], lv["buy_sl"]),
+             ("SELLSTOP", lv["sell_price"], lv["sell_sl"])),
             results):
         ticket = detail.split("|")[1] if ok and "|" in detail else ""
         legs.append({"type": ptype, "price": price, "ok": ok,
-                     "ticket": ticket, "detail": detail})
+                     "ticket": ticket, "sl": sl, "detail": detail})
         try:
             db.log_fired(0, account, symbol, ptype, lot, "stopexe",
                          ticket, ok, detail, ms=ms)
@@ -248,6 +325,9 @@ def _place_stopexe_batch(account: int, symbol: str, lot: float,
         "buy_price": lv["buy_price"],
         "sell_price": lv["sell_price"],
         "distance_pips": lv["distance_pips"],
+        "buy_sl": lv["buy_sl"],
+        "sell_sl": lv["sell_sl"],
+        "sl_pips": lv["sl_pips"],
         "legs": legs,
         "ok": ok_cnt,
         "n": 2,
@@ -255,8 +335,10 @@ def _place_stopexe_batch(account: int, symbol: str, lot: float,
     }
     if ok_cnt == 2:
         out["detail"] = (f"STOPEXE {symbol} {lot:g} - BUY STOP @ "
-                         f"{lv['buy_price']} (#{legs[0]['ticket']}) + SELL STOP @ "
-                         f"{lv['sell_price']} (#{legs[1]['ticket']})")
+                         f"{lv['buy_price']} SL {lv['buy_sl']} "
+                         f"(#{legs[0]['ticket']}) + SELL STOP @ "
+                         f"{lv['sell_price']} SL {lv['sell_sl']} "
+                         f"(#{legs[1]['ticket']})")
         out["tickets"] = [legs[0]["ticket"], legs[1]["ticket"]]
         return out
     if ok_cnt == 1:
