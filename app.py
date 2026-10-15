@@ -713,7 +713,7 @@ def api_stopexe_preview():
         return _fail("symbol is required")
     try:
         dpips = float(request.args.get("pips",
-                                       request.args.get("distance_pips", 2.0)))
+                                       request.args.get("distance_pips", 1.0)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:
@@ -735,10 +735,10 @@ def api_stopexe_preview():
 @app.post("/api/stopexe")
 @rate_limit(max_requests=60, window=60)
 def api_stopexe():
-    """StopExe: open a BUY STOP (ask + 2 pips) + SELL STOP (bid - 2 pips)
-    straddle of `lot` around the live price - 4 pips bracket total
-    (gold at 4150 -> 4152 / 4148), both legs in one exec command, each
-    leg carrying its 2-pip protective SL from the same OrderSend."""
+    """StopExe: open a BUY STOP (ask + 1 pip) + SELL STOP (bid - 1 pip)
+    straddle of `lot` around the live price - 2 pips bracket total
+    (gold at 4150 -> 4151 / 4149), both legs flighted async in one exec
+    command, each leg carrying its 2-pip protective SL."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
@@ -756,7 +756,7 @@ def api_stopexe():
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
     try:
-        dpips = float(d.get("distance_pips", d.get("pips", 2.0)))
+        dpips = float(d.get("distance_pips", d.get("pips", 1.0)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:

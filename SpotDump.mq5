@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.79"
+#property version   "1.80"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -183,9 +183,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.type != TRADE_TRANSACTION_REQUEST)
       return;
 
-   int i = AsyncIndex(result.request_id);
-   if(i < 0)
-      return;
+    int i = AsyncIndex(result.request_id);
+    if(i < 0)
+      {
+       StopexeOnTransaction(result);   // maybe a straddle leg, else ignored
+       return;
+      }
     if(result.retcode == TRADE_RETCODE_DONE ||
        result.retcode == TRADE_RETCODE_PLACED ||
        result.retcode == TRADE_RETCODE_DONE_PARTIAL)
@@ -289,6 +292,143 @@ int FanOutRemoves(string sym, bool all, int &failed)
           failed++;
       }
     return(flighted);
+   }
+
+// One in-flight STOPEXE straddle: both legs leave via OrderSendAsync
+// in the SAME tick (no waiting between them), and the single ack goes
+// out only once both broker answers are in.  A lone winner is pulled
+// before the ack, so a half straddle never stands.
+#define MAX_STOPEXE 8
+struct StopexeSlot
+   {
+    bool     used;
+    string   cmd_id;
+    int      digits;
+    double   bprice;
+    double   sprice;
+    double   bsl;
+    double   ssl;
+    ulong    buy_req;
+    ulong    sell_req;
+    int      buy_state;     // 0 in flight, 1 placed, -1 failed
+    int      sell_state;
+    ulong    buy_ticket;
+    ulong    sell_ticket;
+    string   fail_detail;
+   };
+StopexeSlot g_stopexe[MAX_STOPEXE];
+
+int StopexeAlloc()
+   {
+    for(int s = 0; s < MAX_STOPEXE; s++)
+       if(!g_stopexe[s].used)
+         {
+          g_stopexe[s].used = true;
+          return(s);
+         }
+    return(-1);
+   }
+
+// Both legs resolved -> exactly one ack.  Frees the slot FIRST so a
+// re-entrant transaction can never double-answer the same command.
+void StopexeMaybeFinish(int sidx)
+   {
+    if(sidx < 0 || sidx >= MAX_STOPEXE || !g_stopexe[sidx].used)
+       return;
+    if(g_stopexe[sidx].buy_state == 0 || g_stopexe[sidx].sell_state == 0)
+       return;                       // still a leg in flight
+    string id     = g_stopexe[sidx].cmd_id;
+    int digits    = g_stopexe[sidx].digits;
+    bool buyOk    = (g_stopexe[sidx].buy_state > 0);
+    bool sellOk   = (g_stopexe[sidx].sell_state > 0);
+    string detail = g_stopexe[sidx].fail_detail;
+    ulong bt = g_stopexe[sidx].buy_ticket;
+    ulong st = g_stopexe[sidx].sell_ticket;
+    double bp = g_stopexe[sidx].bprice;
+    double sp = g_stopexe[sidx].sprice;
+    double bs = g_stopexe[sidx].bsl;
+    double ss = g_stopexe[sidx].ssl;
+    g_stopexe[sidx].used = false;
+    if(buyOk && sellOk)
+      {
+       DumpOrders();
+       AppendOut(id, "OK", DoubleToString(bp, digits) + "|" +
+                 IntegerToString((long)bt) + "|" +
+                 DoubleToString(sp, digits) + "|" +
+                 IntegerToString((long)st) + "|" +
+                 DoubleToString(bs, digits) + "|" +
+                 DoubleToString(ss, digits));
+       return;
+      }
+    ulong pull = 0;
+    string side = "";
+    if(buyOk) { pull = bt; side = "buy"; }
+    else if(sellOk) { pull = st; side = "sell"; }
+    if(pull != 0)
+      {
+       MqlTradeRequest dreq;
+       MqlTradeResult  dres;
+       ZeroMemory(dreq);
+       ZeroMemory(dres);
+       dreq.action = TRADE_ACTION_REMOVE;
+       dreq.order  = pull;
+       OrderSend(dreq, dres);
+       detail = detail + " - " + side + " leg #" +
+                IntegerToString((long)pull) + " pulled";
+      }
+    DumpOrders();
+    AppendOut(id, "ERR", detail);
+   }
+
+// Route a TRADE_TRANSACTION_REQUEST result to its straddle leg (if any)
+// and finish the slot once both legs resolved.  Stored request ids are
+// never 0 past flight, so a 0 can never false-match an idle leg.
+void StopexeOnTransaction(const MqlTradeResult &result)
+   {
+    for(int s = 0; s < MAX_STOPEXE; s++)
+      {
+       if(!g_stopexe[s].used)
+          continue;
+       bool isBuy = false;
+       bool mine = false;
+       if(g_stopexe[s].buy_req != 0 && result.request_id == g_stopexe[s].buy_req &&
+          g_stopexe[s].buy_state == 0)
+         { isBuy = true; mine = true; }
+       else if(g_stopexe[s].sell_req != 0 && result.request_id == g_stopexe[s].sell_req &&
+               g_stopexe[s].sell_state == 0)
+         { isBuy = false; mine = true; }
+       if(!mine)
+          continue;
+       bool ok = (result.retcode == TRADE_RETCODE_DONE ||
+                  result.retcode == TRADE_RETCODE_PLACED ||
+                  result.retcode == TRADE_RETCODE_DONE_PARTIAL);
+       if(ok)
+         {
+          if(isBuy)
+            {
+             g_stopexe[s].buy_state = 1;
+             g_stopexe[s].buy_ticket = result.order;
+            }
+          else
+            {
+             g_stopexe[s].sell_state = 1;
+             g_stopexe[s].sell_ticket = result.order;
+            }
+         }
+       else
+         {
+          string now = (isBuy ? "buy stop " : "sell stop ") + "retcode " +
+                       IntegerToString((long)result.retcode) + " " + result.comment;
+          if(StringLen(g_stopexe[s].fail_detail) > 0)
+             g_stopexe[s].fail_detail = g_stopexe[s].fail_detail + " | " + now;
+          else
+             g_stopexe[s].fail_detail = now;
+          if(isBuy) g_stopexe[s].buy_state = -1;
+          else g_stopexe[s].sell_state = -1;
+         }
+       StopexeMaybeFinish(s);
+       return;
+      }
    }
 
 bool SendDealWithFallback(MqlTradeRequest &req, MqlTradeResult &res)
@@ -908,14 +1048,15 @@ void ExecuteLine(string line)
 
     // STOPEXESL\tsym\tvol\tbuyprice\tsellprice\tbuysl\tsellsl\t[magic]\t[comment]
     // STOPEXE\tsym\tvol\tbuyprice\tsellprice\t[magic]\t[comment] (legacy)
-    // One file, one pass, both legs back-to-back with their protective
-    // SLs attached AT OrderSend time: the straddle rests on the broker
-    // TOGETHER and protected (a two-file batch could split across
-    // passes, a post-place MODIFY would leave an unprotected window).
-    // Either both legs ack or neither stands: if the sell leg fails
-    // after the buy leg is placed, the buy leg is pulled before replying.
-    // Legacy STOPEXE callers (no SL fields) get a 2-pip SL derived here,
-    // so every straddle is protected whatever Python sent.
+    // One file, one pass, both legs flighted async in the SAME tick with
+    // their protective SLs attached: the straddle rests on the broker
+    // TOGETHER and protected in ~one round trip (a two-file batch could
+    // split across passes, a post-place MODIFY would leave an
+    // unprotected window, serial sends would cost two round trips).
+    // Either both legs ack or neither stands: a lone winner is pulled
+    // before the single ack goes out.  Legacy STOPEXE callers (no SL
+    // fields) get a 2-pip SL derived here, so every straddle is
+    // protected whatever Python sent.
     if((cmd == "STOPEXESL" || cmd == "STOPEXE") && k >= 6)
       {
        string sym = p[2];
@@ -986,6 +1127,31 @@ void ExecuteLine(string line)
           AppendOut(id, "ERR", "bad stop loss");
           return;
          }
+       // Async dual flight: both legs leave in the SAME tick with no
+       // waiting between them, so the straddle rests AND protects in
+       // ~one broker round trip instead of two serial ones, and the EA
+       // never blocks the feed while the broker works.  The single ack
+       // still goes out once - when both answers are in (a lone winner
+       // is pulled first, so a half straddle never stands).
+       int sidx = StopexeAlloc();
+       if(sidx < 0)
+         {
+          AppendOut(id, "ERR", "stopexe busy - retry");
+          return;
+         }
+       g_stopexe[sidx].cmd_id      = id;
+       g_stopexe[sidx].digits      = digits;
+       g_stopexe[sidx].bprice      = bprice;
+       g_stopexe[sidx].sprice      = sprice;
+       g_stopexe[sidx].bsl         = bsl;
+       g_stopexe[sidx].ssl         = ssl;
+       g_stopexe[sidx].buy_req     = 0;
+       g_stopexe[sidx].sell_req    = 0;
+       g_stopexe[sidx].buy_state   = 0;
+       g_stopexe[sidx].sell_state  = 0;
+       g_stopexe[sidx].buy_ticket  = 0;
+       g_stopexe[sidx].sell_ticket = 0;
+       g_stopexe[sidx].fail_detail = "";
        MqlTradeRequest breq;
        MqlTradeResult  bres;
        ZeroMemory(breq);
@@ -1000,13 +1166,16 @@ void ExecuteLine(string line)
        breq.comment      = cm;
        breq.type_time    = ORDER_TIME_GTC;
        breq.type_filling = ORDER_FILLING_RETURN;
-       if(!OrderSend(breq, bres) ||
-          (bres.retcode != TRADE_RETCODE_DONE && bres.retcode != TRADE_RETCODE_PLACED))
+       if(!OrderSendAsync(breq, bres) || bres.retcode == 0 ||
+          (bres.retcode != TRADE_RETCODE_DONE && bres.retcode != TRADE_RETCODE_PLACED &&
+           bres.retcode != TRADE_RETCODE_DONE_PARTIAL))
          {
+          g_stopexe[sidx].used = false;
           AppendOut(id, "ERR", "buy stop retcode " +
                     IntegerToString((long)bres.retcode) + " " + bres.comment);
           return;
          }
+       g_stopexe[sidx].buy_req = bres.request_id;
        MqlTradeRequest sreq;
        MqlTradeResult  sres;
        ZeroMemory(sreq);
@@ -1021,30 +1190,20 @@ void ExecuteLine(string line)
        sreq.comment      = cm;
        sreq.type_time    = ORDER_TIME_GTC;
        sreq.type_filling = ORDER_FILLING_RETURN;
-       if(!OrderSend(sreq, sres) ||
-          (sres.retcode != TRADE_RETCODE_DONE && sres.retcode != TRADE_RETCODE_PLACED))
+       if(!OrderSendAsync(sreq, sres) || sres.retcode == 0 ||
+          (sres.retcode != TRADE_RETCODE_DONE && sres.retcode != TRADE_RETCODE_PLACED &&
+           sres.retcode != TRADE_RETCODE_DONE_PARTIAL))
          {
-          // Pull the buy leg so a half straddle never stands alone.
-          MqlTradeRequest dreq;
-          MqlTradeResult  dres;
-          ZeroMemory(dreq);
-          ZeroMemory(dres);
-          dreq.action = TRADE_ACTION_REMOVE;
-          dreq.order  = bres.order;
-          OrderSend(dreq, dres);
-          DumpOrders();
-          AppendOut(id, "ERR", "sell stop retcode " +
-                    IntegerToString((long)sres.retcode) + " " + sres.comment +
-                    " - buy leg #" + IntegerToString((long)bres.order) + " pulled");
+          // Sell leg never flighted while the buy leg is still in
+          // flight: record the failure and let the buy leg's answer
+          // finish the slot (a placed buy leg gets pulled there).
+          g_stopexe[sidx].sell_state = -1;
+          g_stopexe[sidx].fail_detail = "sell stop retcode " +
+                    IntegerToString((long)sres.retcode) + " " + sres.comment;
+          StopexeMaybeFinish(sidx);
           return;
          }
-       DumpOrders();
-       AppendOut(id, "OK", DoubleToString(bprice, digits) + "|" +
-                 IntegerToString((long)bres.order) + "|" +
-                 DoubleToString(sprice, digits) + "|" +
-                 IntegerToString((long)sres.order) + "|" +
-                 DoubleToString(bsl, digits) + "|" +
-                 DoubleToString(ssl, digits));
+       g_stopexe[sidx].sell_req = sres.request_id;
        return;
       }
 
