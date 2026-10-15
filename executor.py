@@ -540,6 +540,58 @@ def _positions_empty(acc: int, pair: str | None,
         time.sleep(0.05)
     return _open_count(acc, pair) == 0
 
+def _pending_count(acc: int, pair: str | None) -> int | None:
+    """Open pending stop/limit orders for (acc, pair), or None when unknown.
+
+    Same veil rule as _open_count: None is never "empty" - the red CLOSE
+    bar must keep retrying while a StopExe straddle may still rest on the
+    broker.  Orders the old EA never dumped (pre-v1.76) read as 0 once the
+    file exists; a missing file with an unverified identity reads as None.
+    """
+    from spot import (read_accounts, pick_terminal, read_header,
+                      read_pending_orders, resolve_symbol)
+    login = read_accounts().get(acc, {}).get("login", "")
+    term = pick_terminal(login) if login else None
+    if not term:
+        return None
+    try:
+        head = read_header(term["trades_path"])
+    except Exception:
+        return None
+    if not head or head.get("login") != login:
+        return None
+    try:
+        rows = read_pending_orders(acc)
+    except Exception:
+        return None
+    if pair in (None, "ALL"):
+        return len(rows)
+    try:
+        want = resolve_symbol(pair, acc)
+    except Exception:
+        want = pair
+    wup = str(want or "").upper()
+    return sum(1 for r in rows
+               if r.get("symbol") == pair or r.get("symbol") == want
+               or str(r.get("symbol", "")).upper() == wup)
+
+def _book_empty(acc: int, pair: str | None,
+                timeout: float = CLOSE_VERIFY_TIMEOUT_S) -> bool:
+    """Poll until BOTH positions and pending stop/limit orders are gone.
+
+    The red CLOSE bar deletes the StopExe straddle too, so verifying only
+    the position book would declare victory while stops still rest on the
+    broker.  Unknown (None) on either side never reads as empty.
+    """
+    deadline = time.monotonic() + max(0.5, timeout)
+    while time.monotonic() < deadline:
+        n = _open_count(acc, pair)
+        m = _pending_count(acc, pair)
+        if n == 0 and m == 0:
+            return True
+        time.sleep(0.05)
+    return _open_count(acc, pair) == 0 and _pending_count(acc, pair) == 0
+
 def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, str]:
     ok, detail = False, ""
     for attempt in range(1, max(1, attempts) + 1):
@@ -548,17 +600,26 @@ def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, st
         except Exception as exc:
             detail = f"exception: {exc}"
         # The ack only proves the closes were flighted (async fan-out);
-        # verify against the position book before claiming success.
-        if _positions_empty(acc, pair, timeout=CLOSE_VERIFY_TIMEOUT_S):
+        # verify against the position book AND the pending-order book
+        # (StopExe straddle) before claiming success.
+        if _book_empty(acc, pair, timeout=CLOSE_VERIFY_TIMEOUT_S):
             if attempt > 1:
                 log.info(f"close acc{acc} {pair}: verified empty on retry "
                          f"{attempt} - {detail}")
             return True, detail
+        left_p = _open_count(acc, pair)
+        left_o = _pending_count(acc, pair)
         if attempt < attempts:
             log.warning(f"close acc{acc} {pair} not empty after attempt "
-                        f"{attempt} ({detail}) - "
+                        f"{attempt} ({detail}) - positions={left_p} "
+                        f"pendings={left_o} - "
                         f"retry {attempt + 1}/{attempts} in {RETRY_DELAY_S * 1000:.0f} ms")
             time.sleep(RETRY_DELAY_S)
+    leftover = _pending_count(acc, pair)
+    if leftover:
+        detail = (f"{detail} - {leftover} pending stop/limit order(s) still "
+                  f"on the broker (restart terminal {acc} to pick up EA "
+                  f"v1.76, which deletes pendings on CLOSE)")
     log.error(f"close acc{acc} {pair} FAILED after {attempts} attempts: {detail}")
     return False, detail
 

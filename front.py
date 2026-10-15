@@ -360,6 +360,38 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
 .chip.filter b{color:inherit}
 .dials .btn.mini{margin:26px 0 0 6px;font-weight:700;min-width:44px;
   background:var(--blue3);color:var(--blue);border:1px solid var(--line3)}
+/* ---------- symbol search (manual / order / schedule pickers) ---------- */
+.symsearch{margin-bottom:6px;position:relative}
+.symsearch input{background:var(--bg);border:1px solid var(--line2);
+  color:#fff;padding:6px 9px;font-size:12px;outline:none;width:100%;
+  border-radius:0px}
+.symsearch input:focus{border-color:var(--blue);box-shadow:var(--glow)}
+.symsearch input::placeholder{color:var(--dim2)}
+/* ---------- StopExe straddle panel ---------- */
+.stex-live{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.stex-bracket{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
+.stex-bracket>div{flex:1;min-width:140px;background:var(--panel);
+  border:1px solid var(--line);border-radius:0px;padding:8px 12px}
+.stex-bracket .k{font-size:9px;letter-spacing:1.7px;color:var(--dim);
+  text-transform:uppercase}
+.stex-bracket .v{font-size:16px;font-weight:600;margin-top:3px;
+  font-family:ui-monospace,Consolas,monospace;color:#fff}
+.stex-bracket .v.buy{color:var(--blue)}
+.stex-bracket .v.sell{color:var(--red)}
+.symlist{max-height:168px;overflow-y:auto;border:1px solid var(--line2);
+  background:var(--bg);margin-top:6px;display:none}
+.symlist.open{display:block}
+.symlist .opt{display:flex;gap:8px;align-items:center;padding:6px 10px;
+  font-size:12px;cursor:pointer;color:var(--txt)}
+.symlist .opt:hover{background:var(--panel3);color:#fff}
+.symlist .opt.on{background:var(--blue3);color:var(--blue)}
+.symlist .opt .mono{font-family:ui-monospace,Consolas,monospace}
+.symlist .opt .pr{margin-left:auto;color:var(--dim);font-size:11px;
+  font-family:ui-monospace,Consolas,monospace}
+.tbtn.stex{background:linear-gradient(160deg,#7c3aed,#3b0764);
+  border-color:#a78bfa;box-shadow:0 0 22px rgba(167,139,250,.22);
+  grid-column:span 2}
+.tbtn.stex:hover{filter:brightness(1.15);box-shadow:var(--glow-strong)}
 """
 
 COMMON_JS = """
@@ -416,6 +448,18 @@ function liveLink(sys){
    ((logout1||logout2)?'LOGIN DROPPED':'LINK DEGRADED')}
  const d=$id('sysdot');if(d)d.className=ok?'dot':'dot off';
  return ok}
+/* searchable <select>: hide options that do not contain the query
+   (case-insensitive).  Used by the manual-execution, ORDER-ticket and
+   schedule pair pickers so a 90-symbol broker feed stays usable. */
+function filterSelect(selId,q){
+  const sel=$id(selId);if(!sel)return;
+  q=String(q==null?'':q).trim().toUpperCase();
+  let visible=0,first=null;
+  for(const o of sel.options){
+    const hit=!q||String(o.text||o.value||'').toUpperCase().indexOf(q)>=0;
+    o.hidden=!hit;
+    if(hit){visible++;if(!first)first=o}}
+  if(visible===1&&first){sel.value=first.value||first.text}}
 /* ring gauge: pct 0..100, returns svg */
 function ring(pct,col){
  pct=Math.max(0,Math.min(100,pct||0));
@@ -527,7 +571,9 @@ function schedModalHTML(n,edit){
  return '<div class="modal-head"><h3>'+(edit?'Adjust schedule #'+edit.id:'Schedule future trades')+' · account '+n+'</h3>'+
   '<button class="closex" onclick="closeModal()">×</button></div>'+
   '<div class="frow">'+
-  '<div class="fgroup" style="grid-column:span 2"><label>Pair</label><select id="sp'+n+'">'+
+  '<div class="fgroup" style="grid-column:span 2"><label>Pair · search the broker feed</label>'+
+   '<div class="symsearch"><input type="text" id="sps'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'sp'+n+'\\',this.value)"></div>'+
+   '<select id="sp'+n+'">'+
    (edit?'<option>'+esc(edit.pair)+'</option>':'')+'</select></div>'+
   '<div class="fgroup"><label>Side</label><select id="sdf'+n+'">'+
    '<option value="BUY"'+(e.side!=='SELL'?' selected':'')+'>BUY</option><option value="SELL"'+(e.side==='SELL'?' selected':'')+'>SELL</option></select></div>'+
@@ -825,7 +871,7 @@ PANEL_TMPL = """<!doctype html>
     <div class="wrap">
       <div class="closebar"><button class="btn close-main" id="closeAllTopBtn"
         onclick="closeAllBoth(this)"
-        title="close every position on ALL accounts at once">✕ CLOSE</button></div>
+        title="close every position AND delete every stop/limit order (incl. StopExe straddles) on ALL accounts at once">✕ CLOSE</button></div>
       <div class="grid accounts">
         <section class="panel acc" id="acc1"></section>
         <section class="panel acc" id="acc2"></section>
@@ -963,7 +1009,8 @@ function buildPanel(n){
   '<div class="right"><span class="chip">SPREAD <b id="tspr'+n+'">-</b></span></div></div>'+
  '<div class="body">'+
   '<div class="frow" style="margin-bottom:10px">'+
-   '<div class="fgroup" style="grid-column:span 2"><label>Symbol</label>'+
+   '<div class="fgroup" style="grid-column:span 2"><label>Symbol · search the broker feed</label>'+
+    '<div class="symsearch"><input type="text" id="symsearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'sym'+n+'\\',this.value)"></div>'+
     '<select id="sym'+n+'"></select></div>'+
    '<div class="fgroup"><label>Lot</label>'+
     '<div class="lotrow"><button type="button" onclick="stepLot('+n+',-0.01)">-</button>'+
@@ -983,9 +1030,43 @@ function buildPanel(n){
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
   '<div class="order-wrap"><button class="btn order-mini" id="ordBtn'+n+'" '+
    'onclick="asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
- '</div>'+ '<div class="sect"><h4>Open positions</h4><div class="right">'+
-  '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
-  '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
+  '</div>'+
+  '<div class="sect"><h4>StopExe · straddle stops</h4>'+
+   '<div class="right"><span class="chip">BRACKET <b>±5 pips</b></span></div></div>'+
+  '<div class="body">'+
+   '<div class="fgroup"><label>Search pair · broker feed</label>'+
+    '<div class="symsearch"><input type="text" id="stexsearch'+n+'" placeholder="type XAU, EUR, GBP... (live quotes only)" autocomplete="off" oninput="stexFilter('+n+')"></div>'+
+    '<div class="symlist" id="stexlist'+n+'"></div></div>'+
+   '<div class="stex-live"><span class="chip">PAIR <b id="stexsym'+n+'">-</b></span>'+
+    '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
+    '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
+   '<div class="stex-bracket">'+
+    '<div><div class="k">Buy stop · ask + 5 pips</div><div class="v buy" id="stexbuy'+n+'">-</div></div>'+
+    '<div><div class="k">Sell stop · bid - 5 pips</div><div class="v sell" id="stexsell'+n+'">-</div></div>'+
+   '</div>'+
+   '<div class="frow" style="margin-bottom:10px">'+
+    '<div class="fgroup"><label>Lot (each leg)</label>'+
+     '<div class="lotrow"><button type="button" onclick="stexStepLot('+n+',-0.01)">-</button>'+
+     '<input id="stexlot'+n+'" type="number" step="0.01" min="0.01" value="0.01">'+
+     '<button type="button" onclick="stexStepLot('+n+',0.01)">+</button></div></div>'+
+    '<div class="fgroup" style="grid-column:span 2"><label>Bracket</label>'+
+     '<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
+      '<option value="3">±3 pips (6 total)</option>'+
+      '<option value="5" selected>±5 pips (10 total)</option>'+
+      '<option value="10">±10 pips (20 total)</option></select></div>'+
+   '</div>'+
+   '<div class="tradebtns" style="margin-top:2px">'+
+    '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">⚡ EXECUTE STOPEXE</button>'+
+   '</div>'+
+   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price</div>'+
+  '</div>'+
+  '<div class="sect"><h4>Open positions</h4><div class="right">'+
+   '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
+   '<div class="tblwrap" id="pos'+n+'"><div class="empty">no open positions</div></div>'+
+  '<div class="sect"><h4>Pending orders · stop / limit</h4><div class="right">'+
+   '<span class="chip">ORDERS <b id="pendcnt'+n+'">0</b></span>'+
+   '<button class="btn mini danger" onclick="closeAll('+n+',null)">✕ CLOSE ALL</button></div></div>'+
+   '<div class="tblwrap" id="pend'+n+'"><div class="empty">no pending orders</div></div>'+
  '<div class="sect"><h4>Scheduled trades</h4><div class="right">'+
   '<span class="chip">ACTIVE <b id="schcnt'+n+'">0</b></span>'+
   '<button class="btn mini blue" onclick="openSchedModal('+n+')">+ SCHEDULE</button></div></div>'+
@@ -998,7 +1079,10 @@ function fillSymbols(){const spots=(((P||{}).accounts||{})['1']||{}).spreads||{}
   for(const el of [sel,sp]){if(!el)continue;const cur=el.value;
    el.innerHTML=(cur&&!keys.includes(cur)?'<option>'+esc(cur)+'</option>':'')+
     keys.map(k=>'<option'+(k==cur?' selected':'')+'>'+k+'</option>').join('');
-   if(cur)el.value=cur}}}
+   if(cur)el.value=cur}
+  /* keep an active manual-execution search applied across feed refreshes */
+  const q=($id('symsearch'+n)||{}).value;
+  if(q)filterSelect('sym'+n,q)}}
 function stepLot(n,d){const el=$id('lot'+n);
  let v=Math.max(0.01,(parseFloat(el.value)||0.01)+d);el.value=v.toFixed(2);markChip(n)}
 function setLot(n,v){$id('lot'+n).value=v.toFixed(2);markChip(n)}
@@ -1062,6 +1146,106 @@ async function closeAllBoth(el){
    toast((j.detail||'close-all sent')+'  -  '+(j.wall_ms||0)+' ms wall',true);refresh()}
  catch(e){toast('CLOSE ALL: '+e.message,false)}
  finally{INFLIGHT['caall']=false;if(b)b.disabled=false}}
+/* ---------- StopExe straddle (buy stop + sell stop around live) ----------
+   Search runs on the broker feed (live quotes only): the universe is the
+   account's spreads map, freshest quote wins.  Bracket math lives
+   server-side (/api/stopexe/preview) so the panel and EXECUTE agree. */
+function stexUniverse(n){
+  const a=(P.accounts||{})[n]||{};const sp=a.spreads||{};
+  return Object.keys(sp)}
+function stexSel(n){const el=$id('stexsym'+n);
+  return el?String(el.textContent||'').trim():''}
+function stexSetSel(n,sym){
+  const lab=$id('stexsym'+n);if(lab)lab.textContent=sym||'-';
+  const box=$id('stexlist'+n);if(box)box.classList.remove('open');
+  const inp=$id('stexsearch'+n);if(inp&&sym)inp.value=sym;
+  stexPreview(n,true)}
+function stexPaintQuote(n,sym,bid,ask){
+  if(stexSel(n)!==sym)return;
+  const b=$id('stexbid'+n),a=$id('stexask'+n);
+  if(b)b.textContent=bid==null?'-':bid;
+  if(a)a.textContent=ask==null?'-':ask}
+let STEX_HITS={};
+function stexPick(n,i){const h=STEX_HITS[n]||[];
+  if(h[i])stexSetSel(n,h[i])}
+function stexFilter(n){
+  const q=String(($id('stexsearch'+n)||{}).value||'').trim().toUpperCase();
+  const box=$id('stexlist'+n);if(!box)return;
+  const uni=stexUniverse(n);
+  const hits=uni.filter(s=>!q||s.toUpperCase().indexOf(q)>=0).slice(0,14);
+  STEX_HITS[n]=hits;
+  if(!hits.length){box.classList.remove('open');box.innerHTML='';return}
+  const cur=stexSel(n);
+  box.innerHTML=hits.map((s,i)=>'<div class="opt'+(s===cur?' on':'')+
+   '" onclick="stexPick('+n+','+i+')">'+
+   '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
+  box.classList.add('open')}
+function stexPips(n){const el=$id('stexpips'+n);
+  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:5}
+function stexStepLot(n,d){const el=$id('stexlot'+n);if(!el)return;
+  let v=Math.max(0.01,(parseFloat(el.value)||0.01)+d);el.value=v.toFixed(2)}
+let STEX_TS={};
+async function stexPreview(n,force){
+  /* the 0.6 s panel refresh calls stexLive(): throttle the preview to one
+     request per 2 s per account - the bracket barely moves inside that */
+  const now=Date.now();
+  if(!force&&now-(STEX_TS[n]||0)<2000)return;
+  STEX_TS[n]=now;
+  const sym=stexSel(n);
+  const buy=$id('stexbuy'+n),sell=$id('stexsell'+n);
+  if(!sym||sym==='-'){if(buy)buy.textContent='-';if(sell)sell.textContent='-';return}
+  try{const j=await api('/api/stopexe/preview?account='+n+
+    '&symbol='+encodeURIComponent(sym)+'&pips='+stexPips(n));
+   if(stexSel(n)!==sym)return;             // stale reply after re-arm
+   if(buy)buy.textContent=j.buy_price;
+   if(sell)sell.textContent=j.sell_price;
+   stexPaintQuote(n,sym,String(j.bid),String(j.ask));
+  }catch(e){/* feed gap - keep the last bracket, refresh() retries */}}
+function stexLive(n){
+  const sym=stexSel(n);if(!sym||sym==='-')return;
+  stexPreview(n)}
+async function doStopexe(n){
+  if(INFLIGHT['sx'+n])return;
+  const sym=stexSel(n),fb=$id('stexfb'+n),btn=$id('stexbtn'+n);
+  const lot=parseFloat(($id('stexlot'+n)||{}).value);
+  if(!sym||sym==='-'){if(fb){fb.className='feedback err';
+   fb.textContent='pick a pair first - search the broker feed above';}return}
+  if(!(lot>0)){if(fb){fb.className='feedback err';
+   fb.textContent='lot must be greater than 0';}return}
+  INFLIGHT['sx'+n]=true;if(btn)btn.disabled=true;
+  if(btn)asmrPop(btn);
+  if(fb){fb.className='feedback';
+   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips ... placing both legs';}
+  try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
+    distance_pips:stexPips(n)});
+   if(fb){fb.className='feedback ok';
+    fb.textContent='ARMED '+j.detail+' ('+j.ms+' ms) - CLOSE deletes both legs';}
+   toast('STOPEXE '+sym+': buy '+j.buy_price+' / sell '+j.sell_price,true);
+   refresh()}
+  catch(e){if(fb){fb.className='feedback err';fb.textContent='REJECTED: '+e.message}
+   toast('STOPEXE: '+e.message,false)}
+  finally{delete INFLIGHT['sx'+n];if(btn)btn.disabled=false}}
+/* ---------- pending stop/limit orders (StopExe straddle + ORDER tickets) --- */
+function pendTable(n){const a=(P.accounts||{})[n]||{};const ps=a.pendings||[];
+  const cnt=$id('pendcnt'+n);if(cnt)cnt.textContent=String(ps.length);
+  const box=$id('pend'+n);if(!box)return;
+  if(!ps.length){box.innerHTML='<div class="empty">no pending orders</div>';return}
+  box.innerHTML='<table><tr><th>ticket</th><th>symbol</th><th>type</th>'+
+   '<th class="num">vol</th><th class="num">level</th><th>placed</th><th></th></tr>'+
+   ps.map(p=>'<tr><td class="mono mut">'+esc(p.ticket)+'</td>'+
+    '<td class="mono">'+esc(p.symbol)+'</td>'+
+    '<td><span class="side '+(String(p.type||'').indexOf('BUY')===0?'BUY':'SELL')+'">'+esc(p.type)+'</span></td>'+
+    '<td class="num">'+fmt(Math.abs(+p.volume||0),2)+'</td>'+
+    '<td class="num">'+esc(p.price)+'</td>'+
+    '<td class="mut" style="font-size:11px">'+esc(String(p.time||'').slice(0,19))+'</td>'+
+    '<td><button class="xbtn" onclick="cancelPending('+n+',\\''+esc(p.ticket)+'\\')">DELETE</button></td></tr>').join('')+
+   '</table>'}
+async function cancelPending(n,ticket){
+  if(INFLIGHT['d'+ticket])return;INFLIGHT['d'+ticket]=true;
+  try{const j=await post('/api/close',{account:+n,ticket:String(ticket)});
+   toast('deleted #'+ticket+' - '+(j.detail||'ok'),true);refresh()}
+  catch(e){toast(e.message,false)}
+  finally{delete INFLIGHT['d'+ticket]}}
 async function restartTerm(n){
  if(INFLIGHT['r'+n])return;INFLIGHT['r'+n]=true;
  toast('restarting terminal '+n+' ...',true);
@@ -1089,7 +1273,8 @@ function orderModalHTML(n){
  return '<div class="modal-head"><h3>Place pending order · account '+n+'</h3>'+
   '<button class="closex" onclick="closeModal()">×</button></div>'+
   '<div class="frow">'+
-   '<div class="fgroup" style="grid-column:span 2"><label>Pair</label>'+
+   '<div class="fgroup" style="grid-column:span 2"><label>Pair · search the broker feed</label>'+
+    '<div class="symsearch"><input type="text" id="osearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'osym'+n+'\\',this.value)"></div>'+
     '<select id="osym'+n+'"></select></div>'+
    '<div class="fgroup" style="grid-column:span 2"><label>Order type</label>'+
     '<select id="otyp'+n+'">'+['BUY LIMIT','BUY STOP','SELL LIMIT','SELL STOP']
@@ -1225,9 +1410,9 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
   .filter(k=>sp[k]!=null)
   .map(k=>'<span class="chip">'+k+' <b>'+fmt(sp[k],0)+' pts</b></span>').join('')+
   '<span class="chip">FEED <b>'+(a.live?'LIVE':'STALE')+'</b></span>';
- const sym=$id('sym'+n).value;
- if(sym&&sp[sym]!=null){$id('tspr'+n).textContent=fmt(sp[sym],0)+' pts'}
- posTable(n)}
+  const sym=$id('sym'+n).value;
+  if(sym&&sp[sym]!=null){$id('tspr'+n).textContent=fmt(sp[sym],0)+' pts'}
+  posTable(n);pendTable(n);stexLive(n)}
 function renderSchedCount(n){const rows=(SCH||[]).filter(s=>String(s.account)===String(n));
  const cnt=$id('schcnt'+n);
  if(cnt)cnt.textContent=String(rows.filter(s=>s.active).length)}
@@ -1237,11 +1422,17 @@ function render(){if(!P)return;
     $id('lchips'+n).innerHTML=[0.01,0.05,0.10,0.50,1.00]
      .map(v=>'<button class="lchip" onclick="setLot('+n+','+v.toFixed(2)+')">'
       +v.toFixed(2)+'</button>').join('');
-    $id('ochips'+n).innerHTML=[1,2,3,5,10]
-     .map(v=>'<button class="lchip'+(v===1?' on':'')+'" onclick="setOrd('+n+','+v+')">'
-      +v+'</button>').join('');
-    const oe=$id('ordn'+n);if(oe)oe.oninput=function(){markOrdChip(n)}}
-   BUILT=true}
+     $id('ochips'+n).innerHTML=[1,2,3,5,10]
+      .map(v=>'<button class="lchip'+(v===1?' on':'')+'" onclick="setOrd('+n+','+v+')">'
+       +v+'</button>').join('');
+     const oe=$id('ordn'+n);if(oe)oe.oninput=function(){markOrdChip(n)};
+     /* StopExe default pair: gold first (the desk's straddle pair),
+        else the first quoted symbol - preview arms on next refresh */
+     const uni=stexUniverse(n);
+     const dflt=uni.includes('XAUUSD')?'XAUUSD':(uni[0]||'-');
+     const lab=$id('stexsym'+n);if(lab&&(lab.textContent==='-'||!lab.textContent))
+      lab.textContent=dflt}
+    BUILT=true}
   fillSymbols();updAcc('1');updAcc('2');
   renderSchedCount('1');renderSchedCount('2');
   const sys=P.system||{};liveLink(sys);}

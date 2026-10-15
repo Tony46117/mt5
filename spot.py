@@ -1725,6 +1725,54 @@ def read_spots(max_age: float = 0.1) -> dict[str, tuple[str, str, str]]:
     _SPOTS_CACHE = (now, spots)
     return spots
 
+def read_pending_orders(inst: int) -> list[dict]:
+    """Pending stop/limit orders on terminal `inst` (StopExe straddle, ORDER
+    tickets), from the EA's orders.csv (SpotDump v1.76+).
+
+    Returns [] when the file is absent (old EA / no pendings) or the
+    terminal identity is not verified - never raise on the panel hot path.
+    Row: ticket, symbol, type, volume, price_open, sl, tp, magic, time,
+    comment.
+    """
+    try:
+        login = read_accounts().get(inst, {}).get("login", "")
+        term = pick_terminal(login) if login else None
+        if not term:
+            return []
+        head = read_header(term["trades_path"])
+        if not head or head.get("login") != login:
+            return []
+        opath = term["trades_path"].with_name("orders.csv")
+        raw = opath.read_text(encoding="cp1252", errors="replace")
+    except OSError:
+        return []
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for line in raw.splitlines():
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) >= 2 and parts[0] == "NONE":
+            continue
+        if len(parts) >= 10:
+            rows.append({
+                "ticket": parts[0], "symbol": parts[1], "type": parts[2],
+                "volume": parts[3], "price": parts[4], "sl": parts[5],
+                "tp": parts[6], "magic": parts[7], "time": parts[8],
+                "comment": parts[9],
+            })
+        elif len(parts) >= 5:
+            rows.append({
+                "ticket": parts[0], "symbol": parts[1], "type": parts[2],
+                "volume": parts[3], "price": parts[4],
+                "sl": parts[5] if len(parts) > 5 else "",
+                "tp": parts[6] if len(parts) > 6 else "",
+                "magic": parts[7] if len(parts) > 7 else "",
+                "time": parts[8] if len(parts) > 8 else "",
+                "comment": parts[9] if len(parts) > 9 else "",
+            })
+    return rows
+
+
 def _parse_msc(s: str) -> int:
     for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:

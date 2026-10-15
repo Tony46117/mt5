@@ -23,6 +23,7 @@ from info import snapshot
 from spot import read_spots, feed_age, term_running, read_header, resolve_symbol
 from executor import start_scheduler, sender_for
 from monitor import read_positions, account_info
+import stopexe as stopexe_mod
 import metrics
 import broker_prober
 import account_engine
@@ -136,6 +137,11 @@ def health():
 def _acc_panel(acc_snapshot: dict, inst: int) -> dict:
     out = dict(acc_snapshot)
     out["positions"] = read_positions(inst)
+    try:
+        from spot import read_pending_orders
+        out["pendings"] = read_pending_orders(inst)
+    except Exception:
+        out["pendings"] = []
     return out
 
 _sys_cache: dict = {}
@@ -691,6 +697,91 @@ def api_order():
                 "price": first_price, "ticket": tickets[0] if tickets else "",
                 "tickets": tickets, "ok": ok_cnt, "n": n,
                 "type": ptype, "ms": round(order_ms, 1)})
+
+@app.get("/api/stopexe/preview")
+@rate_limit(max_requests=300, window=60)
+def api_stopexe_preview():
+    """Bracket prices for a StopExe straddle - same math EXECUTE uses."""
+    try:
+        account = int(request.args.get("account", 0))
+    except (TypeError, ValueError):
+        return _fail("bad account")
+    if account not in (1, 2):
+        return _fail("account must be 1 or 2")
+    symbol = str(request.args.get("symbol", "")).strip()
+    if not symbol:
+        return _fail("symbol is required")
+    try:
+        dpips = float(request.args.get("pips",
+                                       request.args.get("distance_pips", 5.0)))
+    except (TypeError, ValueError):
+        return _fail("bad distance")
+    if not 0.5 <= dpips <= 100:
+        return _fail("distance must be 0.5..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips)
+    except ValueError as exc:
+        return _fail(str(exc))
+    return _ok(lv)
+
+
+@app.post("/api/stopexe")
+@rate_limit(max_requests=60, window=60)
+def api_stopexe():
+    """StopExe: open a BUY STOP (ask + 5 pips) + SELL STOP (bid - 5 pips)
+    straddle of `lot` around the live price - 10 pips bracket total
+    (gold at 4150 -> 4155 / 4145)."""
+    d = request.get_json(silent=True) or {}
+    try:
+        account = int(d.get("account", 0))
+    except (TypeError, ValueError):
+        return _fail("bad account")
+    if account not in (1, 2):
+        return _fail("account must be 1 or 2")
+    symbol = str(d.get("symbol", "")).strip()
+    if not symbol:
+        return _fail("symbol is required")
+    try:
+        lot = float(d.get("lot", 0))
+    except (TypeError, ValueError):
+        return _fail("bad lot")
+    if lot <= 0 or lot > 100:
+        return _fail("lot out of range")
+    try:
+        dpips = float(d.get("distance_pips", d.get("pips", 5.0)))
+    except (TypeError, ValueError):
+        return _fail("bad distance")
+    if not 0.5 <= dpips <= 100:
+        return _fail("distance must be 0.5..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips)
+    except ValueError as exc:
+        return _fail(str(exc))
+    try:
+        _sym = broker_prober.get_prober().report()["terminals"] \
+            .get(str(account), {}).get(lv["broker_symbol"])
+        if _sym is None:
+            for _k, _v in broker_prober.get_prober().report()[
+                    "terminals"].get(str(account), {}).items():
+                if str(_k).upper() == str(lv["broker_symbol"]).upper():
+                    _sym = _v
+                    break
+        if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
+            return _fail(f"{symbol} is DISABLED for trading by the broker "
+                         f"on account {account} (trade_mode=0, retcode 10017)")
+    except Exception:
+        pass
+    lot_err = _lot_check(account, lv["broker_symbol"], lot)
+    if lot_err:
+        return _fail(lot_err)
+    try:
+        res = stopexe_mod.place_stopexe(account, symbol, lot, dpips)
+    except ValueError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    return _ok(res)
+
 
 @app.post("/api/close")
 @rate_limit(max_requests=300, window=60)

@@ -1,9 +1,10 @@
 
 #property copyright "spot bridge"
-#property version   "1.75"
+#property version   "1.76"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
+#define ORDERS_FILE  "orders.csv"
 #define CANDLE_FILE  "candles.csv"
 #define SYMBOLS_FILE "symbols.csv"
 #define EXEC_IN      "exec_in.csv"
@@ -257,6 +258,7 @@ int OnInit()
     EventSetMillisecondTimer(IntervalMs);
     DumpSpots();
     DumpTrades();
+    DumpOrders();
     DumpCandles();
     DumpSymbols();
     return(INIT_SUCCEEDED);
@@ -290,13 +292,17 @@ void OnTimer()
    DumpCandles();
 
    static int  s_last_pos   = -1;
+   static int  s_last_ord   = -1;
    static int  s_since_dump = 0;
    int total = PositionsTotal();
-   if(total != s_last_pos || s_since_dump >= 20)
+   int nords = OrdersTotal();
+   if(total != s_last_pos || nords != s_last_ord || s_since_dump >= 20)
      {
       s_last_pos   = total;
+      s_last_ord   = nords;
       s_since_dump = 0;
       DumpTrades();
+      DumpOrders();
      }
    else
       s_since_dump++;
@@ -512,6 +518,49 @@ void DumpTrades()
                 IntegerToString(PositionGetInteger(POSITION_MAGIC)),
                 MscToTime(msc),
                 PositionGetString(POSITION_COMMENT));
+     }
+   FileClose(handle);
+  }
+
+// Pending stop/limit orders, so the panel can SHOW the StopExe straddle
+// and the red CLOSE bar can DELETE it.  orders.csv rows:
+// ticket, symbol, type (BUY LIMIT / BUY STOP / SELL LIMIT / SELL STOP),
+// volume, price_open, sl, tp, magic, time_setup_msc, comment.
+// A "NONE count" header mirrors trades.csv so readers can tell an empty
+// book apart from a missing file.
+void DumpOrders()
+  {
+   int handle = FileOpen(ORDERS_FILE, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_SHARE_READ, '\t');
+   if(handle == INVALID_HANDLE)
+      return;
+   int total = OrdersTotal();
+   FileWrite(handle, "NONE", IntegerToString(total));
+   for(int i = total - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+         continue;
+      string sym = OrderGetString(ORDER_SYMBOL);
+      int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      long otype = OrderGetInteger(ORDER_TYPE);
+      string tname = "UNKNOWN";
+      if(otype == ORDER_TYPE_BUY_LIMIT)       tname = "BUY LIMIT";
+      else if(otype == ORDER_TYPE_BUY_STOP)   tname = "BUY STOP";
+      else if(otype == ORDER_TYPE_SELL_LIMIT) tname = "SELL LIMIT";
+      else if(otype == ORDER_TYPE_SELL_STOP)  tname = "SELL STOP";
+      else if(otype == ORDER_TYPE_BUY_STOP_LIMIT)  tname = "BUY STOP LIMIT";
+      else if(otype == ORDER_TYPE_SELL_STOP_LIMIT) tname = "SELL STOP LIMIT";
+      FileWrite(handle,
+                IntegerToString((long)ticket),
+                sym,
+                tname,
+                DoubleToString(OrderGetDouble(ORDER_VOLUME_CURRENT), 2),
+                DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), dg),
+                DoubleToString(OrderGetDouble(ORDER_SL), dg),
+                DoubleToString(OrderGetDouble(ORDER_TP), dg),
+                IntegerToString(OrderGetInteger(ORDER_MAGIC)),
+                MscToTime((long)OrderGetInteger(ORDER_TIME_SETUP_MSC)),
+                OrderGetString(ORDER_COMMENT));
      }
    FileClose(handle);
   }
@@ -858,7 +907,31 @@ void ExecuteLine(string line)
       ulong ticket = (ulong)StringToInteger(p[2]);
       if(!PositionSelectByTicket(ticket))
         {
-         AppendOut(id, "ERR", "no position " + p[2]);
+         // Not an open position - it may be a pending stop/limit order
+         // (StopExe straddle, manual ORDER ticket).  Delete it instead so
+         // the panel's CLOSE buttons flatten pending orders too.
+         if(OrderSelect(ticket))
+           {
+            string osym = OrderGetString(ORDER_SYMBOL);
+            MqlTradeRequest delreq;
+            MqlTradeResult  delres;
+            ZeroMemory(delreq);
+            ZeroMemory(delres);
+            delreq.action = TRADE_ACTION_REMOVE;
+            delreq.order  = ticket;
+            if(!OrderSend(delreq, delres) ||
+               (delres.retcode != TRADE_RETCODE_DONE &&
+                delres.retcode != TRADE_RETCODE_PLACED))
+              {
+               AppendOut(id, "ERR", "cancel retcode " +
+                         IntegerToString((long)delres.retcode) + " " + delres.comment);
+               return;
+              }
+            DumpOrders();
+            AppendOut(id, "OK", "deleted pending " + osym + "|" + p[2] + "|0.00");
+            return;
+           }
+         AppendOut(id, "ERR", "no position or pending order " + p[2]);
          return;
         }
       string sym  = PositionGetString(POSITION_SYMBOL);
@@ -960,14 +1033,89 @@ void ExecuteLine(string line)
             else
                failed++;
            }
-         if(sent == 0)
+         if(sent == 0 && nreq == 0)
+           {
+            // No matching positions - fall through to the pending-order
+            // sweep below instead of erroring, so CLOSEALL on a book that
+            // holds only stops still deletes them.
+           }
+         else if(sent == 0)
+           {
             AppendOut(id, "ERR", "no close sent (failed " +
                               IntegerToString(failed) + ")");
-
-         return;
+            return;
+           }
+         else
+           {
+            // Positions are flighted async (tracked) - pendings delete
+            // synchronously right now, then one combined ack goes back.
+            int deld = 0, delfail = 0;
+            for(int oi = OrdersTotal() - 1; oi >= 0; oi--)
+              {
+               ulong ot = OrderGetTicket(oi);
+               if(ot == 0 || !OrderSelect(ot))
+                  continue;
+               if(!all && OrderGetString(ORDER_SYMBOL) != sym)
+                  continue;
+               MqlTradeRequest dreq;
+               MqlTradeResult  dres;
+               ZeroMemory(dreq);
+               ZeroMemory(dres);
+               dreq.action = TRADE_ACTION_REMOVE;
+               dreq.order  = ot;
+               if(OrderSend(dreq, dres) &&
+                  (dres.retcode == TRADE_RETCODE_DONE ||
+                   dres.retcode == TRADE_RETCODE_PLACED))
+                  deld++;
+               else
+                  delfail++;
+              }
+            DumpOrders();
+            AppendOut(id, "OK", "closed flighted " + IntegerToString(sent) +
+                      " deleted pendings " + IntegerToString(deld) +
+                      (delfail > 0 ? (" failed " + IntegerToString(failed + delfail)) : ""));
+            return;
+           }
         }
-      AppendOut(id, "OK", "closed 0 failed 0");
-      return;
+      // No positions at all - still sweep pending stop/limit orders so the
+      // red CLOSE bar deletes a StopExe straddle sitting on the broker.
+      {
+       int deld = 0, delfail = 0;
+       for(int oi = OrdersTotal() - 1; oi >= 0; oi--)
+         {
+          ulong ot = OrderGetTicket(oi);
+          if(ot == 0 || !OrderSelect(ot))
+             continue;
+          if(!all && OrderGetString(ORDER_SYMBOL) != sym)
+             continue;
+          MqlTradeRequest dreq;
+          MqlTradeResult  dres;
+          ZeroMemory(dreq);
+          ZeroMemory(dres);
+          dreq.action = TRADE_ACTION_REMOVE;
+          dreq.order  = ot;
+          if(OrderSend(dreq, dres) &&
+             (dres.retcode == TRADE_RETCODE_DONE ||
+              dres.retcode == TRADE_RETCODE_PLACED))
+             deld++;
+          else
+             delfail++;
+         }
+       DumpOrders();
+       if(deld == 0 && delfail == 0)
+         {
+          AppendOut(id, "OK", "closed 0 failed 0");
+          return;
+         }
+       if(deld > 0 && delfail == 0)
+         {
+          AppendOut(id, "OK", "closed 0 deleted pendings " + IntegerToString(deld));
+          return;
+         }
+       AppendOut(id, "ERR", "deleted " + IntegerToString(deld) +
+                 " failed " + IntegerToString(delfail));
+       return;
+      }
      }
 
    if(cmd == "PROBE" && k >= 3)
