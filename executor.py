@@ -589,7 +589,7 @@ def _book_empty(acc: int, pair: str | None,
         m = _pending_count(acc, pair)
         if n == 0 and m == 0:
             return True
-        time.sleep(0.05)
+        time.sleep(0.02)
     return _open_count(acc, pair) == 0 and _pending_count(acc, pair) == 0
 
 def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, str]:
@@ -609,6 +609,18 @@ def _close_one(acc: int, pair: str, attempts: int = RETRY_MAX) -> tuple[bool, st
             return True, detail
         left_p = _open_count(acc, pair)
         left_o = _pending_count(acc, pair)
+        if (left_p == 0 and (left_o or 0) > 0
+                and "pend" not in detail.lower()
+                and "delet" not in detail.lower()):
+            # Old EA (pre-v1.76): positions are flat but it cannot delete
+            # pendings - retrying the same command is pointless, fail fast
+            # with the fix instead of burning 2 more 15 s verifies.
+            detail = (f"{detail} - {left_o} pending stop/limit order(s) "
+                      f"still on the broker (restart terminal {acc} to pick "
+                      f"up the pending-aware EA, then CLOSE again)")
+            log.error(f"close acc{acc} {pair} FAILED (old EA, no retry): "
+                      f"{detail}")
+            return False, detail
         if attempt < attempts:
             log.warning(f"close acc{acc} {pair} not empty after attempt "
                         f"{attempt} ({detail}) - positions={left_p} "

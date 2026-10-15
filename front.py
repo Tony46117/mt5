@@ -927,9 +927,6 @@ PANEL_TMPL = """<!doctype html>
           <div class="frow" style="margin-top:6px">
             <button class="btn blue" style="grid-column:span 2" onclick="engSubmitLogin()">LOG IN</button>
           </div>
-          <div class="body mut" style="font-size:11px;padding-top:6px">
-            works for any account, live or demo, in either terminal - the
-            terminal restarts into it and the whole software follows.</div>
         </div>
         <div id="engApForm" style="display:none;margin-top:12px;
           border-top:1px solid color-mix(in srgb,currentColor 12%,transparent);
@@ -950,10 +947,8 @@ PANEL_TMPL = """<!doctype html>
             learns it and plain name logins keep working.</div>
         </div>
         <div class="body mut" style="font-size:11px;padding-top:8px">
-          log any account (live or demo) into either terminal - verified
-          against the EA feed, one at a time per terminal, the whole software
-          follows. TIP: to switch an account already logged in inside MT5,
-          just switch it there and press ADOPT.</div>
+          any account (live or demo) into either terminal - TIP: already
+          logged in inside MT5? just press ADOPT.</div>
       </section>
     </div>
   </main>
@@ -995,7 +990,7 @@ function buildPanel(n){
   '<span class="sub mono" id="login'+n+'">-</span>'+
   '<span class="sub" id="server'+n+'">-</span>'+
   '<span class="sub" id="broker'+n+'">-</span>'+
-  '<span class="sub" id="mode'+n+'"></span>'+\n  '<span class="sub"><button class="btn mini danger" onclick="restartTerm('+n+')">RESTART</button></span>'+
+  '<span class="sub"><button class="btn mini danger" onclick="restartTerm('+n+')">RESTART</button></span>'+
   '<span class="spacer"></span><span class="sub mono" id="cur'+n+'"></span>'+
   (String(n)==='1'?'':'<button class="btn close-top danger" id="closeTopBtn'+n+'" onclick="closeAll('+n+',this)"'+
   ' title="close every position on account '+n+'">✕ CLOSE</button>')+'</div>'+
@@ -1028,12 +1023,15 @@ function buildPanel(n){
    '<button class="tbtn tbuy" onclick="doTrade('+n+',\\'BUY\\')">BUY</button>'+
   '</div>'+
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
-  '<div class="order-wrap"><button class="btn order-mini" id="ordBtn'+n+'" '+
-   'onclick="asmrPop(this);openOrderModal('+n+')">◌ ORDER · LIMIT / STOP</button></div>'+
+  '<div class="order-wrap" style="gap:8px;flex-wrap:wrap">'+
+   '<button class="btn order-mini" id="ordBtn'+n+'" '+
+    'onclick="asmrPop(this);openOrderModal('+n+')">◌ ORDER</button>'+
+   '<button class="btn order-mini" onclick="asmrPop(this);openSchedModal('+n+')">◇ SCHEDULE</button>'+
+   '<button class="btn order-mini" onclick="asmrPop(this);stexJump('+n+')">STOPEXE ↓</button></div>'+
   '</div>'+
   '<div class="sect"><h4>StopExe · straddle stops</h4>'+
-   '<div class="right"><span class="chip">BRACKET <b>±5 pips</b></span></div></div>'+
-  '<div class="body">'+
+   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±2 pips</b></span></div></div>'+
+  '<div class="body" id="stexbody'+n+'">'+
    '<div class="fgroup"><label>Search pair · broker feed</label>'+
     '<div class="symsearch"><input type="text" id="stexsearch'+n+'" placeholder="type XAU, EUR, GBP... (live quotes only)" autocomplete="off" oninput="stexFilter('+n+')"></div>'+
     '<div class="symlist" id="stexlist'+n+'"></div></div>'+
@@ -1041,8 +1039,8 @@ function buildPanel(n){
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
    '<div class="stex-bracket">'+
-    '<div><div class="k">Buy stop · ask + 5 pips</div><div class="v buy" id="stexbuy'+n+'">-</div></div>'+
-    '<div><div class="k">Sell stop · bid - 5 pips</div><div class="v sell" id="stexsell'+n+'">-</div></div>'+
+    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 2 pips</div><div class="v buy" id="stexbuy'+n+'">-</div></div>'+
+    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 2 pips</div><div class="v sell" id="stexsell'+n+'">-</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
     '<div class="fgroup"><label>Lot (each leg)</label>'+
@@ -1051,12 +1049,12 @@ function buildPanel(n){
      '<button type="button" onclick="stexStepLot('+n+',0.01)">+</button></div></div>'+
     '<div class="fgroup" style="grid-column:span 2"><label>Bracket</label>'+
      '<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
-      '<option value="3">±3 pips (6 total)</option>'+
-      '<option value="5" selected>±5 pips (10 total)</option>'+
-      '<option value="10">±10 pips (20 total)</option></select></div>'+
+      '<option value="1">±1 pip (2 total)</option>'+
+      '<option value="2" selected>±2 pips (4 total)</option>'+
+      '<option value="5">±5 pips (10 total)</option></select></div>'+
    '</div>'+
    '<div class="tradebtns" style="margin-top:2px">'+
-    '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">⚡ EXECUTE STOPEXE</button>'+
+    '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">EXECUTE STOPEXE</button>'+
    '</div>'+
    '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price</div>'+
   '</div>'+
@@ -1181,7 +1179,10 @@ function stexFilter(n){
    '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
   box.classList.add('open')}
 function stexPips(n){const el=$id('stexpips'+n);
-  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:5}
+  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:2}
+function stexJump(n){const b=$id('stexbody'+n);
+  if(b)b.scrollIntoView({behavior:'smooth',block:'start'});
+  const inp=$id('stexsearch'+n);if(inp)inp.focus({preventScroll:true})}
 function stexStepLot(n,d){const el=$id('stexlot'+n);if(!el)return;
   let v=Math.max(0.01,(parseFloat(el.value)||0.01)+d);el.value=v.toFixed(2)}
 let STEX_TS={};
@@ -1199,6 +1200,12 @@ async function stexPreview(n,force){
    if(stexSel(n)!==sym)return;             // stale reply after re-arm
    if(buy)buy.textContent=j.buy_price;
    if(sell)sell.textContent=j.sell_price;
+   const br=$id('stexbr'+n);
+   if(br)br.textContent='±'+j.distance_pips+' pips';
+   const bk=$id('stexbuyk'+n);
+   if(bk)bk.textContent='Buy stop · ask + '+j.distance_pips+' pips';
+   const sk=$id('stexsellk'+n);
+   if(sk)sk.textContent='Sell stop · bid - '+j.distance_pips+' pips';
    stexPaintQuote(n,sym,String(j.bid),String(j.ask));
   }catch(e){/* feed gap - keep the last bracket, refresh() retries */}}
 function stexLive(n){
@@ -1393,9 +1400,8 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
  $id('live'+n).className=syncing?'dot warn':dot(a.live&&!loggedOut,num(a.age_s)>0&&num(a.age_s)<60);
  $id('login'+n).textContent=a.login||'-';
  $id('server'+n).textContent=a.server||'-';
- $id('broker'+n).textContent=a.broker||'-';
- $id('mode'+n).textContent=(a.trade_mode||'').toUpperCase()+' · '+(a.margin_mode||'').toUpperCase();
- $id('cur'+n).textContent=a.currency||'';
+  $id('broker'+n).textContent=a.broker||'-';
+  $id('cur'+n).textContent=a.currency||'';
  $id('bal'+n).textContent=fmt(a.balance);
  $id('eq'+n).textContent=fmt(a.equity);
  $id('eq'+n).className='v sm '+cls(num(a.equity)-num(a.balance));
@@ -1486,10 +1492,7 @@ function engRender(){
    '<button class="btn mini" onclick="engAdopt('+s.terminal+')">ADOPT</button>'+
    '<button class="btn mini" onclick="engRestart('+s.terminal+')">RESTART</button>'+
    '<button class="btn mini danger" onclick="engLogout('+s.terminal+')">LOGOUT</button>'+
-   warn+'</div>'}).join('')+
-  (ENGOPS&&ENGOPS.length?'<div class="mut" style="font-size:11px;padding-top:8px">'+
-   ENGOPS.slice(0,4).map(o=>'['+esc(o.state)+'] T'+o.terminal+' '+esc(o.op)+' - '
-    +esc(o.detail||'…')).join('<br>')+'</div>':'');
+   warn+'</div>'}).join('');
  const busy=(ENG.slots||[]).some(s=>s.running);
  const chip=$id('engBusy');
  chip.textContent=busy?'SYNCING':'IDLE';

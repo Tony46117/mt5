@@ -1,6 +1,6 @@
 
 #property copyright "spot bridge"
-#property version   "1.76"
+#property version   "1.77"
 
 #define SPOT_FILE    "spots.csv"
 #define TRADES_FILE  "trades.csv"
@@ -818,6 +818,110 @@ void ExecuteLine(string line)
          return;
         }
       AsyncTrack(ares.request_id, id, true, sym, req.volume, digits, (long)f, req);
+      return;
+     }
+
+   // STOPEXE\tsym\tvol\tbuyprice\tsellprice\t[magic]\t[comment]
+   // One file, one pass, both legs back-to-back: the straddle rests on
+   // the broker TOGETHER (a two-file batch could split across passes).
+   // Either both legs ack or neither stands: if the sell leg fails after
+   // the buy leg is placed, the buy leg is pulled before replying.
+   if(cmd == "STOPEXE" && k >= 6)
+     {
+      string sym = p[2];
+      if(!SymbolSelect(sym, true))
+        {
+         AppendOut(id, "ERR", "unknown symbol " + sym);
+         return;
+        }
+      double vol   = NormalizeVolume(sym, StringToDouble(p[3]));
+      double bprice = StringToDouble(p[4]);
+      double sprice = StringToDouble(p[5]);
+      long   mg    = (k > 6) ? StringToInteger(p[6]) : MAGIC_PY;
+      string cm    = (k > 7) ? p[7] : "stopexe";
+      int digits   = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      double ask   = SymbolInfoDouble(sym, SYMBOL_ASK);
+      double bid   = SymbolInfoDouble(sym, SYMBOL_BID);
+      bprice = NormalizeDouble(bprice, digits);
+      sprice = NormalizeDouble(sprice, digits);
+      if(vol <= 0.0 || bprice <= 0.0 || sprice <= 0.0 || ask <= 0.0 || bid <= 0.0)
+        {
+         AppendOut(id, "ERR", "bad volume, price or no quote");
+         return;
+        }
+      double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
+      double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+      double gap    = MathMax(stops, freeze);
+      if(bprice < ask + gap)
+        {
+         AppendOut(id, "ERR", "buy stop must sit ABOVE the ask (bid " +
+                   DoubleToString(bid, digits) + " ask " +
+                   DoubleToString(ask, digits) + ")");
+         return;
+        }
+      if(sprice > bid - gap)
+        {
+         AppendOut(id, "ERR", "sell stop must sit BELOW the bid (bid " +
+                   DoubleToString(bid, digits) + " ask " +
+                   DoubleToString(ask, digits) + ")");
+         return;
+        }
+      MqlTradeRequest breq;
+      MqlTradeResult  bres;
+      ZeroMemory(breq);
+      ZeroMemory(bres);
+      breq.action       = TRADE_ACTION_PENDING;
+      breq.symbol       = sym;
+      breq.volume       = vol;
+      breq.type         = ORDER_TYPE_BUY_STOP;
+      breq.price        = bprice;
+      breq.magic        = (ulong)mg;
+      breq.comment      = cm;
+      breq.type_time    = ORDER_TIME_GTC;
+      breq.type_filling = ORDER_FILLING_RETURN;
+      if(!OrderSend(breq, bres) ||
+         (bres.retcode != TRADE_RETCODE_DONE && bres.retcode != TRADE_RETCODE_PLACED))
+        {
+         AppendOut(id, "ERR", "buy stop retcode " +
+                   IntegerToString((long)bres.retcode) + " " + bres.comment);
+         return;
+        }
+      MqlTradeRequest sreq;
+      MqlTradeResult  sres;
+      ZeroMemory(sreq);
+      ZeroMemory(sres);
+      sreq.action       = TRADE_ACTION_PENDING;
+      sreq.symbol       = sym;
+      sreq.volume       = vol;
+      sreq.type         = ORDER_TYPE_SELL_STOP;
+      sreq.price        = sprice;
+      sreq.magic        = (ulong)mg;
+      sreq.comment      = cm;
+      sreq.type_time    = ORDER_TIME_GTC;
+      sreq.type_filling = ORDER_FILLING_RETURN;
+      if(!OrderSend(sreq, sres) ||
+         (sres.retcode != TRADE_RETCODE_DONE && sres.retcode != TRADE_RETCODE_PLACED))
+        {
+         // Pull the buy leg so a half straddle never stands alone.
+         MqlTradeRequest dreq;
+         MqlTradeResult  dres;
+         ZeroMemory(dreq);
+         ZeroMemory(dres);
+         dreq.action = TRADE_ACTION_REMOVE;
+         dreq.order  = bres.order;
+         OrderSend(dreq, dres);
+         DumpOrders();
+         AppendOut(id, "ERR", "sell stop retcode " +
+                   IntegerToString((long)sres.retcode) + " " + sres.comment +
+                   " - buy leg #" + IntegerToString((long)bres.order) + " pulled");
+         return;
+        }
+      DumpOrders();
+      AppendOut(id, "OK", DoubleToString(bprice, digits) + "|" +
+                IntegerToString((long)bres.order) + "|" +
+                DoubleToString(sprice, digits) + "|" +
+                IntegerToString((long)sres.order));
       return;
      }
 

@@ -4,8 +4,12 @@
 
 One EXECUTE opens a two-leg straddle around the live price:
 
-    BUY STOP  at ask + 5 pips
-    SELL STOP at bid - 5 pips        (10-pip bracket total)
+    BUY STOP  at ask + 2 pips
+    SELL STOP at bid - 2 pips        (4-pip bracket total)
+
+Both legs travel in ONE exec command (EA v1.77 STOPEXE): one file, one
+pass, back-to-back OrderSends, one ack - either both legs rest on the
+broker together or neither stands (a half straddle is pulled).
 
 Pip size follows the quote itself:
 
@@ -76,7 +80,7 @@ def digits_for(symbol: str, price: str = "") -> int:
 
 
 def stopexe_levels(symbol: str, account: int,
-                   distance_pips: float = 5.0) -> dict:
+                   distance_pips: float = 2.0) -> dict:
     """Bracket prices for a StopExe straddle.  Raises ValueError with a
     human message when there is no live quote."""
     from spot import read_spots, resolve_symbol
@@ -124,18 +128,86 @@ def stopexe_levels(symbol: str, account: int,
 
 
 def place_stopexe(account: int, symbol: str, lot: float,
-                  distance_pips: float = 5.0,
-                  timeout: float = 20.0) -> dict:
-    """Place the two-leg StopExe straddle.  Returns a JSON-friendly dict.
+                  distance_pips: float = 2.0,
+                  timeout: float = 10.0) -> dict:
+    """Place the two-leg StopExe straddle in ONE exec round trip.
 
-    Both legs go out as ONE batch so they rest on the broker together;
-    a half-filled straddle (only one leg accepted) is reported as a
-    partial, never silently.
+    Returns a JSON-friendly dict.  The EA places both legs back-to-back
+    and acks `buyprice|buyticket|sellprice|sell...`; a half straddle is
+    pulled server-side, never left standing.  Terminals still on an EA
+    older than v1.77 (no STOPEXE command) fall back to the two-PENDING
+    batch path.
     """
     import database as db
     from executor import sender_for
 
     lv = stopexe_levels(symbol, account, distance_pips)
+    broker_sym = lv["broker_symbol"]
+    digits = lv["digits"]
+    sender = sender_for(account)
+    t0 = time.perf_counter()
+    try:
+        ok, detail = sender.send(
+            "STOPEXE", broker_sym, f"{lot:.2f}",
+            f"{lv['buy_price']:.{digits}f}", f"{lv['sell_price']:.{digits}f}",
+            str(STOPEXE_MAGIC), STOPEXE_COMMENT, timeout=timeout)
+    except Exception as exc:
+        raise ValueError(str(exc))
+    ms = (time.perf_counter() - t0) * 1000.0
+    if not ok and "unknown cmd" in detail:
+        # Old EA - same bracket through two PENDINGs in one batch.
+        return _place_stopexe_batch(account, symbol, lot, lv, ms_offset=ms)
+    legs = _legs_from_stopexe_detail(lv, ok, detail)
+    try:
+        for leg in legs:
+            db.log_fired(0, account, symbol, leg["type"], lot, "stopexe",
+                         leg["ticket"], leg["ok"], leg["detail"], ms=ms)
+    except Exception as exc:
+        log.warning(f"stopexe: could not log legs: {exc}")
+    ok_cnt = sum(1 for leg in legs if leg["ok"])
+    out = {
+        "symbol": symbol,
+        "broker_symbol": broker_sym,
+        "account": account,
+        "lot": lot,
+        "bid": lv["bid"],
+        "ask": lv["ask"],
+        "buy_price": lv["buy_price"],
+        "sell_price": lv["sell_price"],
+        "distance_pips": lv["distance_pips"],
+        "legs": legs,
+        "ok": ok_cnt,
+        "n": 2,
+        "ms": round(ms, 1),
+    }
+    if ok_cnt == 2:
+        out["detail"] = (f"STOPEXE {symbol} {lot:g} - BUY STOP @ "
+                         f"{lv['buy_price']} (#{legs[0]['ticket']}) + SELL STOP @ "
+                         f"{lv['sell_price']} (#{legs[1]['ticket']})")
+        out["tickets"] = [legs[0]["ticket"], legs[1]["ticket"]]
+        return out
+    raise ValueError(f"STOPEXE rejected - {detail}")
+
+
+def _legs_from_stopexe_detail(lv: dict, ok: bool, detail: str) -> list[dict]:
+    """`buyprice|buyticket|sellprice|sell...` -> two leg dicts."""
+    parts = str(detail or "").split("|")
+    buy_ticket = parts[1] if ok and len(parts) > 1 else ""
+    sell_ticket = parts[3] if ok and len(parts) > 3 else ""
+    return [
+        {"type": "BUYSTOP", "price": lv["buy_price"], "ok": ok,
+         "ticket": buy_ticket, "detail": detail},
+        {"type": "SELLSTOP", "price": lv["sell_price"], "ok": ok,
+         "ticket": sell_ticket, "detail": detail},
+    ]
+
+
+def _place_stopexe_batch(account: int, symbol: str, lot: float,
+                         lv: dict, ms_offset: float = 0.0) -> dict:
+    """Fallback for pre-v1.77 EAs: two PENDINGs in one batch."""
+    import database as db
+    from executor import sender_for
+
     broker_sym = lv["broker_symbol"]
     digits = lv["digits"]
     sender = sender_for(account)
@@ -149,10 +221,10 @@ def place_stopexe(account: int, symbol: str, lot: float,
     ]
     t0 = time.perf_counter()
     try:
-        results = list(sender.send_batch(*commands, timeout=timeout))
+        results = list(sender.send_batch(*commands, timeout=20.0))
     except Exception as exc:
         raise ValueError(str(exc))
-    ms = (time.perf_counter() - t0) * 1000.0
+    ms = (time.perf_counter() - t0) * 1000.0 + ms_offset
     legs = []
     for (ptype, price), (ok, detail) in zip(
             (("BUYSTOP", lv["buy_price"]), ("SELLSTOP", lv["sell_price"])),
@@ -186,7 +258,8 @@ def place_stopexe(account: int, symbol: str, lot: float,
                          f"{lv['buy_price']} (#{legs[0]['ticket']}) + SELL STOP @ "
                          f"{lv['sell_price']} (#{legs[1]['ticket']})")
         out["tickets"] = [legs[0]["ticket"], legs[1]["ticket"]]
-    elif ok_cnt == 1:
+        return out
+    if ok_cnt == 1:
         good = legs[0] if legs[0]["ok"] else legs[1]
         bad = legs[1] if legs[0]["ok"] else legs[0]
         out["detail"] = (f"PARTIAL {symbol} - {good['type']} @ {good['price']} "
@@ -194,7 +267,6 @@ def place_stopexe(account: int, symbol: str, lot: float,
                          f"{bad['detail']} - delete #{good['ticket']} if the "
                          f"straddle is unwanted")
         out["tickets"] = [good["ticket"]]
-    else:
-        raise ValueError(f"STOPEXE rejected - BUY STOP: {legs[0]['detail']} | "
-                         f"SELL STOP: {legs[1]['detail']}")
-    return out
+        return out
+    raise ValueError(f"STOPEXE rejected - BUY STOP: {legs[0]['detail']} | "
+                     f"SELL STOP: {legs[1]['detail']}")
