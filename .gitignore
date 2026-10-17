@@ -2,6 +2,7 @@ acc.env
 acc.enc
 session.json
 session.enc
+.env
 apis.txt
 *.log
 *.db

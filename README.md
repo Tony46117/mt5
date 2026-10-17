@@ -1,11 +1,48 @@
 # MT5 Dual-Terminal Algo Trading Bridge
 
-A Linux-native algorithmic trading stack that runs two MetaTrader 5
-terminals side by side under Wine and drives them entirely from Python
-through a file-based execution channel. Built and tested against HFM
-demo accounts and the 24/7 gold symbol `XAUUSD247`.
+An algorithmic trading stack that runs two MetaTrader 5 terminals side by
+side under Wine and drives them entirely from Python through a file-based
+execution channel. It runs natively on Linux or in the bundled container
+on any OS (Windows/macOS included). Built and tested against HFM demo
+accounts and the 24/7 gold symbol `XAUUSD247`.
 
 One command starts everything; Ctrl+C stops everything.
+
+## Quick start
+
+Two ways in - pick whichever fits the computer.
+
+**A. Docker or Podman (any OS - the easiest, nothing else to install but
+the container runtime)**
+
+```bash
+git clone https://github.com/Tony46117/mt5.git && cd mt5
+docker compose up --build        # or: make docker
+```
+
+The first boot builds the image and installs MT5 into the `mt5-data`
+volume (~2-5 min); later boots start in seconds. The web panel is then on
+http://localhost:8000. `make docker` also writes a `.env` with a random
+`MT5_MACHINE_KEY` so stored logins survive container recreation.
+
+**B. Linux native (Wine - lowest latency)**
+
+```bash
+bash install.sh      # one-time: packages, Wine, MT5, venv, EA  (or: make setup)
+bash run.sh          # start everything                          (or: make run)
+```
+
+`run.sh` uses the venv `install.sh` created and will create/repair it if
+it is missing, so on a machine that already has Wine, `bash run.sh` is
+usually all you need. Ctrl+C stops the bridge, the web app and both
+terminals; `bash run.sh stop` (or `make stop`) does the same from another
+shell.
+
+**Then, both paths:** open http://localhost:8000, log into your accounts
+from the panel (hot-adopted within a second), or seed `acc.env` first -
+see [Configure accounts](#configure-accounts). `make help` lists every
+shortcut (`setup`, `run`, `stop`, `docker`, `logs`, `shell`, `down`,
+`wipe`).
 
 ## What it does
 
@@ -65,6 +102,7 @@ One command starts everything; Ctrl+C stops everything.
 | `metrics.py`    | Closed-trade and equity observation. |
 | `run.sh`        | One-command launcher for the whole stack with full teardown on Ctrl+C. |
 | `install.sh`    | System bootstrap: packages, Wine prefix, MT5 install, venv, EA compilation. |
+| `Makefile`      | One-line shortcuts for setup/run/stop/docker/logs/shell - `make help` lists them. |
 | `front.py`      | Server-rendered HTML/CSS/JS for the dashboard and the trading panel. |
 | `info.py`       | One-shot account/spread report for the logged-in accounts. |
 | `ms.py`         | Standalone terminal candlestick chart (not used by the stack). |
@@ -72,20 +110,26 @@ One command starts everything; Ctrl+C stops everything.
 
 ## Requirements
 
-- Linux with Wine 9+ (esync/fsync capable builds are used when present)
-- Python 3.12 (a venv at `~/python312` is used by `run.sh` when present)
+- **Docker or Podman** (any OS), or **Linux with Wine 9+** (esync/fsync
+  capable builds are used when present) for native runs
+- **Python 3.10+** for native runs; `run.sh` creates and maintains the
+  `~/python312` venv automatically, so no manual pip setup is needed
+- **x86_64 CPU** - Wine and MT5 are 64-bit Intel/AMD. On Apple Silicon,
+  Docker runs the amd64 image through emulation (works, slower).
 - An MT5 broker account pair (demo recommended). HFM demo accounts with
   `XAUUSD247` are the tested configuration.
 
-## Install
+## Install (Linux native)
 
 ```bash
-bash install.sh
+bash install.sh        # or: make setup
 ```
 
 Handles packages, the Wine prefix, the MetaTrader 5 install, the Python
 virtualenv and EA compilation, with retries and non-fatal fallbacks on
-interactive steps.
+interactive steps (an MT5 GUI wizard may appear once - click through it).
+Everything is skipped when already present, so it is safe to re-run after
+an interruption. When it finishes, `bash run.sh` starts the stack.
 
 ## Run with Docker (any OS, including Windows)
 
@@ -94,7 +138,7 @@ environment (plain Docker, WSL2, Kubernetes) and the X display (X11 forward,
 Wayland, or a private headless Xvfb) on every start - no flags needed.
 
 ```bash
-docker compose up --build       # or: bash run.sh on Windows (auto-detects)
+docker compose up --build       # or: make docker
 ```
 
 - Web panel: http://localhost:8000
@@ -102,6 +146,16 @@ docker compose up --build       # or: bash run.sh on Windows (auto-detects)
   `mt5-data` volume; `logs/` inside the container maps to `/data/logs`.
 - First boot installs MT5 into the volume and creates terminal 2 (~2 min),
   later boots start in seconds.
+- `make docker` creates `.env` (random `MT5_MACHINE_KEY`, gitignored) and
+  `./data/` for you on first run. If you start with plain
+  `docker compose up --build`, copy `.env.example` to `.env` once. Keep
+  `MT5_MACHINE_KEY` stable or the stored session cannot be decrypted.
+- Different host port: `MT5_WEB_PORT=8100 docker compose up --build`.
+
+**Apple Silicon Macs:** the image is `linux/amd64` because Wine + MT5 are
+x86_64. Docker Desktop runs it through Rosetta/QEMU emulation - enable
+"Use Rosetta for x86/amd64 emulation" for a usable speed, and expect the
+first build to take a few minutes longer.
 
 **Windows:** install Docker Desktop (WSL2 backend), then from the project
 folder run `bash run.sh` in Git Bash / WSL - it detects the OS and hands
@@ -126,20 +180,20 @@ If MetaTrader 5 cannot be fetched at runtime (slow/quota-limited links), copy
 a working install to `./data/mt5-master/` (must contain `terminal64.exe`) and
 it is seeded on next boot.
 
-**Accounts:** put your `acc.env` at `./data/acc.env` on the host - the
-container copies it in and seeds the obfuscated session on first boot. Set
-`MT5_MACHINE_KEY` in the environment (any long random string) so the
-encrypted `session.json` survives container recreation. You can also log in
-live from the web panel.
+**Accounts:** put your `acc.env` (see `acc.env.example`) at `./data/acc.env`
+on the host - the container copies it in and seeds the obfuscated session on
+first boot. Set `MT5_MACHINE_KEY` in the environment (any long random string)
+so the encrypted `session.json` survives container recreation. You can also
+log in live from the web panel.
 
-Useful commands:
+Useful commands (all have `make` equivalents - `make help`):
 
 ```bash
-docker compose up --build -d          # detached
-docker compose logs -f                # follow logs
-docker compose exec mt5-bridge bash   # shell inside
-docker compose down                   # stop (volume persists)
-docker compose down -v                # stop AND wipe all state
+docker compose up --build -d          # detached          (make docker-up)
+docker compose logs -f                # follow logs       (make logs)
+docker compose exec mt5-bridge bash   # shell inside      (make shell)
+docker compose down                   # stop, volume kept (make down)
+docker compose down -v                # stop AND wipe state (make wipe)
 ```
 
 ## Configure accounts
@@ -153,8 +207,9 @@ python session.py
 
 `session.json` (obfuscated, 0600) is what the bridge actually boots from.
 `python session.py --status` shows who is stored, `--logout` forgets it.
-(`--seed` is a different thing: it imports credentials from a legacy
-`acc.env` and does nothing if you do not have one.)
+(`--seed` imports credentials from `acc.env` - copy `acc.env.example` to
+`acc.env`, fill in logins, then `python session.py --seed`. For the Docker
+stack put the file at `./data/acc.env` instead.)
 
 The obfuscation is XOR against a machine-derived key - it keeps passwords
 out of plaintext files and backups, it is **not** encryption against
@@ -201,18 +256,20 @@ and tells you exactly which access point to add.
 ## Run
 
 ```bash
-bash run.sh
+bash run.sh        # or: make run
 ```
 
 - Starts the web panel on `http://127.0.0.1:8000` and the bridge
   supervisor (which boots both terminals concurrently).
 - The supervisor screen is the live status dashboard.
+- The venv is created/repaired automatically (at `~/python312`) and missing
+  libraries are installed on the first run.
 - `Ctrl+C` stops the bridge, the web app and both MT5 terminals.
 
 Other commands:
 
 ```bash
-bash run.sh stop                          # tear everything down
+bash run.sh stop                          # tear everything down (make stop)
 MT5_RUN_KEEP_TERMINALS=1 bash run.sh      # keep terminals on exit
 ```
 
@@ -223,7 +280,8 @@ paths and file ownership stay consistent.
 
 - Web panel: `http://127.0.0.1:8000` - buy/sell buttons, schedules,
   account overview.
-- Factory HUD: `/factory` (under **Scheduled Trades**) renders the
+- Factory HUD: `/factory` (full-weight sidebar item just below
+  **Scheduled Trades**) renders the
   factory.py news globe and LED ticker in the browser. The ms/us clock and
   the dotted globe are painted locally every frame (no per-frame server
   round-trip, so rotation/hover stay smooth); `/api/factory/map` serves the
@@ -294,11 +352,27 @@ from an explicit panel click or a schedule.
   hit the broker's cold-symbol sync once; there is no startup warm-up
   trade (orders are only ever fired by a click or a schedule).
 - **Web port busy** - another `app.py` instance is running; `bash run.sh stop`
-  clears it.
+  clears it. Docker users: remap with `MT5_WEB_PORT=8100 docker compose up`.
 - **Double-boot race** - resolved automatically: `run.sh` clears any
   still-running terminals before the bridge boots its own.
+- **`neither Wine nor Docker/Podman was found`** - install Docker (easiest)
+  or run `bash install.sh` for the native Wine stack.
+- **`could not create a venv` / `python3-venv` missing** - `sudo apt-get
+  install python3-venv` (Debian/Ubuntu), then `bash run.sh` again.
+- **`docker compose up` cannot build on Apple Silicon** - allow the amd64
+  emulation (Docker Desktop -> Settings -> General -> "Use Rosetta for
+  x86/amd64 emulation") and retry; the first build is slowest.
+- **Docker container starts but the panel shows no session** - keep
+  `MT5_MACHINE_KEY` the same as the previous run (`.env`); a changed key
+  cannot decrypt `session.json`. Log in again from the panel or restore
+  the old key.
+- **Start over cleanly** - native: `bash run.sh stop` then delete
+  `session.json`, `trades.db*`; Docker: `make wipe` (deletes the
+  `mt5-data` volume and everything in it).
 
 ## Repository scope
 
-Runtime code only. Credentials (`acc.env`, `session.json`), databases,
-logs and probe/CI tooling are intentionally kept out of version control.
+Runtime code only. Credentials (`acc.env`, `session.json`, `.env`),
+databases, logs and probe/CI tooling are intentionally kept out of version
+control; `.env.example` and `acc.env.example` are tracked so a fresh clone
+knows exactly what to copy.

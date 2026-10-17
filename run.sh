@@ -18,12 +18,26 @@ else
     elif command -v podman >/dev/null 2>&1; then RT=podman
     elif command -v docker >/dev/null 2>&1; then RT=docker
     fi
+    if [ -n "$RT" ] && ! command -v "$RT" >/dev/null 2>&1; then
+      echo "ERROR: $RT was requested (MT5_RUN_ENGINE) but is not installed."
+      exit 1
+    fi
     [ -n "$RT" ] && echo "wine not found - using the $RT container stack."
   fi
 fi
 
+if [ -z "$RT" ] && ! command -v wine >/dev/null 2>&1 \
+   && ! command -v wine64 >/dev/null 2>&1 \
+   && [ "${MT5_RUN_ENGINE:-}" != native ]; then
+  echo "ERROR: neither Wine nor Docker/Podman was found on this computer."
+  echo "  easiest:  install Docker, then run:  docker compose up --build"
+  echo "  native:   run  bash install.sh  first (installs Wine + MT5 + venv)"
+  exit 1
+fi
+
 if [ -n "$RT" ]; then
   COMPOSE_FILE=docker-compose.yml
+  mkdir -p data
   if $RT compose version >/dev/null 2>&1; then
     echo "starting via $RT compose (web panel :8000)..."
     exec $RT compose -f "$COMPOSE_FILE" up --build
@@ -35,6 +49,9 @@ if [ -n "$RT" ]; then
 
     RUN_IPC="--ipc=host"
     RUN_SELINUX=":Z"
+  fi
+  if [ -f "$(pwd)/.env" ]; then
+    set -a; . "$(pwd)/.env"; set +a
   fi
   exec $RT run --rm -it -p 8000:8000 \
     $RUN_IPC \
@@ -49,6 +66,46 @@ PY="$HOME/python312/bin/python"
 APP_LOG="app_run.log"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+ensure_python() {
+  # Native runs want a working venv with flask+waitress.  install.sh
+  # builds ~/python312, but a fresh checkout on another computer usually
+  # has neither - so build (or repair) the venv right here instead of
+  # failing with an import error in the log.
+  local venv="$HOME/python312" base
+  if [ -x "$venv/bin/python" ]; then
+    PY="$venv/bin/python"
+  else
+    for base in python3.12 python3.11 python3.10 python3; do
+      command -v "$base" >/dev/null 2>&1 && break
+      base=""
+    done
+    if [ -z "$base" ]; then
+      echo "ERROR: no python3 found - install Python 3.10+ (or use Docker)."
+      exit 1
+    fi
+    echo "creating python venv at $venv (one-time, using $base)..."
+    if ! "$base" -m venv "$venv" 2>/dev/null; then
+      echo "ERROR: could not create a venv with $base."
+      echo "  Debian/Ubuntu:  sudo apt-get install python3-venv"
+      echo "  Fedora/RHEL:    sudo dnf install python3"
+      exit 1
+    fi
+    PY="$venv/bin/python"
+  fi
+  if ! "$PY" -c "import flask, waitress" >/dev/null 2>&1; then
+    echo "installing python requirements into $venv ..."
+    "$PY" -m pip install --disable-pip-version-check --prefer-binary \
+      -r "$HERE/requirements.txt" >/dev/null 2>&1 \
+      || "$PY" -m pip install --disable-pip-version-check --prefer-binary \
+           flask waitress psycopg2-binary
+  fi
+  if ! "$PY" -c "import flask, waitress" >/dev/null 2>&1; then
+    echo "ERROR: python dependencies missing for $PY."
+    echo "  fix:  $PY -m pip install -r $HERE/requirements.txt"
+    exit 1
+  fi
+}
 
 kill_ours() {
   pkill -"$1" -u "$(id -u)" -f "$HERE/$2" 2>/dev/null
@@ -152,6 +209,8 @@ if curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
   echo "  Then stop it (or change web_port in config.py) and run again."
   exit 1
 fi
+
+ensure_python
 
 echo "starting web app on :8000 (log: $APP_LOG, production WSGI)..."
 : > "$APP_LOG"

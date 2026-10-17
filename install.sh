@@ -80,6 +80,11 @@ if [ "$PLATFORM" = "linux" ]; then
 
   if command -v python3 >/dev/null 2>&1 && [ "$(python3 -c 'import sys; print(sys.version_info >= (3,10))')" = "True" ]; then
     skip "python3 ($(python3 -V))"
+    if ! python3 -m venv --help >/dev/null 2>&1; then
+      case "$PKG" in
+        apt) MISSING_PKGS+=("python3-venv") ;;
+      esac
+    fi
   else
     case "$PKG" in
       apt)    MISSING_PKGS+=("python3" "python3-venv" "python3-dev") ;;
@@ -217,10 +222,13 @@ ${B}install complete.${N}
   terminals:       $MT5_DIR
                    $MT5_DIR2
   next steps:
-    1. ${B}python bridge.py${N}   - boots both terminals into the stored session (ALGO ON); logging into any account on any terminal is adopted live
-    2. ${B}python app.py${N}      - web terminal (dashboard, panel, broker probe)
-    3. ${B}python info.py${N}     - account info incl. spreads + best filling
-    4. ${B}python executor.py --status${N} - show scheduled trades + fired log
+    1. ${B}bash run.sh${N}   - starts EVERYTHING (web panel :8000 + both terminals)
+       ${D}(or: make run)${N}
+    2. ${B}python session.py${N} - store the account logins it should boot into
+       ${D}(skippable - you can also log in live from the web panel)${N}
+    3. ${B}python info.py${N}    - account info incl. spreads + best filling
+    4. ${B}python executor.py --status${N} - scheduled trades + fired log
 
-${D}run everything with the venv python:  ~/python312/bin/python ...${N}
+${D}Prefer the venv python for CLI tools:  ~/python312/bin/python ...  (run.sh${N}
+${D}creates or repairs it automatically.)${N}
 EOF

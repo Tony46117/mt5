@@ -8,7 +8,7 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${MT5_WEB_PORT:-8000}:8000"
     environment:
 
       - MT5_MACHINE_KEY=${MT5_MACHINE_KEY:-please-change-me}
@@ -16,6 +16,7 @@ services:
 
       - MT5_NO_LAUNCH_JITTER=${MT5_NO_LAUNCH_JITTER:-1}
       - MT5_TRADING_DAYS=${MT5_TRADING_DAYS:-0,1,2,3,4,5,6}
+      - MT5_CORS_ORIGIN=${MT5_CORS_ORIGIN:-}
 
       - DATABASE_URL=${MT5_DATABASE_URL:-}
     volumes:
