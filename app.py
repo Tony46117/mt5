@@ -282,13 +282,78 @@ def _factory_b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+# The factory page asks for a much denser lattice than factory.py's default
+# 0.63deg grid: ~200,000 dots.  Dot count scales as 1/step^2, so 5.3x
+# density is step/sqrt(5.3) (~0.274deg, ~200k dots measured).  The dense
+# lattice is expensive to rebuild with shapely (~2s), so it is cached as
+# raw little-endian arrays.
+FACTORY_DOT_MULT = 5.3
+
+
+def _factory_i16(vals) -> bytes:
+    """Scale degrees x100 into little-endian int16 (no numpy)."""
+    from array import array
+    a = array("h")
+    for v in vals:
+        a.append(max(-32768, min(32767, int(round(float(v) * 100.0)))))
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a.tobytes()
+
+
+def _factory_dense_dots(fx) -> tuple[bytes, bytes, bytes, int, str]:
+    """Build/load the 5.3x dot lattice (~200k dots) -> (lat, lon, ccy, n, source)."""
+    import math
+    import struct
+    base = float(getattr(fx, "DOT_STEP", 0.63))
+    step = base / math.sqrt(FACTORY_DOT_MULT)
+    cache = os.path.expanduser(
+        f"~/.cache/forex_globe_maps/dots_{FACTORY_DOT_MULT:g}x_{step:.4f}.bin")
+    try:
+        with open(cache, "rb") as f:
+            raw = f.read()
+        if raw[:8] == b"MT5FD6X1":
+            n = struct.unpack_from("<I", raw, 8)[0]
+            off = 12
+            lat = raw[off:off + 2 * n]
+            off += 2 * n
+            lon = raw[off:off + 2 * n]
+            off += 2 * n
+            ccy = raw[off:off + n]
+            off += n
+            if n > 0 and off == len(raw):
+                return lat, lon, ccy, n, \
+                    f"NaturalEarth 50m (cached {FACTORY_DOT_MULT:g}x)"
+    except OSError:
+        pass
+
+    dots, labels, source = fx.build_accurate_dots(step=step)
+    lat = _factory_i16(d[0] for d in dots)
+    lon = _factory_i16(d[1] for d in dots)
+    from array import array
+    ccy_arr = array("b")
+    for c in labels:
+        ccy_arr.append(fx.CCY_LIST.index(c) if c in fx.CCY_LIST else -1)
+    ccy = ccy_arr.tobytes()
+    n = len(dots)
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        tmp = cache + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(b"MT5FD6X1" + struct.pack("<I", n) + lat + lon + ccy)
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return lat, lon, ccy, n, f"{source} \u00b7 {FACTORY_DOT_MULT:g}x dots"
+
+
 def _factory_map_payload() -> dict:
     """Export factory.py's Natural Earth map as compact typed arrays.
 
     Int16 arrays are scaled x100 (0.01 deg resolution) and base64'd so
-    ~38k dots + borders stay a single ~400 KB response that the browser
-    caches.  Everything is derived from factory's own cached map files;
-    no downloads happen here after the first factory import.
+    the 5.3x land lattice (~200k dots) + borders ship as one ~1.4 MB response
+    that the browser caches.  Everything is derived from factory's own
+    cached map files; no downloads happen here after the first import.
     """
     global _factory_map_cache
     if _factory_map_cache is not None:
@@ -299,25 +364,9 @@ def _factory_map_payload() -> dict:
         from array import array
         import factory as fx
 
-        def _i16(vals) -> bytes:
-            """Scale degrees x100 into little-endian int16 (no numpy)."""
-            a = array("h")
-            for v in vals:
-                iv = int(round(float(v) * 100.0))
-                a.append(max(-32768, min(32767, iv)))
-            if sys.byteorder == "big":
-                a.byteswap()
-            return a.tobytes()
-
         fx._ensure_borders()
-        dots = list(getattr(fx, "LAND_DOTS", []))
-        labels = list(getattr(fx, "DOT_COUNTRY", []))
         ccy_list = list(fx.CCY_LIST)
-        lat = _i16([d[0] for d in dots])
-        lon = _i16([d[1] for d in dots])
-        ccy_arr = array("b")
-        for c in labels:
-            ccy_arr.append(ccy_list.index(c) if c in ccy_list else -1)
+        lat, lon, ccy, dot_count, dot_source = _factory_dense_dots(fx)
 
         borders = []
         for entry in getattr(fx, "BORDERS", []):
@@ -372,11 +421,11 @@ def _factory_map_payload() -> dict:
             "extra": extra,
             "dots": {"lat": _factory_b64(lat),
                      "lon": _factory_b64(lon),
-                     "ccy": _factory_b64(ccy_arr.tobytes())},
-            "dot_count": int(len(dots)),
+                     "ccy": _factory_b64(ccy)},
+            "dot_count": int(dot_count),
             "borders": borders,
             "countries": countries,
-            "source": str(getattr(fx, "MAP_SOURCE", "built-in")),
+            "source": dot_source,
             "generated": dt.datetime.now(dt.timezone.utc)
                             .isoformat(timespec="seconds"),
         }

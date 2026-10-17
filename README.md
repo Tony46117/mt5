@@ -227,7 +227,8 @@ paths and file ownership stay consistent.
   factory.py news globe and LED ticker in the browser. The ms/us clock and
   the dotted globe are painted locally every frame (no per-frame server
   round-trip, so rotation/hover stay smooth); `/api/factory/map` serves the
-  Natural Earth geometry once and `/api/factory/news` the cached feed.
+  Natural Earth geometry once at 5.3x factory.py's dot density (~200k dots)
+  and `/api/factory/news` the cached feed.
 - Scheduled trades are stored with an execution time and a close time.
   Those times are entered in the **machine-local clock** (the same clock
   shown in the panel top bar and the schedule dials) and stored as UTC -

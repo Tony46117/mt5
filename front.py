@@ -392,9 +392,7 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
   border-color:#a78bfa;box-shadow:0 0 22px rgba(167,139,250,.22);
   grid-column:span 2}
 .tbtn.stex:hover{filter:brightness(1.15);box-shadow:var(--glow-strong)}
-/* ---------- factory (scheduled trades sub-section) ---------- */
-.sb-item.sb-subitem{margin-left:22px;font-size:12px;border-left:1px solid var(--line2)}
-.sb-item.sb-subitem .ic{font-size:11px}
+/* ---------- factory (top-level page below Scheduled Trades) ---------- */
 .factory-grid{display:grid;grid-template-columns:minmax(0,1fr) 318px;
   gap:14px;align-items:start}
 .factory-grid>section{min-width:0}
@@ -491,7 +489,7 @@ function liveLink(sys){
  FAILS=0;                                 // a good response resets the streak
  const pill=$id('sysPill');
  if(pill){pill.className='status-pill'+(ok?'':' bad');
-  $id('sysLbl').textContent=ok?'LINK LIVE':
+  $id('sysLbl').textContent=ok?'':
    ((logout1||logout2)?'LOGIN DROPPED':'LINK DEGRADED')}
  const d=$id('sysdot');if(d)d.className=ok?'dot':'dot off';
  return ok}
@@ -739,7 +737,7 @@ DASHBOARD_TMPL = """<!doctype html>
     <a class="sb-item on" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">▣</span>Trading Panel</a>
     <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
-    <a class="sb-item sb-subitem" href="/factory"><span class="ic">◈</span>Factory</a>
+    <a class="sb-item" href="/factory"><span class="ic">◈</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
@@ -750,7 +748,7 @@ DASHBOARD_TMPL = """<!doctype html>
       </div>
       <div class="spacer"></div>
       <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
-        <span id="sysLbl">LINK</span></div>
+        <span id="sysLbl"></span></div>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
@@ -903,7 +901,7 @@ PANEL_TMPL = """<!doctype html>
     <a class="sb-item" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item on" href="/panel"><span class="ic">▣</span>Trading Panel</a>
     <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
-    <a class="sb-item sb-subitem" href="/factory"><span class="ic">◈</span>Factory</a>
+    <a class="sb-item" href="/factory"><span class="ic">◈</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
@@ -914,7 +912,7 @@ PANEL_TMPL = """<!doctype html>
       </div>
       <div class="spacer"></div>
       <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
-        <span id="sysLbl">LINK</span></div>
+        <span id="sysLbl"></span></div>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
@@ -1727,7 +1725,7 @@ SCHEDULED_TMPL = """<!doctype html>
     <a class="sb-item" href="/"><span class="ic">\u25c8</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">\u25a3</span>Trading Panel</a>
     <a class="sb-item on" href="/scheduled"><span class="ic">\u25c7</span>Scheduled Trades</a>
-    <a class="sb-item sb-subitem" href="/factory"><span class="ic">\u25c8</span>Factory</a>
+    <a class="sb-item" href="/factory"><span class="ic">\u25c8</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA \u00b7 v2</div>
   </aside>
   <main class="main">
@@ -1738,7 +1736,7 @@ SCHEDULED_TMPL = """<!doctype html>
       </div>
       <div class="spacer"></div>
       <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
-        <span id="sysLbl">LINK</span></div>
+        <span id="sysLbl"></span></div>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
@@ -1941,7 +1939,7 @@ def render_scheduled() -> str:
 
 
 # ---------------------------------------------------------------------------
-# FACTORY - forex news globe + LED ticker (scheduled-trades sub-section).
+# FACTORY - forex news globe + LED ticker (sits right below Scheduled Trades).
 # The tkinter/PIL HUD from factory.py is re-rendered in the browser: static
 # Natural Earth geometry comes from /api/factory/map once, the ForexFactory
 # feed from /api/factory/news, and every frame (clock + globe) is painted
@@ -1963,7 +1961,7 @@ FACTORY_TMPL = """<!doctype html>
     <a class="sb-item" href="/"><span class="ic">\u25c8</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">\u25a3</span>Trading Panel</a>
     <a class="sb-item" href="/scheduled"><span class="ic">\u25c7</span>Scheduled Trades</a>
-    <a class="sb-item sb-subitem on" href="/factory"><span class="ic">\u25c8</span>Factory</a>
+    <a class="sb-item on" href="/factory"><span class="ic">\u25c8</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA \u00b7 v2</div>
   </aside>
   <main class="main">
@@ -1974,7 +1972,7 @@ FACTORY_TMPL = """<!doctype html>
       </div>
       <div class="spacer"></div>
       <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
-        <span id="sysLbl">HUD</span></div>
+        <span id="sysLbl"></span></div>
       <div id="clock" class="mono"></div>
     </header>
     <div class="wrap">
@@ -2099,7 +2097,7 @@ async function loadMap(){
   $id('mapSrc').textContent=FMAP.source+' \u00b7 '+Math.round(FMAP.n/1000)+'k dots';
   $id('dotsN').textContent=FMAP.n.toLocaleString();
   const pill=$id('sysPill');if(pill)pill.className='status-pill';
-  $id('sysLbl').textContent='HUD LIVE';
+  $id('sysLbl').textContent='';
  }catch(e){
   $id('mapSrc').textContent='map unavailable: '+e.message;
   $id('hoverBanner').textContent='factory map unavailable - '+e.message;
@@ -2372,13 +2370,20 @@ function drawGlobe(ts){
   const immIdx=(NEXT&&NEXT.currency)?FMAP.ccyList.indexOf(NEXT.currency):-1;
   const alertCcy=new Uint8Array(FMAP.ccyList.length);
   for(const ix of ALERT_IDX)if(ix>=0&&ix<alertCcy.length)alertCcy[ix]=1;
-  /* Factory grows dots by depth (1px -> 2x2 -> 3x3), adds a size for
-     the hovered state / deep zoom, and blends the imminent currency
-     toward red.  Matching that keeps the dotted map and the border
-     mesh the same visual weight instead of looking like two layers. */
+  /* 5.3x-dense lattice (~200k dots): normal dots are a single device
+     pixel (2 device px once the render scale passes 1.2x), alerts/hover
+     get one extra pixel.  Colours come straight from the u32 palettes so
+     the inner loop stays tight enough at this density; the old per-dot
+     size/colour maths would be too slow. */
   const blink=0.75+0.25*Math.sin(performance.now()/1000*2);
   const immG=Math.round(120*blink+60),immB=immG;
-  const zoomBump=FC.zoom>=2.2?1:0;
+  const immPal=new Uint32Array(16);
+  for(let d=0;d<16;d++){
+   const t=d/15,r=RGB_A[d];
+   immPal[d]=col32(Math.round(r[0]+(255-r[0])*t),
+    Math.round(r[1]+(immG-r[1])*t),
+    Math.round(r[2]+(immB-r[2])*t))}
+  const psize=rdpr>=1.2?2:1;
   for(let i=0;i<n;i++){
    const sda=so[i]*cosl0-co[i]*sinl0;
    const cda=co[i]*cosl0+so[i]*sinl0;
@@ -2387,32 +2392,19 @@ function drawGlobe(ts){
    const x=cl[i]*sda;
    const y=cosp0*sl[i]-sinp0*cl[i]*cda;
    const px=((cx+x*R)*rdpr)|0,py=((cy-y*R)*rdpr)|0;
-   if(px<1||py<1||px>=imgW-1||py>=imgH-1)continue;
+   const ps=psize+(((ci[i]>=0)&&(alertCcy[ci[i]]===1||ci[i]===hi))?1:0);
+   if(px<1||py<1||px+ps>=imgW||py+ps>=imgH)continue;
    const d=Math.min(15,Math.max(0,((cc-0.03)/0.97*15.999)|0));
    const id=ci[i];
-   let rgb=RGB_N[d],isAlert=false,isHov=false;
+   let col=PAL_N[d];
    if(id>=0){
-    isAlert=alertCcy[id]===1;
-    isHov=(id===hi);
-    if(isAlert){
-     rgb=RGB_A[d];
-     if(id===immIdx){
-      const t=d/15;
-      rgb=[Math.round(rgb[0]+(255-rgb[0])*t),
-       Math.round(rgb[1]+(immG-rgb[1])*t),
-       Math.round(rgb[2]+(immB-rgb[2])*t)];
-      if(isHov)rgb=[Math.min(255,rgb[0]+60),
-       Math.min(255,rgb[1]+40),Math.min(255,rgb[2]+40)]}
-    }else if(isHov)rgb=RGB_H[d]}
-   let sz=isAlert?((d>=7)?3:2):((d>=7)?2:1);
-   if(isHov)sz++;
-   sz+=zoomBump;
-   sz=Math.max(1,Math.round(sz*rdpr));
-   if(px+sz>=imgW||py+sz>=imgH)continue;
-   const col=col32(rgb[0],rgb[1],rgb[2]);
-   for(let yy=0;yy<sz;yy++){
-    const row=(py+yy)*imgW+px;
-    for(let xx=0;xx<sz;xx++)u32[row+xx]=col}}}
+    if(alertCcy[id]===1)col=(id===immIdx)?immPal[d]:PAL_A[d];
+    else if(id===hi)col=PAL_H[d]}
+   const o=py*imgW+px;
+   u32[o]=col;
+   if(ps>1){u32[o+1]=col;u32[o+imgW]=col;u32[o+imgW+1]=col;
+    if(ps>2){u32[o+2]=col;u32[o+imgW+2]=col;
+     u32[o+2*imgW]=col;u32[o+2*imgW+1]=col;u32[o+2*imgW+2]=col}}}}
  ctx.putImageData(GIMG,0,0);
  ctx.setTransform(rdpr,0,0,rdpr,0,0);
  /* graticule */
