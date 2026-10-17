@@ -392,6 +392,53 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
   border-color:#a78bfa;box-shadow:0 0 22px rgba(167,139,250,.22);
   grid-column:span 2}
 .tbtn.stex:hover{filter:brightness(1.15);box-shadow:var(--glow-strong)}
+/* ---------- factory (scheduled trades sub-section) ---------- */
+.sb-item.sb-subitem{margin-left:22px;font-size:12px;border-left:1px solid var(--line2)}
+.sb-item.sb-subitem .ic{font-size:11px}
+.factory-grid{display:grid;grid-template-columns:minmax(0,1fr) 318px;
+  gap:14px;align-items:start}
+.factory-grid>section{min-width:0}
+@media(max-width:1180px){.factory-grid{grid-template-columns:1fr}}
+.clockbox{position:relative;height:206px;background:#000;
+  border-bottom:1px solid var(--line);overflow:hidden}
+.clockbox canvas{display:block;width:100%;height:100%}
+.globebox{position:relative;height:min(62vh,620px);min-height:360px;
+  background:#000;overflow:hidden;touch-action:none}
+.globebox canvas{display:block;width:100%;height:100%;cursor:grab}
+.globebox.dragging canvas{cursor:grabbing}
+.fhover{position:absolute;top:10px;left:50%;transform:translateX(-50%);
+  max-width:92%;padding:5px 12px;background:rgba(5,15,35,.9);
+  border:1px solid var(--line3);color:#9ec5ff;font-size:11px;
+  letter-spacing:.6px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;pointer-events:none;z-index:2}
+.fhover.hit{border-color:var(--blue)}
+.fcoord{position:absolute;bottom:8px;left:12px;color:#9ec5ff;
+  font-family:ui-monospace,Consolas,monospace;font-size:10px;
+  pointer-events:none;z-index:2}
+.fhud{position:absolute;right:10px;top:10px;text-align:right;
+  color:var(--dim);font-family:ui-monospace,Consolas,monospace;
+  font-size:10px;line-height:1.55;pointer-events:none;z-index:2}
+.fhud b{color:var(--blue);font-weight:600}
+.fnext{font-family:ui-monospace,Consolas,monospace;font-size:30px;
+  font-weight:700;color:#fff;letter-spacing:1px;margin:2px 0 4px;
+  text-shadow:0 0 18px rgba(77,166,255,.35)}
+.fnext.live{color:#ffb4b4;text-shadow:0 0 18px rgba(255,92,92,.45)}
+.falert{font-size:11px;line-height:1.75;color:#ffb3b3;
+  font-family:ui-monospace,Consolas,monospace}
+.falert .mut{color:var(--dim)}
+.fctrl{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.fctrl .btn{padding:5px 10px;font-size:10px}
+.fctrl .btn.on{border-color:var(--blue);color:var(--blue);
+  background:var(--blue3);box-shadow:var(--glow)}
+.fhoverpanel{font-size:12px;color:#9ec5ff;line-height:1.6}
+.fhoverpanel .iso{color:var(--dim);font-size:10px;letter-spacing:1px}
+.flog td{font-size:11.5px}
+.frow-live td{background:rgba(61,0,0,.35)}
+.frow-live td:first-child{color:#fff;font-weight:700}
+.fsrc{font-size:10px;color:var(--dim);letter-spacing:.5px}
+.fpulse{display:inline-block;width:7px;height:7px;background:var(--blue);
+  box-shadow:0 0 8px var(--blue);margin-right:6px;vertical-align:middle;
+  animation:pulse 2.4s infinite}
 """
 
 COMMON_JS = """
@@ -692,6 +739,7 @@ DASHBOARD_TMPL = """<!doctype html>
     <a class="sb-item on" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">▣</span>Trading Panel</a>
     <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
+    <a class="sb-item sb-subitem" href="/factory"><span class="ic">◈</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
@@ -855,6 +903,7 @@ PANEL_TMPL = """<!doctype html>
     <a class="sb-item" href="/"><span class="ic">◈</span>Dashboard</a>
     <a class="sb-item on" href="/panel"><span class="ic">▣</span>Trading Panel</a>
     <a class="sb-item" href="/scheduled"><span class="ic">◇</span>Scheduled Trades</a>
+    <a class="sb-item sb-subitem" href="/factory"><span class="ic">◈</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA · v2</div>
   </aside>
   <main class="main">
@@ -1678,6 +1727,7 @@ SCHEDULED_TMPL = """<!doctype html>
     <a class="sb-item" href="/"><span class="ic">\u25c8</span>Dashboard</a>
     <a class="sb-item" href="/panel"><span class="ic">\u25a3</span>Trading Panel</a>
     <a class="sb-item on" href="/scheduled"><span class="ic">\u25c7</span>Scheduled Trades</a>
+    <a class="sb-item sb-subitem" href="/factory"><span class="ic">\u25c8</span>Factory</a>
     <div class="sb-foot">SPOTDUMP EA \u00b7 v2</div>
   </aside>
   <main class="main">
@@ -1888,3 +1938,756 @@ refresh();setInterval(refresh,2000);
 
 def render_scheduled() -> str:
     return render_template_string(SCHEDULED_TMPL, css=CSS, js=SCHEDULED_JS)
+
+
+# ---------------------------------------------------------------------------
+# FACTORY - forex news globe + LED ticker (scheduled-trades sub-section).
+# The tkinter/PIL HUD from factory.py is re-rendered in the browser: static
+# Natural Earth geometry comes from /api/factory/map once, the ForexFactory
+# feed from /api/factory/news, and every frame (clock + globe) is painted
+# locally on a canvas with requestAnimationFrame.  No per-frame round-trip,
+# so the clock keeps sub-millisecond resolution and the globe stays smooth
+# even when the network stalls ("enhanced latency" = local render loop).
+# ---------------------------------------------------------------------------
+FACTORY_TMPL = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MT5 TERMINAL - FACTORY</title>
+<style>{{ css|safe }}</style></head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sb-brand"><div class="logo"></div>MT5<b>//</b>TERM</div>
+    <div class="sb-sub">trading terminal</div>
+    <div class="sb-section">Workspace</div>
+    <a class="sb-item" href="/"><span class="ic">\u25c8</span>Dashboard</a>
+    <a class="sb-item" href="/panel"><span class="ic">\u25a3</span>Trading Panel</a>
+    <a class="sb-item" href="/scheduled"><span class="ic">\u25c7</span>Scheduled Trades</a>
+    <a class="sb-item sb-subitem on" href="/factory"><span class="ic">\u25c8</span>Factory</a>
+    <div class="sb-foot">SPOTDUMP EA \u00b7 v2</div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="page-title">FACTORY</div>
+        <div class="page-sub">forex news globe \u00b7 LED ticker \u00b7 local canvas render \u00b7 live ms/us</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="status-pill" id="sysPill"><span class="dot" id="sysdot"></span>
+        <span id="sysLbl">HUD</span></div>
+      <div id="clock" class="mono"></div>
+    </header>
+    <div class="wrap">
+      <div class="factory-grid">
+        <section class="panel">
+          <div class="sect"><h4>LED Ticker</h4>
+            <div class="right"><span class="fsrc" id="clockTz">LOCAL</span></div></div>
+          <div class="clockbox"><canvas id="clockCv"></canvas></div>
+          <div class="sect"><h4>News Globe</h4>
+            <div class="right"><span class="fsrc" id="mapSrc">loading map\u2026</span></div></div>
+          <div class="globebox" id="globeBox">
+            <canvas id="globeCv"></canvas>
+            <div class="fhover" id="hoverBanner">\u2014 hover globe \u2014</div>
+            <div class="fcoord" id="hoverCoord"></div>
+            <div class="fhud"><div><b id="fps">0</b> fps</div>
+              <div><b id="lat">0</b> ms frame</div>
+              <div><b id="dotsN">0</b> dots</div>
+              <div id="zoomLbl">x1.00</div></div>
+          </div>
+          <div class="sect"><h4>News Log</h4>
+            <div class="right"><span class="fsrc" id="newsSrc">loading feed\u2026</span>
+              <button class="btn mini" onclick="refreshNews(true)">REFRESH</button></div></div>
+          <div class="tblwrap" id="newsTbl"><div class="empty">loading\u2026</div></div>
+        </section>
+        <section class="panel">
+          <div class="sect"><h4>Next Release</h4></div>
+          <div class="body">
+            <div class="fnext" id="nextCd">--:--:--</div>
+            <div id="nextInfo" class="mut" style="font-size:11px">waiting for feed\u2026</div>
+          </div>
+          <div class="sect"><h4>States On Alert</h4></div>
+          <div class="body falert" id="alertBox">\u2014</div>
+          <div class="sect"><h4>Controls</h4></div>
+          <div class="body">
+            <div class="fctrl">
+              <button class="btn" id="tzBtn" onclick="toggleTz()">UTC</button>
+              <button class="btn" id="h12Btn" onclick="toggle12h()">12H</button>
+              <button class="btn on" id="autoBtn" onclick="toggleAuto()">PAUSE</button>
+              <button class="btn on" id="highBtn" onclick="toggleHigh()">HIGH ONLY</button>
+            </div>
+            <div class="fctrl">
+              <button class="btn" onclick="zoomBy(1.25)">Z+</button>
+              <button class="btn" onclick="zoomBy(0.8)">Z-</button>
+              <button class="btn" onclick="zoomReset()">1:1</button>
+            </div>
+            <div class="fsrc" style="margin-top:8px">drag = spin \u00b7 wheel = zoom \u00b7 double-click = 1:1</div>
+          </div>
+          <div class="sect"><h4>Hover</h4></div>
+          <div class="body fhoverpanel" id="hoverPanel">\u2014 hover globe \u2014</div>
+          <div class="sect"><h4>Feed</h4></div>
+          <div class="body"><div class="fsrc" id="feedMeta">\u2014</div></div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script>{{ js|safe }}</script>
+</body></html>"""
+
+FACTORY_JS = COMMON_JS + """
+/* ================= factory HUD: local, low-latency canvas render ========= */
+const FC = {lon0:-40, lat0:22, zoom:1, auto:true, utc:false, use12h:false,
+ highOnly:true, lastDrag:0, lastGlobe:0, dragging:false, dragX:0, dragY:0,
+ hoverLatLon:null, hoverIso:null, hoverCcy:null, hoverName:null,
+ fps:0, latMs:0, lastHud:0};
+let FMAP=null, FEV=[], FSRC='loading', FAGE=null, FLOADING=false, FERR='';
+let ALERTS={}, NEXT=null, ALERT_IDX=new Set(), ALERT_ISO=new Set();
+let GIMG=null, CAM={sinLat0:0,cosLat0:1,lon0:0};
+const DEG=Math.PI/180;
+const RGB_N=[], RGB_A=[], RGB_H=[];
+const SEG7={0:'abcdef',1:'bc',2:'abged',3:'abgcd',4:'fgbc',5:'afgcd',
+ 6:'afgedc',7:'abc',8:'abcdefg',9:'abcfgd','-':'g',' ':'',':':''};
+
+function col32(r,g,b){return ((255<<24)|(b<<16)|(g<<8)|r)>>>0}
+function buildPal(out,a,b){
+ for(let i=0;i<16;i++){
+  const t=i/15;
+  out.push([Math.round(a[0]+(b[0]-a[0])*t),
+   Math.round(a[1]+(b[1]-a[1])*t),Math.round(a[2]+(b[2]-a[2])*t)])}}
+buildPal(RGB_N,[40,40,40],[178,178,178]);
+buildPal(RGB_A,[122,58,58],[255,154,154]);
+buildPal(RGB_H,[50,90,160],[170,205,255]);
+const PAL_N=RGB_N.map(function(c){return col32(c[0],c[1],c[2])});
+const PAL_A=RGB_A.map(function(c){return col32(c[0],c[1],c[2])});
+const PAL_H=RGB_H.map(function(c){return col32(c[0],c[1],c[2])});
+
+function pad2(n){return String(n).padStart(2,'0')}
+function pad3(n){return String(n).padStart(3,'0')}
+function b64buf(s){
+ const bin=atob(s),u=new Uint8Array(bin.length);
+ for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);
+ return u.buffer}
+
+/* ---------- map payload once; trig precomputed for every dot ---------- */
+function decodeMap(j){
+ const lat=new Int16Array(b64buf(j.dots.lat));
+ const lon=new Int16Array(b64buf(j.dots.lon));
+ const ccy=new Int8Array(b64buf(j.dots.ccy));
+ const n=lat.length;
+ const sinLat=new Float32Array(n),cosLat=new Float32Array(n);
+ const sinLon=new Float32Array(n),cosLon=new Float32Array(n);
+ for(let i=0;i<n;i++){
+  const la=lat[i]/100*DEG,lo=lon[i]/100*DEG;
+  sinLat[i]=Math.sin(la);cosLat[i]=Math.cos(la);
+  sinLon[i]=Math.sin(lo);cosLon[i]=Math.cos(lo)}
+ const rings={},byIso={};
+ const borders=j.borders.map(function(b){
+  const a=new Int16Array(b64buf(b.p));
+  (rings[b.i]=rings[b.i]||[]).push(a);
+  return {i:b.i,a:a}});
+ for(const c of j.countries)byIso[c.i]=c;
+ return {lat:lat,lon:lon,ccy:ccy,sinLat:sinLat,cosLat:cosLat,
+  sinLon:sinLon,cosLon:cosLon,n:n,borders:borders,rings:rings,
+  byIso:byIso,ccyList:j.ccy,iso2ccy:j.iso2ccy,centers:j.centers,
+  extra:j.extra,countries:j.countries,source:j.source}};
+
+async function loadMap(){
+ try{
+  const j=await api('/api/factory/map');
+  FMAP=decodeMap(j);
+  $id('mapSrc').textContent=FMAP.source+' \u00b7 '+Math.round(FMAP.n/1000)+'k dots';
+  $id('dotsN').textContent=FMAP.n.toLocaleString();
+  const pill=$id('sysPill');if(pill)pill.className='status-pill';
+  $id('sysLbl').textContent='HUD LIVE';
+ }catch(e){
+  $id('mapSrc').textContent='map unavailable: '+e.message;
+  $id('hoverBanner').textContent='factory map unavailable - '+e.message;
+  const pill=$id('sysPill');if(pill)pill.className='status-pill bad';
+  $id('sysLbl').textContent='HUD OFFLINE';}}
+
+/* ---------- news + alert windows (same math as factory.py) ---------- */
+function minsTo(iso){return (new Date(iso).getTime()-Date.now())/60000}
+function alertsNow(){
+ const al={};
+ for(const e of FEV){
+  if(FC.highOnly && e.impact!=='High')continue;
+  const m=minsTo(e.dt);
+  if(m>=-30 && m<=48*60){
+   const a=al[e.currency]||(al[e.currency]={count:0,next_min:1e18,events:[]});
+   a.count++;a.next_min=Math.min(a.next_min,m);a.events.push(e)}}
+ for(const c in al)al[c].events.sort(function(a,b){
+  return new Date(a.dt)-new Date(b.dt)});
+ return al}
+function nextEvent(){
+ let best=null;
+ for(const e of FEV){
+  if(FC.highOnly && e.impact!=='High')continue;
+  if(minsTo(e.dt)>=-5 && (!best || new Date(e.dt)<new Date(best.dt)))best=e}
+ return best}
+function recomputeAlerts(){
+ ALERTS=alertsNow();NEXT=nextEvent();
+ ALERT_IDX=new Set();ALERT_ISO=new Set();
+ if(!FMAP)return;
+ for(const c in ALERTS){
+  const i=FMAP.ccyList.indexOf(c);
+  if(i>=0)ALERT_IDX.add(i)}
+ for(const iso in FMAP.iso2ccy){
+  if(ALERTS[FMAP.iso2ccy[iso]])ALERT_ISO.add(iso)}}
+function fmtCountdown(m){
+ if(m>=-5 && m<=5)return 'LIVE';
+ if(m<0){const x=Math.round(-m);
+  return x<60?x+'m ago':Math.floor(x/60)+'h '+(x%60)+'m ago'}
+ const s=Math.max(0,m*60);
+ const hh=Math.floor(s/3600),mm=Math.floor(s%3600/60),ss=Math.floor(s%60);
+ if(hh)return 'in '+hh+'h '+pad2(mm)+'m';
+ return 'in '+mm+'m '+pad2(ss)+'s'}
+
+async function refreshNews(force){
+ if(force)$id('newsSrc').textContent='refreshing\u2026';
+ try{
+  const j=await api('/api/factory/news'+(force?'?force=1':''));
+  FEV=j.events||[];FSRC=j.source||'feed';FAGE=j.age_s;
+  FLOADING=!!j.loading;FERR=j.error||'';
+  recomputeAlerts();renderNewsMeta();renderLog();
+ }catch(e){FERR=e.message;renderNewsMeta()}}
+function renderNewsMeta(){
+ const bits=[];
+ if(FLOADING)bits.push('fetching\u2026');
+ bits.push(FSRC||'feed');
+ if(FAGE!==null && FAGE!==undefined)bits.push('updated '+Math.round(FAGE)+'s ago');
+ if(FERR)bits.push('ERR '+FERR);
+ const txt=bits.join(' \u00b7 ');
+ const el=$id('newsSrc');if(el){el.textContent=txt;el.title=txt}
+ const fm=$id('feedMeta');
+ if(fm)fm.textContent=(FEV.length?FEV.length+' events known':'no events')+' \u00b7 '+txt}
+
+/* ---------- 7-segment LED clock (same geometry as factory.SevenSeg) ------ */
+function hpoly(x,y,L,T){const h=T/2;
+ return [[x+h,y],[x+L-h,y],[x+L,y+h],[x+L-h,y+T],[x+h,y+T],[x,y+h]]}
+function vpoly(x,y,L,T){const h=T/2;
+ return [[x+h,y],[x+T,y+h],[x+T,y+L-h],[x+h,y+L],[x,y+L-h],[x,y+h]]}
+function polyPath(ctx,p){
+ ctx.beginPath();ctx.moveTo(p[0][0],p[0][1]);
+ for(let i=1;i<p.length;i++)ctx.lineTo(p[i][0],p[i][1]);
+ ctx.closePath()}
+function segDigit(ctx,x,y,w,h,ch){
+ const T=Math.max(3,w*0.24),pad=T*0.7,vlen=h/2-pad*1.2,H=w-2*pad;
+ const segs={a:hpoly(x+pad,y,H,T),
+  g:hpoly(x+pad,y+h/2-T/2,H,T),
+  d:hpoly(x+pad,y+h-T,H,T),
+  f:vpoly(x,y+pad,vlen,T),b:vpoly(x+w-T,y+pad,vlen,T),
+  e:vpoly(x,y+h/2+pad*0.2,vlen,T),
+  c:vpoly(x+w-T,y+h/2+pad*0.2,vlen,T)};
+ const on=SEG7[ch]||'';
+ for(const k in segs){
+  polyPath(ctx,segs[k]);
+  if(on.indexOf(k)>=0){
+   ctx.save();ctx.fillStyle='#ffffff';ctx.shadowColor='#b4b4b4';
+   ctx.shadowBlur=9;ctx.fill();ctx.restore();
+  }else{ctx.fillStyle='#1c1c1c';ctx.fill()}}
+ return w+T*0.55}
+function segNumber(ctx,x,y,w,h,text,blink,subsec){
+ let cx=x;
+ for(const ch of String(text)){
+  if(ch===':'){cx+=segColon(ctx,cx,y,w*0.5,h,!blink||(subsec%1000)<600)}
+  else cx+=segDigit(ctx,cx,y,w,h,ch)}
+ return cx-x}
+function segColon(ctx,x,y,w,h,on){
+ const T=Math.max(3,w*0.24);
+ for(const cy of [y+h*0.30,y+h*0.66]){
+  ctx.fillStyle=on?'#ffffff':'#1c1c1c';
+  ctx.fillRect(x,cy,T,T)}
+ return T+w*0.3}
+function tzName(d){
+ try{
+  const p=new Intl.DateTimeFormat('en-GB',{timeZoneName:'short'})
+   .formatToParts(d);
+  for(const x of p)if(x.type==='timeZoneName')return x.value
+ }catch(e){}
+ return 'LOCAL'}
+function drawClock(){
+ const cv=$id('clockCv');if(!cv)return;
+ const W=cv.clientWidth||1000,H=cv.clientHeight||206;
+ if(!W||!H)return;
+ const dpr=Math.min(window.devicePixelRatio||1,2);
+ if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){
+  cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr)}
+ const ctx=cv.getContext('2d');
+ ctx.setTransform(1,0,0,1,0,0);
+ ctx.clearRect(0,0,cv.width,cv.height);
+ ctx.fillStyle='#000000';ctx.fillRect(0,0,cv.width,cv.height);
+ const sc=Math.min(W/1000,H/206);
+ ctx.setTransform(dpr*sc,0,0,dpr*sc,
+  (W-1000*sc)*dpr/2,(H-206*sc)*dpr/2);
+ ctx.strokeStyle='#070707';ctx.lineWidth=1;
+ for(let gx=0;gx<1000;gx+=44){ctx.beginPath();
+  ctx.moveTo(gx,0);ctx.lineTo(gx,206);ctx.stroke()}
+ const t=performance.timeOrigin+performance.now();
+ const d=new Date(t);
+ const ms=Math.floor(t)%1000,us=Math.floor(t*1000)%1000;
+ const utc=FC.utc;
+ let hr=utc?d.getUTCHours():d.getHours();
+ const mi=utc?d.getUTCMinutes():d.getMinutes();
+ const se=utc?d.getUTCSeconds():d.getSeconds();
+ let ampm='';
+ if(FC.use12h){ampm=hr<12?' AM':' PM';hr=hr%12||12}
+ const hrTxt=(!FC.use12h||hr>=10)?pad2(hr):' '+hr;
+ const x0=26,y0=12,bw=60,bh=104;
+ let x=x0;
+ x+=segNumber(ctx,x,y0,bw,bh,hrTxt,false,ms);
+ x+=8;
+ x+=segColon(ctx,x,y0,bw*0.5,bh,(ms<600));
+ x+=8;
+ x+=segNumber(ctx,x,y0,bw,bh,pad2(mi),false,ms);
+ const sx=x+2*(bw+16)+22;
+ segNumber(ctx,sx,y0+6,27,46,pad2(se),false,ms);
+ ctx.textAlign='left';ctx.textBaseline='alphabetic';
+ ctx.fillStyle='#ffffff';ctx.font='bold 13px "Courier New",monospace';
+ ctx.fillText(pad3(ms)+' '+pad3(us),sx+4,y0+64);
+ ctx.fillStyle='#8f8f8f';ctx.font='bold 9px "Courier New",monospace';
+ ctx.fillText('MS   US',sx+4,y0+86);
+ if(ampm){ctx.fillStyle='#ffffff';ctx.font='bold 26px "Courier New",monospace';
+  ctx.textAlign='right';ctx.fillText(ampm,1000-30,34)}
+ else{ctx.fillStyle='#8f8f8f';ctx.font='bold 12px "Courier New",monospace';
+  ctx.textAlign='right';ctx.fillText('HR  MN',1000-30,34)}
+ const months=['JANUARY','FEBRUARY','MARCH','APRIL','MAY','JUNE','JULY',
+  'AUGUST','SEPTEMBER','OCTOBER','NOVEMBER','DECEMBER'];
+ const wdays=['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+ const day=utc?d.getUTCDate():d.getDate();
+ const mon=utc?d.getUTCMonth():d.getMonth();
+ const year=utc?d.getUTCFullYear():d.getFullYear();
+ const wd=wdays[utc?d.getUTCDay():d.getDay()];
+ const tzn=utc?'UTC':tzName(d);
+ ctx.textAlign='left';ctx.fillStyle='#ffffff';
+ ctx.font='bold 17px "Courier New",monospace';
+ ctx.fillText(months[mon]+' '+pad2(day)+' '+year+'   '+wd+'   '+tzn,30,148);
+ ctx.fillStyle='#8f8f8f';ctx.font='bold 10px "Courier New",monospace';
+ ctx.fillText('HR : MN : SC : MS : US',30,176)}
+
+/* ---------- globe ---------- */
+let PX=0,PY=0,PC=0;
+function proj(lat,lon){
+ const la=lat*DEG,dlo=lon*DEG-CAM.lon0;
+ const sla=Math.sin(la),cla=Math.cos(la);
+ const cdl=Math.cos(dlo),sdl=Math.sin(dlo);
+ PC=CAM.sinLat0*sla+CAM.cosLat0*cla*cdl;
+ PX=cla*sdl;PY=CAM.cosLat0*sla-CAM.sinLat0*cla*cdl;
+ return PC}
+function ringHit(a,lon,lat){
+ /* points are interleaved [lat, lon] in hundredths of a degree */
+ let inside=false;
+ const n=a.length;
+ for(let i=0,j=n-2;i<n;j=i,i+=2){
+  const lati=a[i]/100,loni=a[i+1]/100;
+  const latj=a[j]/100,lonj=a[j+1]/100;
+  if(((lati>lat)!==(latj>lat)) &&
+     (lon<(lonj-loni)*(lat-lati)/((latj-lati)||1e-12)+loni))inside=!inside}
+ return inside}
+function countryAt(lat,lon){
+ let best=null,bestArea=1e18;
+ if(!FMAP)return null;
+ for(const c of FMAP.countries){
+  const b=c.b;
+  if(lon<b[0]-0.4||lon>b[2]+0.4||lat<b[1]-0.4||lat>b[3]+0.4)continue;
+  const rings=FMAP.rings[c.i];
+  if(!rings)continue;
+  let hit=false;
+  for(const a of rings)if(ringHit(a,lon,lat))hit=!hit;
+  if(hit){
+   const ar=Math.max(0.05,b[2]-b[0])*Math.max(0.05,b[3]-b[1]);
+   if(ar<bestArea){bestArea=ar;best=c}}}
+ if(best)return best;
+ let nd=0.8,nc=null;
+ for(const c of FMAP.countries){
+  const dx=(c.c[0]-lon)*Math.cos(lat*DEG),dy=c.c[1]-lat;
+  const dd=Math.sqrt(dx*dx+dy*dy);
+  if(dd<nd){nd=dd;nc=c}}
+ return nc}
+function angDist(lat1,lon1,lat2,lon2){
+ const s1=Math.sin(lat1*DEG),s2=Math.sin(lat2*DEG);
+ const c1=Math.cos(lat1*DEG),c2=Math.cos(lat2*DEG);
+ const c=Math.max(-1,Math.min(1,s1*s2+c1*c2*Math.cos((lon1-lon2)*DEG)));
+ return Math.acos(c)/DEG}
+function ccyAt(lat,lon){
+ if(!FMAP)return null;
+ let best=null,bd=1e18;
+ for(const c in FMAP.centers){
+  const v=FMAP.centers[c],dd=angDist(lat,lon,v[0],v[1]);
+  if(dd<=v[2]&&dd<bd){best=c;bd=dd}}
+ for(const c in FMAP.extra){
+  for(const v of FMAP.extra[c]){
+   const dd=angDist(lat,lon,v[0],v[1]);
+   if(dd<=v[2]&&dd<bd){best=c;bd=dd}}}
+ return best}
+
+function drawGlobe(ts){
+ const cv=$id('globeCv');if(!cv)return;
+ const W=cv.clientWidth,H=cv.clientHeight;
+ if(!W||!H)return;
+ const dpr=Math.min(window.devicePixelRatio||1,2);
+ /* Globe raster is capped at 1.25x: a 2x full-canvas ImageData fill +
+    putImageData costs ~37 ms/frame, which made the globe stutter.  The
+    clock still renders at the full dpr; the dotted globe is soft only
+    at the sub-pixel level and stays 60 fps. */
+ const rdpr=Math.min(dpr,1.25);
+ if(cv.width!==Math.round(W*rdpr)||cv.height!==Math.round(H*rdpr)){
+  cv.width=Math.round(W*rdpr);cv.height=Math.round(H*rdpr);GIMG=null}
+ const ctx=cv.getContext('2d');
+ const S=Math.min(W,H),R=(S/2-26)*FC.zoom;
+ const cx=W/2,cy=H/2;
+ const dtG=Math.min(0.15,(ts-(FC.lastGlobe||ts))/1000);
+ FC.lastGlobe=ts;
+ if(FC.auto && ts-FC.lastDrag>3000)FC.lon0=(FC.lon0+6.1*dtG)%360;
+ CAM.sinLat0=Math.sin(FC.lat0*DEG);CAM.cosLat0=Math.cos(FC.lat0*DEG);
+ CAM.lon0=FC.lon0*DEG;
+ const imgW=cv.width,imgH=cv.height;
+ if(!GIMG||GIMG.width!==imgW||GIMG.height!==imgH)
+  GIMG=ctx.createImageData(imgW,imgH);
+ const u32=new Uint32Array(GIMG.data.buffer);
+ u32.fill(0xff000000);
+ /* Grid belongs to the globe's square, not the full wide canvas:
+    painting it edge-to-edge made the circular globe look like a
+    separate overlay floating on a rectangular map.  factory.py draws
+    its grid on the square SxS render surface, so match that. */
+ const gsq=Math.round(S*rdpr);
+ const gx0=Math.round((imgW-gsq)/2), gy0=Math.round((imgH-gsq)/2);
+ const gx1=gx0+gsq, gy1=gy0+gsq;
+ const gstep=Math.max(4,Math.round(40*rdpr));
+ for(let gx=gx0;gx<=gx1;gx+=gstep){
+  for(let y=gy0;y<gy1;y++)u32[y*imgW+gx]=0xff0b0b0b}
+ for(let gy=gy0;gy<=gy1;gy+=gstep){
+  const o=gy*imgW;
+  for(let x=gx0;x<gx1;x++)u32[o+x]=0xff0b0b0b}
+ if(FMAP && FMAP.n){
+  /* Camera basis: sda/cda rotate by LON0, cc/x/y tilt by LAT0.
+     Using sin/cos(lat0) for the longitude terms (the old bug) put the
+     dotted map on a different angle than the border mesh and hover. */
+  const sinp0=CAM.sinLat0,cosp0=CAM.cosLat0;
+  const sinl0=Math.sin(CAM.lon0),cosl0=Math.cos(CAM.lon0);
+  const sl=FMAP.sinLat,cl=FMAP.cosLat;
+  const so=FMAP.sinLon,co=FMAP.cosLon,ci=FMAP.ccy,n=FMAP.n;
+  const hoverIdx=(FC.hoverCcy?FMAP.ccyList.indexOf(FC.hoverCcy):-1);
+  const hi=(hoverIdx===undefined)?-1:hoverIdx;
+  const immIdx=(NEXT&&NEXT.currency)?FMAP.ccyList.indexOf(NEXT.currency):-1;
+  const alertCcy=new Uint8Array(FMAP.ccyList.length);
+  for(const ix of ALERT_IDX)if(ix>=0&&ix<alertCcy.length)alertCcy[ix]=1;
+  /* Factory grows dots by depth (1px -> 2x2 -> 3x3), adds a size for
+     the hovered state / deep zoom, and blends the imminent currency
+     toward red.  Matching that keeps the dotted map and the border
+     mesh the same visual weight instead of looking like two layers. */
+  const blink=0.75+0.25*Math.sin(performance.now()/1000*2);
+  const immG=Math.round(120*blink+60),immB=immG;
+  const zoomBump=FC.zoom>=2.2?1:0;
+  for(let i=0;i<n;i++){
+   const sda=so[i]*cosl0-co[i]*sinl0;
+   const cda=co[i]*cosl0+so[i]*sinl0;
+   const cc=sinp0*sl[i]+cosp0*cl[i]*cda;
+   if(cc<=0.03)continue;
+   const x=cl[i]*sda;
+   const y=cosp0*sl[i]-sinp0*cl[i]*cda;
+   const px=((cx+x*R)*rdpr)|0,py=((cy-y*R)*rdpr)|0;
+   if(px<1||py<1||px>=imgW-1||py>=imgH-1)continue;
+   const d=Math.min(15,Math.max(0,((cc-0.03)/0.97*15.999)|0));
+   const id=ci[i];
+   let rgb=RGB_N[d],isAlert=false,isHov=false;
+   if(id>=0){
+    isAlert=alertCcy[id]===1;
+    isHov=(id===hi);
+    if(isAlert){
+     rgb=RGB_A[d];
+     if(id===immIdx){
+      const t=d/15;
+      rgb=[Math.round(rgb[0]+(255-rgb[0])*t),
+       Math.round(rgb[1]+(immG-rgb[1])*t),
+       Math.round(rgb[2]+(immB-rgb[2])*t)];
+      if(isHov)rgb=[Math.min(255,rgb[0]+60),
+       Math.min(255,rgb[1]+40),Math.min(255,rgb[2]+40)]}
+    }else if(isHov)rgb=RGB_H[d]}
+   let sz=isAlert?((d>=7)?3:2):((d>=7)?2:1);
+   if(isHov)sz++;
+   sz+=zoomBump;
+   sz=Math.max(1,Math.round(sz*rdpr));
+   if(px+sz>=imgW||py+sz>=imgH)continue;
+   const col=col32(rgb[0],rgb[1],rgb[2]);
+   for(let yy=0;yy<sz;yy++){
+    const row=(py+yy)*imgW+px;
+    for(let xx=0;xx<sz;xx++)u32[row+xx]=col}}}
+ ctx.putImageData(GIMG,0,0);
+ ctx.setTransform(rdpr,0,0,rdpr,0,0);
+ /* graticule */
+ const grat=new Path2D();
+ for(let lat=-60;lat<=60;lat+=30){
+  let pen=false;
+  for(let k=0;k<=96;k++){
+   const c=proj(lat,-180+k*3.75);
+   if(c>0.02){const px=cx+PX*R,py=cy-PY*R;
+    if(!pen){grat.moveTo(px,py);pen=true}else grat.lineTo(px,py)}
+   else pen=false}}
+ for(let lon=-180;lon<180;lon+=30){
+  let pen=false;
+  for(let k=0;k<=96;k++){
+   const c=proj(-90+k*1.875,lon);
+   if(c>0.02){const px=cx+PX*R,py=cy-PY*R;
+    if(!pen){grat.moveTo(px,py);pen=true}else grat.lineTo(px,py)}
+   else pen=false}}
+ ctx.strokeStyle='#2e2e2e';ctx.lineWidth=1;ctx.stroke(grat);
+ /* Natural Earth borders, batched by colour */
+ if(FMAP){
+  const paths={base:new Path2D(),alert:new Path2D(),hover:new Path2D()};
+  const hiIso=FC.hoverIso;
+  for(const b of FMAP.borders){
+   let key='base';
+   if(b.i&&b.i===hiIso)key='hover';
+   else if(ALERT_ISO.has(b.i))key='alert';
+   const p=paths[key],a=b.a;
+   let pen=false;
+   for(let k=0;k<a.length;k+=2){
+    const c=proj(a[k]/100,a[k+1]/100);
+    if(c>0.02){const px=cx+PX*R,py=cy-PY*R;
+     if(!pen){p.moveTo(px,py);pen=true}else p.lineTo(px,py)}
+    else pen=false}}
+  ctx.lineWidth=1;
+  ctx.strokeStyle='#696969';ctx.stroke(paths.base);
+  ctx.strokeStyle='#d28282';ctx.stroke(paths.alert);
+  ctx.strokeStyle='#93c5fd';ctx.stroke(paths.hover)}
+ ctx.strokeStyle='#5a5a5a';ctx.lineWidth=1;
+ ctx.beginPath();ctx.arc(cx,cy,R,0,Math.PI*2);ctx.stroke();
+ /* alert spikes + cross-links (same geometry as factory.py) */
+ const imm=NEXT?NEXT.currency:null;
+ for(const cur in ALERTS){
+  if(!FMAP)break;
+  const cc=FMAP.centers[cur];if(!cc)continue;
+  if(proj(cc[0],cc[1])<=0.05)continue;
+  const x=cx+PX*R,y=cy-PY*R;
+  const dx=x-cx,dy=y-cy,n=Math.hypot(dx,dy)||1;
+  const ux=dx/n,uy=dy/n;
+  const L=Math.min(64,12+7*ALERTS[cur].count);
+  const isNext=cur===imm;
+  ctx.strokeStyle=isNext?'#ff2a2a':'#ffa726';
+  ctx.lineWidth=isNext?3:2;
+  ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+ux*L,y+uy*L);ctx.stroke();
+  ctx.fillStyle=ctx.strokeStyle;
+  const tip=isNext?3:2;
+  ctx.beginPath();ctx.arc(x+ux*L,y+uy*L,tip,0,Math.PI*2);ctx.fill()}
+ if(FMAP){
+  const tops=[];
+  for(const c in ALERTS)if(FMAP.centers[c])tops.push(c);
+  if(tops.length>4)tops.length=4;
+  for(let i=0;i<tops.length;i++)for(let j=i+1;j<tops.length;j++){
+   const a=FMAP.centers[tops[i]],b=FMAP.centers[tops[j]];
+   const dlo=((b[1]-a[1]+540)%360)-180;
+   const pts=[];
+   for(let k=0;k<=32;k++){
+    const t=k/32;
+    const la=a[0]+(b[0]-a[0])*t+Math.sin(t*Math.PI)*12;
+    const lo=a[1]+dlo*t;
+    const c=proj(la,lo);
+    pts.push({x:cx+PX*R,y:cy-PY*R,v:c})}
+   ctx.strokeStyle='#787878';ctx.lineWidth=1;ctx.beginPath();
+   for(let k=0;k<pts.length-1;k+=2){
+    if(pts[k].v>0.05&&pts[k+1].v>0.05){
+     ctx.moveTo(pts[k].x,pts[k].y);ctx.lineTo(pts[k+1].x,pts[k+1].y)}}
+   ctx.stroke()}}
+ /* hover ring + crosshair */
+ if(FMAP&&FC.hoverCcy&&FMAP.centers[FC.hoverCcy]){
+  const cc=FMAP.centers[FC.hoverCcy];
+  if(proj(cc[0],cc[1])>0.03){
+   const rr=14+2*Math.sin(performance.now()/1000*2);
+   ctx.strokeStyle='#93c5fd';ctx.lineWidth=2;
+   ctx.beginPath();ctx.arc(cx+PX*R,cy-PY*R,rr,0,Math.PI*2);ctx.stroke();
+   ctx.fillStyle='#93c5fd';
+   ctx.beginPath();ctx.arc(cx+PX*R,cy-PY*R,3,0,Math.PI*2);ctx.fill()}}
+ if(FC.hoverLatLon&&proj(FC.hoverLatLon[0],FC.hoverLatLon[1])>0){
+  const hx=cx+PX*R,hy=cy-PY*R;
+  ctx.strokeStyle='#93c5fd';ctx.lineWidth=1;ctx.beginPath();
+  ctx.moveTo(hx-8,hy);ctx.lineTo(hx+8,hy);
+  ctx.moveTo(hx,hy-8);ctx.lineTo(hx,hy+8);ctx.stroke()}}
+
+/* ---------- hover / interaction ---------- */
+function pointerGeo(e){
+ const cv=$id('globeCv'),r=cv.getBoundingClientRect();
+ const S=Math.min(r.width,r.height),R=(S/2-26)*FC.zoom;
+ if(!R)return null;
+ const x=(e.clientX-r.left-r.width/2)/R;
+ const y=(r.height/2-(e.clientY-r.top))/R;
+ const rho=Math.hypot(x,y);
+ if(rho>1)return null;
+ const lat0=FC.lat0*DEG,lon0=FC.lon0*DEG;
+ let lat,lon;
+ if(rho<1e-9){lat=lat0;lon=lon0}
+ else{
+  const c=Math.asin(Math.min(1,rho));
+  lat=Math.asin(Math.cos(c)*Math.sin(lat0)+
+   (y*Math.sin(c)*Math.cos(lat0))/rho);
+  lon=lon0+Math.atan2(x*Math.sin(c),
+   rho*Math.cos(c)*Math.cos(lat0)-y*Math.sin(c)*Math.sin(lat0))}
+ let dLat=lat/DEG,dLon=lon/DEG;
+ while(dLon<-180)dLon+=360;
+ while(dLon>180)dLon-=360;
+ return [dLat,dLon]}
+function setHover(lat,lon){
+ FC.hoverLatLon=[lat,lon];
+ const c=countryAt(lat,lon);
+ const cur=ccyAt(lat,lon);
+ FC.hoverIso=c?c.i:null;
+ FC.hoverName=c?c.n:null;
+ FC.hoverCcy=cur||(c&&FMAP.iso2ccy[c.i])||null;
+ let banner='\u25cb '+lat.toFixed(1)+', '+lon.toFixed(1);
+ let panel='<div class="iso">POINT</div>'+
+  '<div>'+lat.toFixed(2)+', '+lon.toFixed(2)+'</div>';
+ if(c){
+  const iso=c.i?' ('+c.i+')':'';
+  const tag=FC.hoverCcy?'\u25b6 '+FC.hoverCcy+' ':'\u25cf ';
+  banner=tag+c.n.toUpperCase()+iso;
+  panel='<div class="iso">COUNTRY</div><div style="color:#fff;font-weight:600">'+
+   esc(c.n)+iso+'</div>';
+  if(FC.hoverCcy)panel+='<div class="iso" style="margin-top:6px">STATE</div>'+
+   '<div style="color:#9ec5ff">'+esc(FC.hoverCcy)+'</div>';
+  panel+='<div class="iso" style="margin-top:6px">COORD</div><div>'+
+   lat.toFixed(2)+', '+lon.toFixed(2)+'</div>'}
+ else panel+='<div class="iso" style="margin-top:6px">OCEAN / NO STATE</div>';
+ $id('hoverBanner').textContent=banner;
+ $id('hoverBanner').className='fhover'+(c?' hit':'');
+ $id('hoverPanel').innerHTML=panel;
+ $id('hoverCoord').textContent='LON '+lon.toFixed(1)+'  LAT '+lat.toFixed(1)}
+function clearHover(){
+ FC.hoverLatLon=null;FC.hoverIso=null;FC.hoverCcy=null;FC.hoverName=null;
+ $id('hoverBanner').textContent='\u2014 hover globe \u2014';
+ $id('hoverBanner').className='fhover';
+ $id('hoverPanel').textContent='\u2014 hover globe \u2014';
+ $id('hoverCoord').textContent=''}
+function initGlobe(){
+ const cv=$id('globeCv'),box=$id('globeBox');
+ if(!cv)return;
+ cv.addEventListener('pointerdown',function(e){
+  FC.dragging=true;FC.dragX=e.clientX;FC.dragY=e.clientY;
+  FC.lastDrag=performance.now();box.classList.add('dragging');
+  try{cv.setPointerCapture(e.pointerId)}catch(err){}});
+ cv.addEventListener('pointermove',function(e){
+  if(FC.dragging){
+   const dx=e.clientX-FC.dragX,dy=e.clientY-FC.dragY;
+   FC.dragX=e.clientX;FC.dragY=e.clientY;
+   FC.lon0=(FC.lon0-dx*0.45)%360;
+   FC.lat0=Math.max(-60,Math.min(60,FC.lat0+dy*0.3));
+   FC.lastDrag=performance.now()}
+  const g=pointerGeo(e);
+  if(g)setHover(g[0],g[1]);else clearHover()});
+ function endDrag(e){
+  FC.dragging=false;FC.lastDrag=performance.now();
+  box.classList.remove('dragging');
+  try{cv.releasePointerCapture(e.pointerId)}catch(err){}}
+ cv.addEventListener('pointerup',endDrag);
+ cv.addEventListener('pointercancel',endDrag);
+ cv.addEventListener('pointerleave',function(){
+  if(!FC.dragging)clearHover()});
+ cv.addEventListener('wheel',function(e){
+  e.preventDefault();zoomBy(e.deltaY>0?0.9:1.1)},{passive:false});
+ cv.addEventListener('dblclick',zoomReset)}
+function zoomBy(f){FC.zoom=Math.max(0.5,Math.min(5,FC.zoom*f));
+ $id('zoomLbl').textContent='x'+FC.zoom.toFixed(2)}
+function zoomReset(){FC.zoom=1;$id('zoomLbl').textContent='x1.00'}
+function toggleTz(){FC.utc=!FC.utc;
+ const b=$id('tzBtn');b.textContent=FC.utc?'LOCAL':'UTC';
+ b.className='btn'+(FC.utc?' on':'');
+ $id('clockTz').textContent=FC.utc?'UTC':'LOCAL';
+ renderLog()}
+function toggle12h(){FC.use12h=!FC.use12h;
+ const b=$id('h12Btn');b.textContent=FC.use12h?'24H':'12H';
+ b.className='btn'+(FC.use12h?' on':'')}
+function toggleAuto(){FC.auto=!FC.auto;FC.lastDrag=performance.now();
+ const b=$id('autoBtn');b.textContent=FC.auto?'PAUSE':'RESUME';
+ b.className='btn'+(FC.auto?' on':'')}
+function toggleHigh(){FC.highOnly=!FC.highOnly;
+ const b=$id('highBtn');b.textContent=FC.highOnly?'HIGH ONLY':'ALL IMPACTS';
+ b.className='btn'+(FC.highOnly?' on':'');
+ recomputeAlerts();renderAlerts();renderLog()}
+
+/* ---------- side panel + log ---------- */
+function renderNext(){
+ const el=$id('nextCd'),info=$id('nextInfo');
+ if(!NEXT){el.textContent='--:--:--';el.className='fnext';
+  info.textContent='no events in the 48 h window';return}
+ const m=minsTo(NEXT.dt),s=Math.max(0,Math.floor(m*60));
+ const hh=Math.floor(s/3600),mm=Math.floor(s%3600/60),ss=s%60;
+ el.textContent=hh+':'+pad2(mm)+':'+pad2(ss);
+ el.className='fnext'+((m>=-5&&m<=5)?' live':'');
+ info.innerHTML='<b>'+esc(NEXT.currency)+'</b> \u00b7 '+esc(NEXT.title)+
+  '<br><span class="'+(m>=-5&&m<=5?'down':'mut')+'">'+fmtCountdown(m)+
+  '</span> \u00b7 fcast '+esc(NEXT.forecast)+' \u00b7 prev '+esc(NEXT.previous)+
+  '<br><span class="mut">'+fmtEventTime(NEXT.dt)+'</span>'}
+function renderAlerts(){
+ const el=$id('alertBox');if(!el)return;
+ const keys=[];
+ for(const c in ALERTS)if(FMAP&&FMAP.centers[c])keys.push(c);
+ keys.sort(function(a,b){return ALERTS[a].next_min-ALERTS[b].next_min});
+ if(!keys.length){el.innerHTML='<span class="mut">no high-impact states in the next 48 h</span>';return}
+ el.innerHTML=keys.map(function(c){
+  const a=ALERTS[c],nm=(FMAP.centers[c]&&FMAP.centers[c][3])||c;
+  return '<div><b>'+esc(c)+'</b> '+esc(nm)+
+   ' <span class="mut">'+a.count+' event'+(a.count>1?'s':'')+' \u00b7 '+
+   fmtCountdown(a.next_min)+'</span></div>'}).join('')}
+function fmtEventTime(iso){
+ const d=new Date(iso);
+ if(isNaN(d.getTime()))return String(iso||'');
+ if(FC.utc)return pad2(d.getUTCHours())+':'+pad2(d.getUTCMinutes())+' UTC';
+ return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}
+function fmtEventDate(iso){
+ const d=new Date(iso);
+ if(isNaN(d.getTime()))return '';
+ if(FC.utc)return pad2(d.getUTCDate())+'/'+pad2(d.getUTCMonth()+1);
+ return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'})}
+function renderLog(){
+ const el=$id('newsTbl');if(!el)return;
+ const rows=[];
+ for(const e of FEV){
+  if(FC.highOnly&&e.impact!=='High')continue;
+  const m=minsTo(e.dt);
+  if(m>=-120&&m<=7*24*60)rows.push({m:m,e:e})}
+ rows.sort(function(a,b){return a.m-b.m});
+ if(rows.length>60)rows.length=60;
+ if(!rows.length){el.innerHTML='<div class="empty">no events in window \u00b7 press REFRESH</div>';return}
+ el.innerHTML='<table class="flog"><tr><th>in</th><th>time</th><th>cur</th>'+
+  '<th>event</th><th>fcast</th><th>prev</th></tr>'+
+  rows.map(function(r){
+   const e=r.e,live=(r.m>=-5&&r.m<=5);
+   return '<tr'+(live?' class="frow-live"':'')+'><td class="mono">'+
+    (live?'LIVE':fmtCountdown(r.m))+'</td><td class="mono mut">'+
+    fmtEventDate(e.dt)+' '+fmtEventTime(e.dt)+'</td><td class="mono">'+esc(e.currency)+
+    '</td><td>'+esc(e.title)+'</td><td class="mono mut">'+esc(e.forecast)+
+    '</td><td class="mono mut">'+esc(e.previous)+'</td></tr>'}).join('')+
+  '</table>'}
+
+/* ---------- frame loop ---------- */
+function updateHud(){
+ const f=$id('fps'),l=$id('lat');
+ if(f)f.textContent=Math.round(FC.fps);
+ if(l)l.textContent=FC.latMs.toFixed(1);
+ $id('zoomLbl').textContent='x'+FC.zoom.toFixed(2)}
+let LAST_TS=0;
+function frame(ts){
+ const t0=performance.now();
+ const dt=Math.max(1,ts-(LAST_TS||ts));
+ LAST_TS=ts;
+ drawClock();
+ if(ts-FC.lastGlobe>=33)drawGlobe(ts);
+ const cost=performance.now()-t0;
+ FC.latMs=FC.latMs?FC.latMs*0.88+cost*0.12:cost;
+ FC.fps=FC.fps?FC.fps*0.9+(1000/dt)*0.1:1000/dt;
+ if(ts-FC.lastHud>400){FC.lastHud=ts;updateHud()}
+ requestAnimationFrame(frame)}
+function fastTick(){
+ recomputeAlerts();renderNext();renderAlerts();
+ if(Math.floor(Date.now()/1000)%2===0)renderLog()}
+
+loadMap();
+initGlobe();
+refreshNews();
+setInterval(refreshNews,15000);
+setInterval(fastTick,500);
+requestAnimationFrame(frame);
+"""
+
+
+def render_factory() -> str:
+    return render_template_string(FACTORY_TMPL, css=CSS, js=FACTORY_JS)

@@ -95,6 +95,28 @@ def page_panel():
 def page_scheduled():
     return front.render_scheduled()
 
+@app.get("/factory")
+def page_factory():
+    return front.render_factory()
+
+@app.get("/api/factory/map")
+@rate_limit(max_requests=60, window=60)
+def api_factory_map():
+    try:
+        payload = _factory_map_payload()
+    except Exception as exc:
+        log.error(f"factory map unavailable: {exc}")
+        return _fail(f"factory map unavailable: {exc}", code=503)
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+@app.get("/api/factory/news")
+@rate_limit(max_requests=240, window=60)
+def api_factory_news():
+    snap = _factory_news_snapshot(force=request.args.get("force") == "1")
+    return jsonify({"ok": True, "now_ms": int(time.time() * 1000), **snap})
+
 @app.get("/health")
 def health():
     health = {
@@ -240,6 +262,178 @@ def _lot_check(account: int, broker_symbol: str, lot: float) -> str | None:
 
 def _fail(msg: str, code: int = 400):
     return jsonify({"ok": False, "error": msg}), code
+
+# ---------------- factory HUD (scheduled-trades sub-section) ----------------
+# factory.py draws its HUD with tkinter/PIL, which cannot run inside a
+# browser (and needs a display).  The web page renders the same HUD
+# client-side instead: the static map geometry is exported once here and
+# every frame (clock + globe rotation + hover) is drawn on a canvas with
+# requestAnimationFrame, so there is no per-frame server round-trip - that
+# is the low-latency path.  Only the slowly-changing news feed is polled.
+_factory_map_cache: dict | None = None
+_factory_map_lock = threading.Lock()
+_factory_state_lock = threading.Lock()
+_factory_news: dict = {"events": [], "source": "loading", "ts": 0.0,
+                       "last_try": 0.0, "busy": False, "error": ""}
+
+
+def _factory_b64(raw: bytes) -> str:
+    import base64
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _factory_map_payload() -> dict:
+    """Export factory.py's Natural Earth map as compact typed arrays.
+
+    Int16 arrays are scaled x100 (0.01 deg resolution) and base64'd so
+    ~38k dots + borders stay a single ~400 KB response that the browser
+    caches.  Everything is derived from factory's own cached map files;
+    no downloads happen here after the first factory import.
+    """
+    global _factory_map_cache
+    if _factory_map_cache is not None:
+        return _factory_map_cache
+    with _factory_map_lock:
+        if _factory_map_cache is not None:
+            return _factory_map_cache
+        from array import array
+        import factory as fx
+
+        def _i16(vals) -> bytes:
+            """Scale degrees x100 into little-endian int16 (no numpy)."""
+            a = array("h")
+            for v in vals:
+                iv = int(round(float(v) * 100.0))
+                a.append(max(-32768, min(32767, iv)))
+            if sys.byteorder == "big":
+                a.byteswap()
+            return a.tobytes()
+
+        fx._ensure_borders()
+        dots = list(getattr(fx, "LAND_DOTS", []))
+        labels = list(getattr(fx, "DOT_COUNTRY", []))
+        ccy_list = list(fx.CCY_LIST)
+        lat = _i16([d[0] for d in dots])
+        lon = _i16([d[1] for d in dots])
+        ccy_arr = array("b")
+        for c in labels:
+            ccy_arr.append(ccy_list.index(c) if c in ccy_list else -1)
+
+        borders = []
+        for entry in getattr(fx, "BORDERS", []):
+            try:
+                iso, bla, blo = entry[0], entry[1], entry[2]
+            except Exception:
+                continue
+            if len(bla) < 2 or len(bla) != len(blo):
+                continue
+            pts = array("h")
+            for la_v, lo_v in zip(bla, blo):
+                pts.append(max(-32768, min(32767, int(round(float(la_v) * 100.0)))))
+                pts.append(max(-32768, min(32767, int(round(float(lo_v) * 100.0)))))
+            if sys.byteorder == "big":
+                pts.byteswap()
+            borders.append({"i": str(iso),
+                            "p": _factory_b64(pts.tobytes())})
+
+        countries = []
+        for iso, name, geom, bounds in getattr(fx, "FULL_GEO", []):
+            try:
+                p = geom.representative_point()
+                clon, clat = float(p.x), float(p.y)
+            except Exception:
+                clon = (float(bounds[0]) + float(bounds[2])) / 2.0
+                clat = (float(bounds[1]) + float(bounds[3])) / 2.0
+            countries.append({
+                "i": str(iso), "n": str(name),
+                "b": [round(float(bounds[0]), 3), round(float(bounds[1]), 3),
+                      round(float(bounds[2]), 3), round(float(bounds[3]), 3)],
+                "c": [round(clon, 3), round(clat, 3)],
+            })
+
+        centers = {}
+        for cur, v in getattr(fx, "COUNTRIES", {}).items():
+            try:
+                centers[str(cur)] = [float(v[0]), float(v[1]), float(v[2]),
+                                     str(v[3])]
+            except Exception:
+                continue
+        extra = {}
+        for cur, pts in getattr(fx, "EXTRA_CENTERS", {}).items():
+            extra[str(cur)] = [[float(a), float(b), float(r)]
+                               for a, b, r in pts]
+
+        _factory_map_cache = {
+            "ok": True,
+            "ccy": ccy_list,
+            "iso2ccy": {str(k): str(v)
+                        for k, v in getattr(fx, "ISO_TO_CCY", {}).items()},
+            "centers": centers,
+            "extra": extra,
+            "dots": {"lat": _factory_b64(lat),
+                     "lon": _factory_b64(lon),
+                     "ccy": _factory_b64(ccy_arr.tobytes())},
+            "dot_count": int(len(dots)),
+            "borders": borders,
+            "countries": countries,
+            "source": str(getattr(fx, "MAP_SOURCE", "built-in")),
+            "generated": dt.datetime.now(dt.timezone.utc)
+                            .isoformat(timespec="seconds"),
+        }
+        return _factory_map_cache
+
+
+def _factory_news_worker() -> None:
+    rows: list[dict] = []
+    source = "unavailable"
+    err = ""
+    try:
+        import factory as fx
+        events, source = fx.fetch_ff_events(timeout=6.0)
+        for e in events[:800]:
+            d = e["dt"]
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=dt.timezone.utc)
+            rows.append({
+                "dt": d.astimezone(dt.timezone.utc).isoformat(),
+                "currency": str(e.get("currency", "?")),
+                "impact": str(e.get("impact", "")),
+                "title": str(e.get("title", "")),
+                "forecast": str(e.get("forecast", "-")),
+                "previous": str(e.get("previous", "-")),
+            })
+    except Exception as exc:
+        err = str(exc)
+    with _factory_state_lock:
+        if rows:
+            _factory_news["events"] = rows
+            _factory_news["source"] = source
+            _factory_news["error"] = ""
+        else:
+            _factory_news["error"] = err or "feed returned no events"
+        _factory_news["ts"] = time.time()
+        _factory_news["busy"] = False
+
+
+def _factory_news_snapshot(force: bool = False) -> dict:
+    """Return the cached feed immediately; refresh in the background.
+
+    A ForexFactory fetch can take >10 s on a bad network, so it must never
+    block a request (the page polls this every few seconds).
+    """
+    now = time.time()
+    with _factory_state_lock:
+        c = _factory_news
+        stale = (not c["events"]) or (now - c["ts"] > 300.0)
+        if not c["busy"] and (force or stale) and (now - c["last_try"] > 5.0):
+            c["busy"] = True
+            c["last_try"] = now
+            threading.Thread(target=_factory_news_worker, daemon=True,
+                             name="factory-news").start()
+        return {"events": list(c["events"]), "source": c["source"],
+                "age_s": (round(max(0.0, now - c["ts"]), 1)
+                          if c["ts"] else None),
+                "loading": c["busy"], "error": c["error"]}
 
 # ---------------- account integration engine ----------------
 

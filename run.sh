@@ -54,6 +54,14 @@ kill_ours() {
   pkill -"$1" -u "$(id -u)" -f "$HERE/$2" 2>/dev/null
 }
 
+# factory.py may have been started by hand from this directory ("python3
+# factory.py"), so its argv is not the absolute $HERE path.  Match both
+# the absolute and relative forms without catching unrelated *factory.py
+# names such as notfactory.py.
+kill_factory() {
+  pkill -"$1" -u "$(id -u)" -f "(^|[ /])factory\\.py([ ]|$)" 2>/dev/null
+}
+
 stop_terminals() {
   "$PY" - <<'EOF' 2>/dev/null
 try:
@@ -89,9 +97,10 @@ EOF
 }
 
 if [ "${1:-}" = "stop" ]; then
-  echo "stopping bridge / app / terminals..."
+  echo "stopping bridge / app / factory / terminals..."
   kill_ours TERM bridge.py
   kill_ours TERM app.py
+  kill_factory TERM
   stop_terminals
   echo "all stopped."
   exit 0
@@ -105,9 +114,11 @@ cleanup() {
   echo "shutting down..."
   [ -n "${APP_PID:-}" ]    && kill "$APP_PID"    2>/dev/null
   [ -n "${BRIDGE_PID:-}" ] && kill "$BRIDGE_PID" 2>/dev/null
+  kill_factory TERM
   sleep 1
   [ -n "${APP_PID:-}" ]    && kill -9 "$APP_PID"    2>/dev/null
   [ -n "${BRIDGE_PID:-}" ] && kill -9 "$BRIDGE_PID" 2>/dev/null
+  kill_factory KILL
   if [ "${MT5_RUN_KEEP_TERMINALS:-0}" != "1" ]; then
     stop_terminals
   else
@@ -120,6 +131,7 @@ trap 'cleanup; exit 143' TERM
 
 kill_ours TERM bridge.py
 kill_ours TERM app.py
+kill_factory TERM
 stop_terminals
 purge_exec_files
 sleep 1
@@ -162,7 +174,8 @@ else
 fi
 
 echo "starting bridge supervisor - boots both MT5 terminals into the stored"
-echo "accounts (ALGO ON, one EURUSD chart each).  Ctrl+C stops EVERYTHING."
+echo "accounts (ALGO ON, one EURUSD chart each).  Ctrl+C stops EVERYTHING,"
+echo "including a hand-started factory.py."
 "$PY" -u "$HERE/bridge.py" &
 BRIDGE_PID=$!
 

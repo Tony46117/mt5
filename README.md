@@ -223,6 +223,11 @@ paths and file ownership stay consistent.
 
 - Web panel: `http://127.0.0.1:8000` - buy/sell buttons, schedules,
   account overview.
+- Factory HUD: `/factory` (under **Scheduled Trades**) renders the
+  factory.py news globe and LED ticker in the browser. The ms/us clock and
+  the dotted globe are painted locally every frame (no per-frame server
+  round-trip, so rotation/hover stay smooth); `/api/factory/map` serves the
+  Natural Earth geometry once and `/api/factory/news` the cached feed.
 - Scheduled trades are stored with an execution time and a close time.
   Those times are entered in the **machine-local clock** (the same clock
   shown in the panel top bar and the schedule dials) and stored as UTC -
