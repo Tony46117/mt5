@@ -1077,7 +1077,7 @@ function buildPanel(n){
    '<button class="btn order-mini" onclick="asmrPop(this);stexJump('+n+')">STOPEXE ↓</button></div>'+
   '</div>'+
   '<div class="sect"><h4>StopExe · straddle stops</h4>'+
-   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1 pip</b></span></div></div>'+
+   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1.6 pips</b></span></div></div>'+
   '<div class="body" id="stexbody'+n+'">'+
    '<div class="fgroup"><label>Search pair · broker feed</label>'+
     '<div class="symsearch"><input type="text" id="stexsearch'+n+'" placeholder="type XAU, EUR, GBP... (live quotes only)" autocomplete="off" oninput="stexFilter('+n+')"></div>'+
@@ -1086,9 +1086,9 @@ function buildPanel(n){
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
    '<div class="stex-bracket">'+
-    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1 pip</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
+    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.6 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
      '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 2 pips</div></div>'+
-    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1 pip</div><div class="v sell" id="stexsell'+n+'">-</div>'+
+    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.6 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
      '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 2 pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
@@ -1098,7 +1098,8 @@ function buildPanel(n){
      '<button type="button" onclick="stexStepLot('+n+',0.01)">+</button></div></div>'+
     '<div class="fgroup" style="grid-column:span 2"><label>Bracket</label>'+
      '<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
-      '<option value="1" selected>±1 pip (2 total)</option>'+
+      '<option value="1.6" selected>±1.6 pips (3.2 total)</option>'+
+      '<option value="1">±1 pip (2 total)</option>'+
       '<option value="2">±2 pips (4 total)</option>'+
       '<option value="5">±5 pips (10 total)</option></select></div>'+
    '</div>'+
@@ -1228,7 +1229,7 @@ function stexFilter(n){
    '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
   box.classList.add('open')}
 function stexPips(n){const el=$id('stexpips'+n);
-  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:1}
+  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:1.6}
 function stexJump(n){const b=$id('stexbody'+n);
   if(b)b.scrollIntoView({behavior:'smooth',block:'start'});
   const inp=$id('stexsearch'+n);if(inp)inp.focus({preventScroll:true})}
