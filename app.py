@@ -123,6 +123,9 @@ def health():
         "status": "healthy",
         "timestamp": dt.datetime.now().isoformat(),
         "version": "2.0.0",
+        # which process answers here - CI's smoke check uses this to prove it
+        # is talking to the app it started and not a leftover server
+        "pid": os.getpid(),
         "components": {}
     }
 

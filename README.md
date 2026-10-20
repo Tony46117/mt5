@@ -370,9 +370,34 @@ from an explicit panel click or a schedule.
   `session.json`, `trades.db*`; Docker: `make wipe` (deletes the
   `mt5-data` volume and everything in it).
 
+## CI / CD
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+- **render** installs `requirements.txt`, byte-compiles every module, then
+  boots `app.py` the way `run.sh` does (waitress, throwaway
+  `MT5_MACHINE_KEY`) and requires `/`, `/panel`, `/scheduled`, `/factory`
+  and `/api/{dashboard,panel,spots,accounts}` to render. The panel must
+  also carry the current StopExe bracket and its button. The same check
+  runs locally: `python3 ci_smoke.py --port 8010`.
+- **publish** (main only, after `render`) builds the Dockerfile and
+  pushes `ghcr.io/<owner>/<repo>:latest` plus a short-sha tag, so the
+  image that ships is the commit that passed the render checks.
+
+No Wine, MT5 or broker feed is needed for the checks - health reports
+`degraded` off-box and that is accepted. The check refuses to run when
+its port is already served by another process, so it can never pass
+against a stale instance.
+
+```bash
+docker pull ghcr.io/tony46117/mt5:latest   # GHCR names are lowercase
+docker run --rm -p 8000:8000 -e MT5_MACHINE_KEY=... ghcr.io/tony46117/mt5:latest
+```
+
 ## Repository scope
 
 Runtime code only. Credentials (`acc.env`, `session.json`, `.env`),
-databases, logs and probe/CI tooling are intentionally kept out of version
-control; `.env.example` and `acc.env.example` are tracked so a fresh clone
-knows exactly what to copy.
+databases and run logs are intentionally kept out of version control;
+`.env.example` and `acc.env.example` are tracked so a fresh clone knows
+exactly what to copy. The CI pipeline itself (`.github/workflows/ci.yml`
+and `ci_smoke.py`) is versioned with the code it checks.
