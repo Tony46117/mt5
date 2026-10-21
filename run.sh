@@ -116,7 +116,7 @@ kill_ours() {
 # the absolute and relative forms without catching unrelated *factory.py
 # names such as notfactory.py.
 kill_factory() {
-  pkill -"$1" -u "$(id -u)" -f "(^|[ /])factory\\.py([ ]|$)" 2>/dev/null
+  pkill -"$1" -u "$(id -u)" -f "factory\.py" 2>/dev/null
 }
 
 stop_terminals() {
@@ -185,6 +185,7 @@ cleanup() {
 }
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 0' EXIT
 
 kill_ours TERM bridge.py
 kill_ours TERM app.py
