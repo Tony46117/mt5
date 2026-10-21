@@ -1182,8 +1182,8 @@ PANEL_TMPL = """<!doctype html>
     <div class="news-quote" id="newsQuote"></div>
     <div class="news-plans" id="newsPlans"></div>
     <div class="news-foot">
-      <button class="tbtn news-trade" id="newsTradeBtn" onclick="newsTrade()">TRADE</button>
       <button class="tbtn news-decline" onclick="newsDecline()">DECLINE</button>
+      <button class="tbtn news-trade" id="newsTradeBtn" onclick="newsTrade()">TRADE</button>
     </div>
   </section>
 </div>
@@ -1719,7 +1719,7 @@ refresh();setInterval(refresh,600);
    through close.py's fast path 5 s after the release - a 10 s window. */
 let NW={open:false,acc:1,idx:0,high:true,closer:false,events:[],map:{},
         pending:{},quotes:{},sel:{symbol:'',lot:0.01,orders:1},plans:[],
-        busy:false,timer:null,plansTs:0,key:'',retry:null};
+        busy:false,timer:null,plansTs:0,key:'',retry:null,eventCloser:false};
 function newsEvent(){return NW.events[NW.idx]||null}
 function newsKey(e){return String(e.dt_ms)+'|'+String(e.title)}
 async function openNews(n){
@@ -1743,12 +1743,12 @@ function newsToggleHigh(){
   if(c)c.className='chip filter'+(NW.high?' on':'');
   newsLoad(true)
 }
-function newsToggleCloser(){NW.closer=!NW.closer;newsPaintCloser();newsPaintQuote()}
+function newsToggleCloser(){NW.eventCloser=!NW.eventCloser;newsPaintCloser();newsPaintQuote()}
 function newsPaintCloser(){
   const b=$id('newsCloserBtn');
-  if(b){b.className='news-closer'+(NW.closer?' on':'');
-    b.setAttribute('aria-pressed',NW.closer?'true':'false')}
-  const l=$id('newsCloserLbl');if(l)l.textContent=NW.closer?'ON':'OFF'
+  if(b){b.className='news-closer'+(NW.eventCloser?' on':'');
+    b.setAttribute('aria-pressed',NW.eventCloser?'true':'false')}
+  const l=$id('newsCloserLbl');if(l)l.textContent=NW.eventCloser?'ON':'OFF'
 }
 async function newsLoad(force){
   try{
@@ -1777,6 +1777,7 @@ async function newsLoad(force){
 function newsSlide(d){
   if(!NW.events.length)return;
   NW.idx=(NW.idx+d+NW.events.length)%NW.events.length;
+  NW.eventCloser=false; // closer OFF when sliding to a new event
   newsPaint()
 }
 function newsPaint(){
@@ -1818,12 +1819,14 @@ function newsPaintMap(){
   const e=newsEvent(),box=$id('newsMap');
   if(!e||!box)return;
   const m=NW.map[e.currency];
-  box.innerHTML='<span class="ccy">'+esc(e.currency||'--')+'</span>'+
+  const ccy=e.currency||'--';
+  const name=m&&m.name?m.name:countryName(ccy)||'';
+  box.innerHTML='<span class="ccy">'+esc(ccy)+'</span>'+
    (m&&m.d
     ? '<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">'+
       '<path d="'+m.d+'" fill="#14304d" stroke="#4da6ff" stroke-width="0.8" '+
       'stroke-linejoin="round"/></svg>'
-    : '<span class="none">'+(m?('no map for '+esc(e.currency||'-')):'drawing map...')+'</span>');
+    : '<span class="none">'+(m?('no map for '+esc(ccy)):'drawing map...')+'</span>');
   if(!m&&!NW.pending[e.currency]){
     NW.pending[e.currency]=true;
     api('/api/news/map?ccy='+encodeURIComponent(e.currency)).then(function(j){
@@ -1832,6 +1835,20 @@ function newsPaintMap(){
       if(cur&&cur.currency===e.currency)newsPaintMap()
     }).catch(function(){NW.pending[e.currency]=false})
   }
+  const lab=$id('newsMapLabel');if(lab)lab.remove();
+  if(!m)return;
+  const s=document.createElement('span');
+  s.id='newsMapLabel';
+  s.style.position='absolute';
+  s.style.right='4px';s.style.top='4px';
+  s.style.fontSize='10px';s.style.background='#14304d';s.style.color='#4da6ff';
+  s.style.padding='2px 4px';s.style.borderRadius='3px';
+  s.style.zIndex='10';s.textContent=name||'';
+  box.parentNode.appendChild(s)
+}
+function countryName(ccy){
+  const e=newsEvent();if(!e)return '';
+  const c=(e.country||'').trim();return c?c:''
 }
 function newsTick(){
   const now=$id('newsNow');
@@ -1918,7 +1935,7 @@ function newsPaintQuote(){
     '<span class="chip">STOPS <b>'+(NW.sel.orders*2)+'</b></span>'+
     '<span class="chip">BRACKET <b>±1.0 pips</b></span>'+
     '<span class="chip">SL <b>1.2 pips</b></span>'+
-    '<span class="chip">CLOSER <b>'+(NW.closer?'T+5s':'off')+'</b></span>'+
+    '<span class="chip">CLOSER <b>'+(NW.eventCloser?'T+5s':'off')+'</b></span>'+
     '<span class="mut" style="font-size:10px">'+esc(NW.qsrc||'')+'</span>'
 }
 async function newsTrade(){
@@ -1933,7 +1950,7 @@ async function newsTrade(){
   try{
     const j=await post('/api/news/plan',{account:NW.acc,symbol:NW.sel.symbol,
       lot:parseFloat(NW.sel.lot),orders:parseInt(NW.sel.orders,10),
-      closer:!!NW.closer,event:{dt:e.dt,dt_ms:e.dt_ms,currency:e.currency,
+      closer:!!NW.eventCloser,event:{dt:e.dt,dt_ms:e.dt_ms,currency:e.currency,
       impact:e.impact,title:e.title,forecast:e.forecast,previous:e.previous,
       country:e.country}});
     toast(j.detail||'news bracket armed',true);
@@ -2255,6 +2272,14 @@ const FIRED_PREVIEW = 20;  // show only last 20 by default
 /* next_fire is stored UTC; show the operator their own wall clock */
 function localFire(iso){try{return new Date(iso).toLocaleTimeString('en-GB')+
  ' \u00b7 '+new Date(iso).toLocaleDateString('en-GB')}catch(e){return String(iso||'')}}
+let NEWS_PLANS=[];
+/* News plans load in the background: the schedule table must paint even
+   when /api/news/plans is slow (a blocking await here left the section on
+   "loading..." forever). */
+function loadNewsPlans(){
+ api('/api/news/plans').then(function(j){
+  NEWS_PLANS=j.plans||[];renderSched()
+ }).catch(function(){})}
 /* fired log = past 24 h only (the server also prunes old rows) */
 function fresh24(rows){const cut=Date.now()-86400000;
  return (rows||[]).filter(r=>{try{return new Date(r.at).getTime()>=cut}catch(e){return true}})}
@@ -2294,30 +2319,54 @@ function renderSched(){
   if(FILTER==='ACTIVE')rows=rows.filter(s=>s.active);
   if(FILTER==='OFF')rows=rows.filter(s=>!s.active);
   rows=rows.slice().sort((a,b)=>String(a.next_fire||'').localeCompare(String(b.next_fire||'')));
+  const newsRows=NEWS_PLANS.map(p=>({
+    id: 'news-'+p.id,
+    news_id: String(p.id),
+    news: true,
+    account: p.account,
+    pair: p.symbol,
+    side: 'STRADDLE',
+    lot: p.lot,
+    n_positions: p.orders,
+    exec_h: '', exec_m: '', exec_s: '',
+    close_h: '', close_m: '', close_s: '',
+    next_fire: p.event_ms?new Date(Number(p.event_ms)).toISOString():'',
+    active: ['scheduled','arming','armed','closing'].indexOf(
+      String(p.status||'scheduled'))>=0,
+    status: String(p.status||'scheduled'),
+    closer: p.closer||false,
+  })).filter(s=>FILTER==='ALL'||(FILTER==='ACTIVE'?s.active:!s.active));
   window.__retryState={};
   for(const s of rows)if(s.slot_retry)window.__retryState[s.id]=s.slot_retry;
-  if(!rows.length){$id('schedTbl').innerHTML='<div class="empty">'+
+  if(!rows.length&&newsRows.length===0){$id('schedTbl').innerHTML='<div class="empty">'+
    (FILTER==='ACTIVE'?'no active schedules - create one with + NEW SCHEDULE (or arm one +30 s away)':'no schedules here')+'</div>';return}
+  const allRows=[...rows,...newsRows].sort((a,b)=>String(a.next_fire||'').localeCompare(String(b.next_fire||'')));
   $id('schedTbl').innerHTML='<table><tr><th>#</th><th>account</th><th>pair</th><th>side</th>'+
    '<th class="num">lot</th><th class="num">x</th><th>open at</th><th>close at</th>'+
    '<th>next fire</th><th>status</th><th></th></tr>'+
-   rows.map(s=>'<tr><td class="mut">'+s.id+
+   allRows.map(s=>'<tr><td class="mut">'+(s.news?'NEWS':s.id)+
     (s.slot_retry?'<div style="color:#eab308;font-weight:600">RETRYING x'+s.slot_retry.tries+
      ' <span class="cd" data-retry="'+s.id+'"></span></div>':'')+'</td><td>acc'+s.account+'</td>'+
     '<td class="mono">'+esc(s.pair)+'</td>'+
     '<td><span class="side '+esc(s.side)+'">'+esc(s.side)+'</span></td>'+
     '<td class="num">'+fmt(s.lot,2)+'</td><td class="num">'+s.n_positions+'</td>'+
-    '<td class="mono">'+hhmmss(s.exec_h,s.exec_m,s.exec_s)+'</td>'+
-    '<td class="mono">'+hhmmss(s.close_h,s.close_m,s.close_s)+'</td>'+
+    '<td class="mono">'+(s.exec_h?hhmmss(s.exec_h,s.exec_m,s.exec_s):'-')+'</td>'+
+    '<td class="mono">'+(s.close_h?hhmmss(s.close_h,s.close_m,s.close_s):'-')+'</td>'+
     '<td class="mut" style="font-size:11px" data-fire="'+esc(String(s.next_fire||''))+'">'+(s.active?
      '<span class="cd up"></span> \u00b7 ':'')+
     esc(localFire(s.next_fire))+'</td>'+
-    '<td>'+(s.active?'<span class="up">ACTIVE</span>':'<span class="mut">OFF</span>')+'</td>'+
+    '<td>'+(s.news?'<span class="'+(s.active?'up':'mut')+'">'+esc(s.status.toUpperCase())+'</span>':
+     (s.active?'<span class="up">ACTIVE</span>':'<span class="mut">OFF</span>'))+'</td>'+
     '<td style="white-space:nowrap">'+
+    (s.news?'<button class="xbtn" data-news="'+esc(s.news_id)+'" onclick="cancelNewsPlan(this.dataset.news)">CANCEL</button>':
      '<button class="xbtn" onclick="editSchedule('+s.id+')">EDIT</button> '+
      '<button class="xbtn" onclick="toggleSchedule('+s.id+','+s.active+')">'+(s.active?'PAUSE':'ARM')+'</button> '+
-     '<button class="xbtn" onclick="delSchedule('+s.id+')">DEL</button></td></tr>').join('')+
-   '</table>'}
+     '<button class="xbtn" onclick="delSchedule('+s.id+')">DEL</button>')+'</td></tr>').join('')+
+    '</table>'}
+async function cancelNewsPlan(id){
+  try{const j=await post('/api/news/cancel',{id:String(id)});
+   toast(j.detail||('news plan #'+id+' cancelled'),true);refresh()}
+  catch(e){toast(e.message,false)}}
 function renderFired(){
   const all = fresh24(F);
   if(!all.length){$id('firedTbl').innerHTML='<div class="empty">no fired trades in the past 24 h</div>';return}
@@ -2373,7 +2422,7 @@ async function toggleSchedule(id,isActive){
  try{const j=await post('/api/schedule/update',{id:id,active:!isActive});
   toast('schedule #'+id+(isActive?' paused':' armed')+' - next fire '+(j.next_fire_local||''),true);
   refresh()}catch(e){toast(e.message,false)}}
-function render(){renderKpis();renderSched();renderFired();
+function render(){renderSched();renderKpis();renderFired();
  liveLink((SYS&&SYS.system)||{})}
 async function refresh(){
   try{const [sch,fired,sys]=await Promise.all([api('/api/schedules'),api('/api/fired'),
@@ -2412,6 +2461,7 @@ function renderCountdowns(){
    const st=rst[el.getAttribute('data-retry')];
    if(st&&st.next_in!=null)el.textContent='\u00b7 next try '+st.next_in+'s'}}
 setInterval(renderCountdowns,1000);
+loadNewsPlans();setInterval(loadNewsPlans,5000);
 refresh();setInterval(refresh,2000);
 """
 
