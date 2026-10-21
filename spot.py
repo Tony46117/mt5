@@ -1613,12 +1613,18 @@ def setup_terminal2() -> bool:
     log.info(f"copy done in {time.time() - t0:.0f}s")
     return True
 
-def install_script(inst: int = 1) -> None:
+def install_script(inst: int = 1) -> bool:
+    """Copy the EA source in and compile it when out of date.
+
+    Returns True when the EA was (re)installed/recompiled - the caller must
+    then RESTART the terminal to load it, since a running terminal keeps the
+    old .ex5 in memory.  False means the terminal already has this build.
+    """
     experts_dir = TERMINALS[inst]["dir"] / "MQL5" / "Experts"
     experts_dir.mkdir(parents=True, exist_ok=True)
     if not SCRIPT_SRC.exists():
         log.error(f"{SCRIPT_SRC} not found next to spot.py")
-        return
+        return False
     dst = experts_dir / "SpotDump.mq5"
     changed = True
     if dst.exists():
@@ -1630,9 +1636,10 @@ def install_script(inst: int = 1) -> None:
     elif not ex5.exists():
         stale_ex5 = True
     if not changed and not stale_ex5:
-        return
+        return False
     shutil.copy2(SCRIPT_SRC, dst)
     compile_mq5(dst, inst)
+    return True
 
 def compile_mq5(dst_mq5: Path, inst: int = 1) -> bool:
     if not os.path.exists(wine_bin()):

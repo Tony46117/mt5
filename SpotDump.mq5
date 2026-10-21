@@ -1081,14 +1081,13 @@ void ExecuteLine(string line)
          }
        double stops  = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * point;
        double freeze = (double)SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL) * point;
-       double gap    = MathMax(stops, freeze);
-       if(bprice <= ask
-         {
-          AppendOut(id, "ERR", "buy stop must sit ABOVE the ask (bid " +
-                    DoubleToString(bid, digits) + " ask " +
-                    DoubleToString(ask, digits) + ")");
-          return;
-         }
+       double gap    = MathMax(stops, freeze);      if(bprice <= ask)
+        {
+         AppendOut(id, "ERR", "buy stop must sit ABOVE the ask (bid " +
+                   DoubleToString(bid, digits) + " ask " +
+                   DoubleToString(ask, digits) + ")");
+         return;
+        }
        if(sprice > bid - gap)
          {
           AppendOut(id, "ERR", "sell stop must sit BELOW the bid (bid " +

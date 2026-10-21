@@ -260,7 +260,13 @@ bash run.sh        # or: make run
 ```
 
 - Starts the web panel on `http://127.0.0.1:8000` and the bridge
-  supervisor (which boots both terminals concurrently).
+  supervisor **in parallel** (the bridge does not wait for the web app).
+- Already-live terminals are **adopted, not rebooted**: a cold MT5 boot
+  takes ~20 s, but restarting with both terminals up and streaming is live
+  again in about a second, with ALGO ON untouched. Terminals are only
+  stopped when they are not live (or the EA source was recompiled - MT5
+  keeps the old `.ex5` in memory, so that one change needs a reload).
+- Each startup phase prints its elapsed time, so a slow start is visible.
 - The supervisor screen is the live status dashboard.
 - The venv is created/repaired automatically (at `~/python312`) and missing
   libraries are installed on the first run.

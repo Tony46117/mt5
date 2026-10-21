@@ -57,12 +57,43 @@ SYNC_HEAL_GRACE_S = 120.0
 # login.  Stay hands-off for this long after any session change.
 ADOPT_QUIET_S = 150.0
 
+# A terminal this fresh is already serving orders/quotes: adopt it instead
+# of rebooting.  A cold wine + MT5 boot costs 40-90 s and turns ALGO OFF on
+# the way (the toolbar state is only restored as the terminal comes up), so
+# "already live" is always the fast and safe path.
+ADOPT_FEED_S = 5.0
+
+
+def _own_header(inst: int) -> dict:
+    try:
+        return read_header(TERMINALS[inst]["dir"] / "MQL5" / "Files"
+                           / "trades.csv")
+    except Exception:
+        return {}
+
+
+def _adoptable(inst: int, expected: str) -> bool:
+    """Running with a live EA feed AND already on the intended login?"""
+    if not expected:
+        return False
+    try:
+        if not term_running(inst, max_age=0):
+            return False
+        if feed_age(inst) >= ADOPT_FEED_S:
+            return False
+        return str(_own_header(inst).get("login", "")) == expected
+    except Exception:
+        return False
+
+
 def wait_for_login_feed(inst: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if term_running(inst) and feed_age(inst) < 5.0:
             return True
-        time.sleep(0.5)
+        # 0.1 s: the old 0.5 s poll added up to half a second of pure
+        # latency to every login verify (and to each boot's "ready" print)
+        time.sleep(0.1)
     return False
 
 def verify_login(inst: int) -> tuple[bool, str, str]:
@@ -98,6 +129,22 @@ def login_and_boot() -> tuple[bool, list[int]]:
                 print(f"{RED}terminal {inst} executable missing{RESET}")
                 boot_res[inst] = False
                 return
+            expected = str(accs.get(inst, {}).get("login", "")).strip()
+            if _adoptable(inst, expected):
+                # Already logged in with a live EA feed: no stop, no launch,
+                # no login verify wait.  ALGO ON is set for the next cold
+                # boot; a freshly compiled EA still needs one reload (MT5
+                # keeps the old .ex5 in memory), and only that reload pays
+                # the boot cost.
+                if install_script(inst):
+                    print(f"  terminal {inst}: EA source changed - reloading "
+                          f"the terminal to load it")
+                else:
+                    ensure_autotrading(inst)
+                    print(f"  terminal {inst} already live as {expected} - "
+                          f"adopted (ALGO ON, no reboot)")
+                    boot_res[inst] = True
+                    return
             if term_running(inst):
                 print(f"  terminal {inst} is running - stopping it for a clean boot...")
                 stop_terminal(inst)
