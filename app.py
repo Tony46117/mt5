@@ -1004,7 +1004,7 @@ def api_stopexe():
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
     try:
-        dpips = float(d.get("distance_pips", d.get("pips", 1.6)))
+        dpips = float(d.get("distance_pips", d.get("pips", 1.0)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:

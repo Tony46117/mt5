@@ -39,7 +39,7 @@ log = setup_logging(__name__)
 STOPEXE_MAGIC = 777003
 STOPEXE_COMMENT = "stopexe"
 # Protective stop attached to every straddle leg at OrderSend time.
-STOPEXE_SL_PIPS = 2.0
+STOPEXE_SL_PIPS = 1.0
 
 
 def pip_size(symbol: str, digits: int) -> float:
