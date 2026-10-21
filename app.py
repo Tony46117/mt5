@@ -27,6 +27,7 @@ import stopexe as stopexe_mod
 import metrics
 import broker_prober
 import account_engine
+import news as news_mod
 
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
@@ -486,6 +487,137 @@ def _factory_news_snapshot(force: bool = False) -> dict:
                 "age_s": (round(max(0.0, now - c["ts"]), 1)
                           if c["ts"] else None),
                 "loading": c["busy"], "error": c["error"]}
+
+# ---------------- news module (release bracket + closer) ----------------
+# The panel's NEWS button slides through the week's calendar (the same
+# factory feed the Factory page polls) and arms a StopExe straddle 5 s
+# before the release.  All timing lives in news.py; these routes only
+# validate what the desk picked and hand it over.
+
+@app.get("/api/news/events")
+@rate_limit(max_requests=300, window=60)
+def api_news_events():
+    snap = _factory_news_snapshot(force=request.args.get("force") == "1")
+    high_only = str(request.args.get("impact", "high")).lower() != "all"
+    try:
+        payload = news_mod.week_events(snap["events"], high_only)
+    except Exception as exc:
+        log.error(f"news week failed: {exc}")
+        return _fail(f"news feed unavailable: {exc}", code=503)
+    return jsonify({"ok": True, "now_ms": int(time.time() * 1000),
+                    "source": snap["source"], "loading": snap["loading"],
+                    "error": snap["error"], **payload})
+
+
+@app.get("/api/news/map")
+@rate_limit(max_requests=120, window=60)
+def api_news_map():
+    """Mini map of the country behind a news currency (SVG path data)."""
+    ccy = str(request.args.get("ccy", "")).strip().upper()
+    if not ccy or len(ccy) > 8 or not ccy.isalpha():
+        return _fail("ccy is required (e.g. USD)")
+    try:
+        payload = news_mod.country_map(ccy)
+    except Exception as exc:
+        return _fail(f"map unavailable: {exc}", code=503)
+    resp = jsonify({"ok": True, **payload})
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.get("/api/news/quotes")
+@rate_limit(max_requests=120, window=60)
+def api_news_quotes():
+    """Symbols the broker probe says are tradeable AND quoting right now."""
+    try:
+        account = int(request.args.get("account", 0))
+    except (TypeError, ValueError):
+        return _fail("bad account")
+    if account not in (1, 2):
+        return _fail("account must be 1 or 2")
+    return jsonify({"ok": True, **news_mod.quotes(account)})
+
+
+@app.get("/api/news/plans")
+@rate_limit(max_requests=300, window=60)
+def api_news_plans():
+    return jsonify({"ok": True, "now_ms": int(time.time() * 1000),
+                    "plans": news_mod.plans()})
+
+
+@app.post("/api/news/plan")
+@rate_limit(max_requests=30, window=60)
+def api_news_plan():
+    """Arm an event: N buy stops + N sell stops at T-5 s, flat at T+5 s."""
+    d = request.get_json(silent=True) or {}
+    try:
+        account = int(d.get("account", 0))
+    except (TypeError, ValueError):
+        return _fail("bad account")
+    if account not in (1, 2):
+        return _fail("account must be 1 or 2")
+    symbol = str(d.get("symbol", "")).strip()
+    if not symbol:
+        return _fail("symbol is required")
+    try:
+        lot = float(d.get("lot", 0))
+        orders = int(d.get("orders", d.get("n", 1)))
+        dpips = float(d.get("distance_pips", 1.0))
+    except (TypeError, ValueError):
+        return _fail("bad lot / orders / distance")
+    if not 0 < lot <= 100:
+        return _fail("lot out of range")
+    if not 1 <= orders <= 50:
+        return _fail("orders must be 1..50")
+    if not 0.5 <= dpips <= 100:
+        return _fail("distance must be 0.5..100 pips")
+    event = d.get("event") or {}
+    if not isinstance(event, dict) or not event:
+        return _fail("event is required (pick one from the calendar)")
+    broker_sym = resolve_symbol(symbol, account)
+    spots = read_spots()
+    if broker_sym not in spots or not spots[broker_sym][0]:
+        return _fail("no live quote for " + symbol)
+    try:
+        _sym = broker_prober.get_prober().report()["terminals"] \
+            .get(str(account), {}).get(broker_sym)
+        if _sym is not None and int(_sym.get("trade_mode", 4)) == 0:
+            return _fail(f"{symbol} is DISABLED for trading by the broker "
+                         f"on account {account} (trade_mode=0, retcode 10017)")
+    except Exception:
+        pass
+    lot_err = _lot_check(account, broker_sym, lot)
+    if lot_err:
+        return _fail(lot_err)
+    try:
+        plan = news_mod.plan_event(account, symbol, lot, orders, event,
+                                   bool(d.get("closer")), dpips)
+    except ValueError as exc:
+        return _fail(str(exc))
+    except Exception as exc:
+        return _fail(str(exc), code=500)
+    at = dt.datetime.fromtimestamp(plan["event_ms"] / 1000.0,
+                                   dt.timezone.utc)
+    return _ok({"plan": plan,
+                "detail": f"news plan #{plan['id']} armed for {plan['symbol']} "
+                          f"{plan['orders']}x{plan['lot']:g} at "
+                          f"{at:%H:%M:%S} UTC (T-5 s)"
+                          + (" - closer ON at T+5 s" if plan["closer"] else "")})
+
+
+@app.post("/api/news/cancel")
+@rate_limit(max_requests=60, window=60)
+def api_news_cancel():
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id", "")).strip()
+    if not pid:
+        return _fail("id is required")
+    try:
+        plan = news_mod.cancel(pid)
+    except ValueError as exc:
+        return _fail(str(exc))
+    return _ok({"plan": plan, "detail": f"news plan #{pid} cancelled"})
+
 
 # ---------------- account integration engine ----------------
 
@@ -967,8 +1099,8 @@ def api_stopexe_preview():
     if not 0.5 <= dpips <= 100:
         return _fail("distance must be 0.5..100 pips")
     try:
-        slpips = float(request.args.get("sl_pips",
-                                        request.args.get("sl", 2.0)))
+        slpips = float(request.args.get("sl_pips", request.args.get(
+            "sl", stopexe_mod.STOPEXE_SL_PIPS)))
     except (TypeError, ValueError):
         return _fail("bad sl")
     if not 0.5 <= slpips <= 100:
@@ -986,7 +1118,7 @@ def api_stopexe():
     """StopExe: open a BUY STOP (ask + 1.0 pips) + SELL STOP (bid - 1.0
     pips) straddle of `lot` around the live price - 2.0 pips bracket total
     (gold at 4150 -> 4151.0 / 4149.0), both legs flighted async in one exec
-    command, each leg carrying its 2-pip protective SL."""
+    command, each leg carrying its 1.2-pip protective SL."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
@@ -1010,7 +1142,8 @@ def api_stopexe():
     if not 0.5 <= dpips <= 100:
         return _fail("distance must be 0.5..100 pips")
     try:
-        slpips = float(d.get("sl_pips", d.get("sl", 2.0)))
+        slpips = float(d.get("sl_pips", d.get("sl",
+                                              stopexe_mod.STOPEXE_SL_PIPS)))
     except (TypeError, ValueError):
         return _fail("bad sl")
     if not 0.5 <= slpips <= 100:
@@ -1386,6 +1519,9 @@ def main() -> int:
     metrics.start_observer()
 
     broker_prober.start_prober()
+    # re-arm news brackets saved before a restart - a release 20 minutes
+    # out must not be dropped because the app bounced
+    news_mod.start()
 
     def _shutdown(*_):
         log.info("shutting down - stopping scheduler + metrics observer...")
@@ -1393,6 +1529,7 @@ def main() -> int:
             _scheduler.stop_flag.set()
         metrics.stop_observer()
         broker_prober.stop_prober()
+        news_mod.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)

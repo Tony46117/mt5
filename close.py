@@ -9,11 +9,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from executor import _close_one
+from executor import _close_one, sender_for
 from spot import read_accounts
 from config import setup_logging
 
 log = setup_logging(__name__)
+
+# Fast close: fire CLOSEALL and return on the EA's ack without waiting for
+# the book to report empty.  _close_one polls the position + pending book
+# for up to MT5_CLOSE_VERIFY_TIMEOUT (15 s) because the red CLOSE bar must
+# PROVE the book is flat; the news closer cannot wait that long - it has to
+# have the positions gone 5 s after the release - so it uses this path.
+NEWS_CLOSE_TIMEOUT_S = 3.0
 
 def close_account(acc_num: int, results: dict) -> None:
     t0 = time.perf_counter()
@@ -24,6 +31,54 @@ def close_account_pair(acc_num: int, pair: str, results: dict) -> None:
     t0 = time.perf_counter()
     ok, detail = _close_one(acc_num, pair)
     results[acc_num] = (ok, detail, (time.perf_counter() - t0) * 1000.0)
+
+def close_account_fast(acc_num: int, pair: str | None, results: dict,
+                       timeout: float = NEWS_CLOSE_TIMEOUT_S) -> None:
+    """Send CLOSEALL and report the EA's ack - no book verification.
+
+    The EA fans the closes out asynchronously, so the ack already means
+    "every close is flighted"; skipping the up-to-15 s verify is what keeps
+    this inside the news closer's 5-second window.
+    """
+    t0 = time.perf_counter()
+    try:
+        ok, detail = sender_for(acc_num).close_all(pair, timeout=timeout)
+    except Exception as exc:            # a close must never abort the thread
+        ok, detail = False, f"exception: {exc}"
+    results[acc_num] = (ok, detail, (time.perf_counter() - t0) * 1000.0)
+
+
+def close_all_fast(pair: str | None = None,
+                   accounts: list[int] | None = None,
+                   timeout: float = NEWS_CLOSE_TIMEOUT_S) -> dict:
+    """Close on every terminal CONCURRENTLY and return the moment they ack.
+
+    Same result shape as close_all_accounts_results, but no per-terminal
+    verify loop (see close_account_fast) - built for the news closer, which
+    must have the book gone 5 s after a release.
+    """
+    known = read_accounts()
+    wanted = [n for n in (1, 2) if accounts is None or n in accounts]
+    active = [n for n in wanted if known.get(n, {}).get("login")]
+    results: dict[int, tuple[bool, str, float]] = {}
+    threads = [threading.Thread(target=close_account_fast,
+                                args=(n, pair, results, timeout),
+                                daemon=True, name=f"close-fast-{n}")
+               for n in active]
+    wall0 = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_ms = (time.perf_counter() - wall0) * 1000.0
+    out: dict[int, dict] = {}
+    for n in (1, 2):
+        if n not in active:
+            out[n] = {"ok": False, "detail": "not logged in", "ms": 0.0}
+            continue
+        ok, detail, ms = results.get(n, (False, "no result", 0.0))
+        out[n] = {"ok": ok, "detail": detail, "ms": round(ms, 1)}
+    return {"accounts": out, "wall_ms": round(wall_ms, 1)}
 
 def close_all_accounts_results(pair: str | None = None) -> dict:
     """Close every position on every logged-in terminal CONCURRENTLY.

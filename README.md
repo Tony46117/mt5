@@ -301,6 +301,18 @@ paths and file ownership stay consistent.
 - Both BUY and SELL can be scheduled. Symbol names are passed through
   case-sensitively, so brokers whose symbols are not upper-case
   (`Boom 1000 Index`) work as typed.
+- **NEWS** (the wider button beside ORDER / SCHEDULE / STOPEXE) slides
+  through the next week of releases from the same ForexFactory calendar
+  the Factory page uses (`/api/news/events`). It shows high impact only
+  until the filter chip is toggled off, draws the release country from
+  factory.py's Natural Earth borders (`/api/news/map`) and picks the pair
+  from the broker probe's tradeable, live-quoted symbols
+  (`/api/news/quotes`). **TRADE** arms N buy stops + N sell stops through
+  the StopExe straddle 5 s before the release, each leg carrying a
+  1.2-pip SL; the **CLOSER** toggle (top right) additionally closes every
+  position on that account 5 s after the release, so the whole execution
+  window is 10 s. Plans survive a restart (`news_plans.json`) and are
+  re-armed on boot without firing twice. **DECLINE** closes the panel.
 - CLI:
 
 ```bash

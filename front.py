@@ -169,6 +169,15 @@ a{color:var(--blue);text-decoration:none}
 .btn.order-mini:active{transform:scale(.94)}
 .btn.order-mini:disabled{opacity:.55;cursor:progress;transform:none}
 .btn.order-mini.pop{animation:pop .18s ease}
+/* NEWS sits beside ORDER / SCHEDULE / STOPEXE and is deliberately a notch
+   bigger: it opens the week-of-events panel, not a single order. */
+.btn.order-mini.news{padding:9px 24px;font-size:12px;letter-spacing:.18em;
+  border-radius:13px;border-color:#8a6d1f;color:#ffd479;
+  background:linear-gradient(160deg,#2a2109,#161005);
+  box-shadow:0 1px 8px rgba(0,0,0,.45),0 0 14px rgba(255,196,77,.16),
+  inset 0 1px 0 rgba(255,196,77,.25)}
+.btn.order-mini.news:hover{border-color:#ffc44d;color:#fff;
+  box-shadow:0 0 22px rgba(255,196,77,.4),inset 0 1px 0 rgba(255,196,77,.35)}
 .order-wrap{display:flex;justify-content:center;margin-top:10px}
 @media(max-width:1180px){.accounts{grid-template-columns:1fr}
   .accounts.mid{grid-template-columns:1fr}
@@ -399,6 +408,99 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
   border-color:#a78bfa;box-shadow:0 0 22px rgba(167,139,250,.22);
   grid-column:span 2}
 .tbtn.stex:hover{filter:brightness(1.15);box-shadow:var(--glow-strong)}
+/* ---------- news panel (week of events, one release at a time) ---------- */
+.news-bg{position:fixed;inset:0;z-index:120;display:none;align-items:center;
+  justify-content:center;padding:18px;background:rgba(2,4,8,.84)}
+.news-bg.open{display:flex}
+.news-panel{width:min(1020px,96vw);max-height:94vh;overflow-y:auto;
+  background:linear-gradient(180deg,var(--panel3),var(--panel));
+  border:1px solid var(--line3);border-radius:0px;
+  box-shadow:var(--glow-strong),0 34px 90px rgba(0,0,0,.7)}
+.news-head{display:flex;align-items:center;gap:10px;padding:12px 16px;
+  border-bottom:1px solid var(--line);
+  background:linear-gradient(90deg,rgba(255,196,77,.10),transparent 70%)}
+.news-head .title{font-size:13px;font-weight:700;letter-spacing:2.6px;
+  color:#fff}
+.news-head .title::before{content:"◆ ";color:#ffc44d;font-size:9px}
+.news-head .sub{font-size:10px;letter-spacing:1px;color:var(--dim)}
+.news-x{background:none;border:none;color:var(--dim);font-size:18px;
+  cursor:pointer;padding:0 4px}
+.news-x:hover{color:var(--red)}
+.news-closer{display:inline-flex;align-items:center;gap:9px;padding:6px 12px;
+  border:1px solid var(--line2);background:var(--panel);color:var(--dim);
+  font-size:10px;font-weight:700;letter-spacing:1.5px;cursor:pointer;
+  border-radius:0px;transition:all .12s}
+.news-closer .knob{position:relative;width:30px;height:13px;
+  border:1px solid var(--line3);background:var(--bg)}
+.news-closer .knob::after{content:"";position:absolute;top:1px;left:1px;
+  width:11px;height:9px;background:var(--dim2);transition:left .12s ease}
+.news-closer:hover{border-color:#ffc44d;color:#ffd479}
+.news-closer.on{border-color:#ffc44d;color:#ffd479;box-shadow:var(--glow)}
+.news-closer.on .knob{border-color:#ffc44d}
+.news-closer.on .knob::after{left:16px;background:#ffc44d;
+  box-shadow:0 0 8px rgba(255,196,77,.9)}
+.news-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;
+  padding:10px 16px;border-bottom:1px solid var(--line)}
+.news-bar .spacer{flex:1}
+.news-slide{display:grid;grid-template-columns:44px minmax(0,1fr) 44px;
+  gap:10px;padding:14px 16px;align-items:stretch}
+.news-nav{background:var(--panel);border:1px solid var(--line2);color:var(--blue);
+  font-size:20px;font-weight:700;line-height:1;cursor:pointer;
+  border-radius:0px;transition:all .12s}
+.news-nav:hover{background:var(--blue3);border-color:var(--blue);
+  box-shadow:var(--glow);color:#fff}
+.news-nav:active{transform:scale(.96)}
+.news-card{display:grid;grid-template-columns:158px minmax(0,1fr);gap:14px;
+  border:1px solid var(--line);background:var(--bg);padding:12px}
+@media(max-width:680px){.news-card{grid-template-columns:1fr}
+  .news-slide{grid-template-columns:36px minmax(0,1fr) 36px}}
+.news-map{position:relative;height:152px;background:#04070c;
+  border:1px solid var(--line);display:flex;align-items:center;
+  justify-content:center;overflow:hidden}
+.news-map svg{display:block;width:100%;height:100%}
+.news-map .ccy{position:absolute;top:6px;left:8px;font-size:9.5px;
+  letter-spacing:2px;color:#ffc44d;font-weight:700}
+.news-map .none{font-size:10px;color:var(--dim);padding:8px;text-align:center}
+.news-when{font-family:ui-monospace,Consolas,monospace;font-size:26px;
+  font-weight:700;color:#fff;letter-spacing:.5px;line-height:1.1}
+.news-when .tz{font-size:11px;color:var(--dim);letter-spacing:1.5px;
+  margin-left:8px;font-family:inherit;font-weight:400}
+.news-metarow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  margin:7px 0}
+.news-impact{padding:2px 9px;font-size:9.5px;font-weight:700;
+  letter-spacing:1.4px;text-transform:uppercase}
+.news-impact.High{background:#7f1d1d;color:#ffd0d0;
+  box-shadow:0 0 10px rgba(255,92,92,.25)}
+.news-impact.Medium{background:#7c4a03;color:#ffe1b0}
+.news-impact.Low,.news-impact.Holiday{background:#334155;color:#cbd5e1}
+.news-name{font-size:14px;color:#fff;line-height:1.35}
+.news-line{font-size:11px;color:var(--dim);margin-top:5px}
+.news-line b{color:var(--txt);font-family:ui-monospace,Consolas,monospace;
+  font-weight:600}
+.news-cd{margin-top:8px;font-size:11px;letter-spacing:1px;color:var(--blue2)}
+.news-cd b{color:#ffd479;font-family:ui-monospace,Consolas,monospace}
+.news-controls{display:grid;gap:10px;padding:0 16px 10px;
+  grid-template-columns:repeat(auto-fit,minmax(148px,1fr))}
+.news-controls .seg{display:flex;gap:5px}
+.news-controls .seg .btn{flex:1;padding:6px 0}
+.news-controls select,.news-controls input{width:100%;background:var(--bg);
+  border:1px solid var(--line2);color:#fff;padding:6px 8px;font-size:12px;
+  outline:none;border-radius:0px;font-family:ui-monospace,Consolas,monospace}
+.news-quote{display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+  padding:0 16px 10px}
+.news-plans{padding:0 16px 10px;font-size:11px;color:var(--dim)}
+.news-plans .prow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  border-top:1px solid var(--line);padding:5px 0}
+.news-plans .prow .st{font-size:9.5px;letter-spacing:1.2px;
+  padding:1px 7px;background:var(--panel3);color:var(--blue2);
+  text-transform:uppercase}
+.news-plans .prow .st.bad{color:#ffb4b4}
+.news-foot{display:grid;grid-template-columns:1fr 1fr;gap:10px;
+  padding:0 16px 16px}
+.tbtn.news-trade{background:linear-gradient(160deg,#15803d,#064e2b);
+  border-color:#34d399;box-shadow:0 0 22px rgba(52,211,153,.22)}
+.tbtn.news-decline{background:linear-gradient(160deg,#7f1d1d,#3f0d0d);
+  border-color:#f87171;box-shadow:0 0 22px rgba(248,113,113,.18)}
 /* ---------- factory (top-level page below Scheduled Trades) ---------- */
 .factory-grid{display:grid;grid-template-columns:minmax(0,1fr) 318px;
   gap:14px;align-items:start}
@@ -1047,6 +1149,44 @@ PANEL_TMPL = """<!doctype html>
 <div class="modal-bg" id="modalBg">
   <div class="modal" id="modalBody"></div>
 </div>
+<div class="news-bg" id="newsBg">
+  <section class="news-panel" id="newsBody">
+    <div class="news-head">
+      <div class="title">NEWS TRADER</div>
+      <div class="sub" id="newsSrc">calendar</div>
+      <div style="flex:1"></div>
+      <button class="news-closer" id="newsCloserBtn" aria-pressed="false"
+        onclick="newsToggleCloser()"
+        title="close every position on the account 5 s AFTER the release (10 s execution gap)">
+        <span class="knob"></span><span>CLOSER <b id="newsCloserLbl">OFF</b></span></button>
+      <button class="news-x" onclick="closeNews()" title="decline / close">✕</button>
+    </div>
+    <div class="news-bar">
+      <button class="chip filter on" id="newsHighChip" onclick="newsToggleHigh()">
+        HIGH IMPACT ONLY</button>
+      <span class="chip">WEEK <b id="newsCount">0</b></span>
+      <span class="chip">NOW <b id="newsNow">-</b></span>
+      <span class="chip">WINDOW <b>T-5s → T+5s</b></span>
+      <div class="spacer"></div>
+      <span class="chip" id="newsPos">-</span>
+    </div>
+    <div class="news-slide">
+      <button class="news-nav" id="newsPrev" onclick="newsSlide(-1)"
+        title="earlier event">&lt;</button>
+      <div class="news-card" id="newsCard">
+        <div class="empty">loading the calendar...</div></div>
+      <button class="news-nav" id="newsNext" onclick="newsSlide(1)"
+        title="later event">&gt;</button>
+    </div>
+    <div class="news-controls" id="newsControls"></div>
+    <div class="news-quote" id="newsQuote"></div>
+    <div class="news-plans" id="newsPlans"></div>
+    <div class="news-foot">
+      <button class="tbtn news-trade" id="newsTradeBtn" onclick="newsTrade()">TRADE</button>
+      <button class="tbtn news-decline" onclick="newsDecline()">DECLINE</button>
+    </div>
+  </section>
+</div>
 <div class="toast" id="toast"></div>
 <script>{{ js|safe }}</script>
 </body></html>"""
@@ -1119,7 +1259,9 @@ function buildPanel(n){
    '<button class="btn order-mini" id="ordBtn'+n+'" '+
     'onclick="asmrPop(this);openOrderModal('+n+')">◌ ORDER</button>'+
    '<button class="btn order-mini" onclick="asmrPop(this);openSchedModal('+n+')">◇ SCHEDULE</button>'+
-   '<button class="btn order-mini" onclick="asmrPop(this);stexJump('+n+')">STOPEXE ↓</button></div>'+
+   '<button class="btn order-mini" onclick="asmrPop(this);stexJump('+n+')">STOPEXE ↓</button>'+
+   '<button class="btn order-mini news" id="newsBtn'+n+'" onclick="asmrPop(this);openNews('+n+')"'+
+   ' title="upcoming news - slide the week, arm a straddle 5 s before the release">◈ NEWS</button></div>'+
   '</div>'+
   '<div class="sect"><h4>StopExe · straddle stops</h4>'+
    '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1.0 pips</b></span></div></div>'+
@@ -1131,9 +1273,9 @@ function buildPanel(n){
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
    '<div class="stex-bracket">'+     '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.0 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 2 pips</div></div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 1.2 pips</div></div>'+
     '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.0 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 2 pips</div></div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 1.2 pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
     '<div class="fgroup"><label>Lot (each leg)</label>'+
@@ -1150,7 +1292,7 @@ function buildPanel(n){
    '<div class="tradebtns" style="margin-top:2px">'+
     '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">EXECUTE STOPEXE</button>'+
    '</div>'+
-   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price · each leg carries a 2-pip SL from the same OrderSend</div>'+
+   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price · each leg carries a 1.2-pip SL from the same OrderSend</div>'+
   '</div>'+
   '<div class="sect"><h4>Open positions</h4><div class="right">'+
    '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
@@ -1330,9 +1472,9 @@ async function doStopexe(n){
   INFLIGHT['sx'+n]=true;if(btn)btn.disabled=true;
   if(btn)asmrPop(btn);
    if(fb){fb.className='feedback';
-   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + 2-pip SLs ... placing both legs';}
+   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + 1.2-pip SLs ... placing both legs';}
    try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
-    distance_pips:stexPips(n),sl_pips:2});
+    distance_pips:stexPips(n),sl_pips:1.2});
    if(fb){fb.className='feedback ok';
     fb.textContent='ARMED '+j.detail+' ('+j.ms+' ms) - CLOSE deletes both legs';}
    toast('STOPEXE '+sym+': buy '+j.buy_price+' (SL '+j.buy_sl+') / sell '+j.sell_price+' (SL '+j.sell_sl+')',true);
@@ -1569,6 +1711,280 @@ async function refresh(){
    if(c&&c.children.length===0)
     c.innerHTML='<div class="empty">waiting for data - '+esc(e.message)+'</div>'}}}
 refresh();setInterval(refresh,600);
+/* ---------- NEWS module ----------
+   Slides the coming week of releases (factory's ForexFactory feed via
+   /api/news/events), draws the event's country from factory's Natural
+   Earth borders (/api/news/map) and arms a StopExe straddle 5 s before
+   the release (/api/news/plan).  With CLOSER on, the account is closed
+   through close.py's fast path 5 s after the release - a 10 s window. */
+let NW={open:false,acc:1,idx:0,high:true,closer:false,events:[],map:{},
+        pending:{},quotes:{},sel:{symbol:'',lot:0.01,orders:1},plans:[],
+        busy:false,timer:null,plansTs:0,key:'',retry:null};
+function newsEvent(){return NW.events[NW.idx]||null}
+function newsKey(e){return String(e.dt_ms)+'|'+String(e.title)}
+async function openNews(n){
+  NW.open=true;NW.acc=(+n===2)?2:1;NW.idx=0;NW.key='';NW.plansTs=0;
+  $id('newsBg').classList.add('open');
+  newsPaintCloser();newsControls();
+  await Promise.all([newsLoad(true),newsQuotes()]);
+  newsLoadPlans();
+  if(NW.timer)clearInterval(NW.timer);
+  NW.timer=setInterval(newsTick,1000);newsTick();
+}
+function closeNews(){
+  NW.open=false;$id('newsBg').classList.remove('open');
+  if(NW.timer){clearInterval(NW.timer);NW.timer=null}
+}
+function newsDecline(){const e=newsEvent();closeNews();
+  if(e)toast('declined: '+e.title,true)}
+function newsToggleHigh(){
+  NW.high=!NW.high;
+  const c=$id('newsHighChip');
+  if(c)c.className='chip filter'+(NW.high?' on':'');
+  newsLoad(true)
+}
+function newsToggleCloser(){NW.closer=!NW.closer;newsPaintCloser();newsPaintQuote()}
+function newsPaintCloser(){
+  const b=$id('newsCloserBtn');
+  if(b){b.className='news-closer'+(NW.closer?' on':'');
+    b.setAttribute('aria-pressed',NW.closer?'true':'false')}
+  const l=$id('newsCloserLbl');if(l)l.textContent=NW.closer?'ON':'OFF'
+}
+async function newsLoad(force){
+  try{
+    const j=await api('/api/news/events?impact='+(NW.high?'high':'all')+
+      (force?'&force=1':''));
+    NW.events=j.events||[];
+    const src=$id('newsSrc');
+    if(src)src.textContent=(j.source||'calendar')+(j.loading?' · refreshing':'');
+    const cnt=$id('newsCount');if(cnt)cnt.textContent=String(NW.events.length);
+    if(NW.key){const i=NW.events.findIndex(function(e){return newsKey(e)===NW.key});
+      if(i>=0)NW.idx=i}
+    if(NW.idx>NW.events.length-1)NW.idx=Math.max(0,NW.events.length-1);
+    newsPaint();
+    /* first open after a boot: the feed can still be fetching - poll a few
+       times so the panel fills itself instead of showing an empty week */
+    if(!NW.events.length&&j.loading){
+      clearTimeout(NW.retry);
+      NW.retry=setTimeout(function(){if(NW.open)newsLoad(false)},3000)
+    }
+  }catch(e){
+    const c=$id('newsCard');
+    if(c)c.innerHTML='<div class="empty">calendar offline - '+esc(e.message)+
+      '</div>'
+  }
+}
+function newsSlide(d){
+  if(!NW.events.length)return;
+  NW.idx=(NW.idx+d+NW.events.length)%NW.events.length;
+  newsPaint()
+}
+function newsPaint(){
+  const e=newsEvent(),card=$id('newsCard');
+  const pos=$id('newsPos');
+  if(pos)pos.textContent=NW.events.length?((NW.idx+1)+' / '+NW.events.length):'-';
+  const tb=$id('newsTradeBtn');
+  if(!e){
+    if(card)card.innerHTML='<div class="empty">no '+
+      (NW.high?'high impact ':'')+'news in the next week - '+
+      '<button class="btn mini" onclick="newsToggleHigh()">'+
+      (NW.high?'SHOW ALL IMPACTS':'HIGH IMPACT ONLY')+'</button></div>';
+    if(tb)tb.disabled=true;
+    return
+  }
+  NW.key=newsKey(e);
+  if(tb)tb.disabled=false;
+  const d=new Date(e.dt_ms);
+  const when=d.toLocaleTimeString('en-GB',{hour12:false});
+  const day=d.toLocaleDateString('en-GB',{weekday:'short',day:'2-digit',month:'short'});
+  const utc=new Date(e.dt_ms).toISOString().slice(11,19);
+  card.innerHTML=
+   '<div class="news-map" id="newsMap"></div>'+
+   '<div>'+
+    '<div class="news-when">'+esc(when)+
+      '<span class="tz">LOCAL · '+esc(day)+'</span></div>'+
+    '<div class="news-metarow">'+
+      '<span class="news-impact '+esc(e.impact||'Low')+'">'+esc(e.impact||'-')+'</span>'+
+      '<span class="chip">'+esc(e.currency||'-')+' <b>'+esc(e.country||'-')+'</b></span>'+
+      '<span class="chip">UTC <b>'+esc(utc)+'</b></span></div>'+
+    '<div class="news-name">'+esc(e.title||'-')+'</div>'+
+    '<div class="news-line">forecast <b>'+esc(e.forecast||'-')+
+      '</b> · previous <b>'+esc(e.previous||'-')+'</b></div>'+
+    '<div class="news-cd" id="newsCd">-</div>'+
+   '</div>';
+  newsPaintMap();newsTick()
+}
+function newsPaintMap(){
+  const e=newsEvent(),box=$id('newsMap');
+  if(!e||!box)return;
+  const m=NW.map[e.currency];
+  box.innerHTML='<span class="ccy">'+esc(e.currency||'--')+'</span>'+
+   (m&&m.d
+    ? '<svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">'+
+      '<path d="'+m.d+'" fill="#14304d" stroke="#4da6ff" stroke-width="0.8" '+
+      'stroke-linejoin="round"/></svg>'
+    : '<span class="none">'+(m?('no map for '+esc(e.currency||'-')):'drawing map...')+'</span>');
+  if(!m&&!NW.pending[e.currency]){
+    NW.pending[e.currency]=true;
+    api('/api/news/map?ccy='+encodeURIComponent(e.currency)).then(function(j){
+      NW.map[e.currency]=j;NW.pending[e.currency]=false;
+      const cur=newsEvent();
+      if(cur&&cur.currency===e.currency)newsPaintMap()
+    }).catch(function(){NW.pending[e.currency]=false})
+  }
+}
+function newsTick(){
+  const now=$id('newsNow');
+  if(now)now.textContent=new Date().toLocaleTimeString('en-GB');
+  const e=newsEvent(),cd=$id('newsCd');
+  if(e&&cd){
+    const s=Math.round((e.dt_ms-Date.now())/1000);
+    let txt;
+    if(s>86400)txt=Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h '+
+      Math.floor((s%3600)/60)+'m';
+    else if(s>=3600)txt=Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+    else if(s>0)txt=s+'s';
+    else txt='released '+(-s)+'s ago';
+    cd.innerHTML=(s>0?'releases in <b>':'release <b>')+esc(txt)+
+      (s>0?'</b> · straddle arms T-5 s (':('</b> · '))+'SL 1.2 pips'+
+      (s>0?')':'')
+  }
+  if(Date.now()-(NW.plansTs||0)>5000)newsLoadPlans()
+}
+async function newsQuotes(){
+  try{
+    const j=await api('/api/news/quotes?account='+NW.acc);
+    NW.quotes[NW.acc]=j.symbols||[];NW.qsrc=j.source||''
+  }catch(e){NW.quotes[NW.acc]=[];NW.qsrc=''}
+  const rows=NW.quotes[NW.acc]||[];
+  if(!NW.sel.symbol||!rows.some(function(r){return r.symbol===NW.sel.symbol}))
+    NW.sel.symbol=newsDefaultSymbol();
+  newsControls();newsPaintQuote()
+}
+function newsDefaultSymbol(){
+  const rows=NW.quotes[NW.acc]||[];
+  const gold=rows.find(function(r){return /XAU|GOLD/i.test(r.symbol)});
+  return (gold||rows[0]||{}).symbol||''
+}
+function newsControls(){
+  const box=$id('newsControls');if(!box)return;
+  const rows=NW.quotes[NW.acc]||[];
+  const opts=rows.map(function(r){
+    return '<option value="'+esc(r.symbol)+'">'+esc(r.symbol)+
+      (r.bid==null?'':' · '+r.bid)+'</option>'
+  }).join('');
+  box.innerHTML=
+   '<div class="fgroup"><label>Account</label><div class="seg">'+
+     [1,2].map(function(n){return '<button class="btn mini'+
+       (n===NW.acc?' blue':'')+'" onclick="newsSetAcc('+n+')">A'+n+'</button>'}).join('')+
+   '</div></div>'+
+   '<div class="fgroup"><label>Quote · probed live</label>'+
+    '<input id="newsSym" list="newsSymList" autocomplete="off" spellcheck="false" '+
+    'placeholder="search the broker feed" value="'+esc(NW.sel.symbol||'')+
+    '" oninput="newsPickSym()" onchange="newsPickSym()">'+
+    '<datalist id="newsSymList">'+opts+'</datalist></div>'+
+   '<div class="fgroup"><label>Lot (each stop)</label>'+
+    '<input id="newsLot" type="number" step="0.01" min="0.01" value="'+
+    Number(NW.sel.lot||0.01).toFixed(2)+'" oninput="newsPickSym()"></div>'+
+   '<div class="fgroup"><label>Buy stops + sell stops</label>'+
+    '<input id="newsOrd" type="number" step="1" min="1" max="50" value="'+
+    Number(NW.sel.orders||1)+'" oninput="newsPickSym()"></div>'
+}
+function newsPickSym(){
+  const s=$id('newsSym'),l=$id('newsLot'),o=$id('newsOrd');
+  if(s)NW.sel.symbol=String(s.value||'').trim();
+  if(l)NW.sel.lot=parseFloat(l.value)||0.01;
+  if(o)NW.sel.orders=Math.max(1,Math.min(50,parseInt(o.value,10)||1));
+  newsPaintQuote()
+}
+function newsSetAcc(n){NW.acc=(+n===2)?2:1;NW.sel.symbol='';newsQuotes();newsPaintPlans()}
+function newsPaintQuote(){
+  const box=$id('newsQuote');if(!box)return;
+  const rows=NW.quotes[NW.acc]||[];
+  const r=rows.find(function(x){return x.symbol===NW.sel.symbol});
+  if(!r){
+    box.innerHTML='<span class="chip">QUOTE <b>-</b></span>'+
+      '<span class="mut" style="font-size:10px">'+(NW.sel.symbol?
+      'not in the probed feed - pick an exact symbol from the list':
+      'the broker probe has no tradeable symbol with a live quote on this account')+
+      '</span>';
+    return
+  }
+  const dig=(r.digits==null)?5:parseInt(r.digits,10);
+  const spr=(r.ask&&r.bid)?(r.ask-r.bid).toFixed(dig):'-';
+  box.innerHTML='<span class="chip">BID <b>'+esc(r.bid)+'</b></span>'+
+    '<span class="chip">ASK <b>'+(r.ask==null?'-':esc(r.ask))+'</b></span>'+
+    '<span class="chip">SPREAD <b>'+esc(spr)+'</b></span>'+
+    '<span class="chip">STOPS <b>'+(NW.sel.orders*2)+'</b></span>'+
+    '<span class="chip">BRACKET <b>±1.0 pips</b></span>'+
+    '<span class="chip">SL <b>1.2 pips</b></span>'+
+    '<span class="chip">CLOSER <b>'+(NW.closer?'T+5s':'off')+'</b></span>'+
+    '<span class="mut" style="font-size:10px">'+esc(NW.qsrc||'')+'</span>'
+}
+async function newsTrade(){
+  const e=newsEvent();
+  if(!e){toast('no event selected - slide to one first',false);return}
+  if(NW.busy)return;
+  const rows=NW.quotes[NW.acc]||[];
+  if(!rows.some(function(r){return r.symbol===NW.sel.symbol})){
+    toast('pick an exact quote from the probed feed first',false);return}
+  NW.busy=true;
+  const btn=$id('newsTradeBtn');if(btn)btn.disabled=true;
+  try{
+    const j=await post('/api/news/plan',{account:NW.acc,symbol:NW.sel.symbol,
+      lot:parseFloat(NW.sel.lot),orders:parseInt(NW.sel.orders,10),
+      closer:!!NW.closer,event:{dt:e.dt,dt_ms:e.dt_ms,currency:e.currency,
+      impact:e.impact,title:e.title,forecast:e.forecast,previous:e.previous,
+      country:e.country}});
+    toast(j.detail||'news bracket armed',true);
+    newsLoadPlans()
+  }catch(err){toast('NEWS: '+err.message,false)}
+  finally{NW.busy=false;if(btn)btn.disabled=false}
+}
+async function newsLoadPlans(){
+  if(!NW.open)return;
+  NW.plansTs=Date.now();
+  try{const j=await api('/api/news/plans');NW.plans=j.plans||[];newsPaintPlans()}
+  catch(e){}
+}
+function newsPaintPlans(){
+  const box=$id('newsPlans');if(!box)return;
+  const rows=(NW.plans||[]).filter(function(p){
+    return String(p.account)===String(NW.acc)||
+      ['scheduled','arming','armed','closing'].indexOf(String(p.status))>=0
+  });
+  if(!rows.length){
+    box.innerHTML='<span class="mut" style="font-size:10px">no news bracket '+
+      'armed - TRADE arms the selected release at T-5 s</span>';
+    return
+  }
+  box.innerHTML=rows.map(function(p){
+    const t=new Date(p.event_ms);
+    const st=String(p.status||'');
+    const bad=/fail|expired|cancel/.test(st);
+    const ev=p.event||{};
+    return '<div class="prow"><span class="st'+(bad?' bad':'')+'">'+esc(st)+
+      '</span><span class="mono">'+esc(p.symbol)+'</span>'+
+      '<span class="mut">'+p.orders+'x'+Number(p.lot).toFixed(2)+'</span>'+
+      '<span class="mut">'+esc(t.toLocaleTimeString('en-GB'))+'</span>'+
+      (p.closer?'<span class="chip">CLOSER</span>':'')+
+      '<span class="mut" style="flex:1;min-width:110px;overflow:hidden;'+
+      'text-overflow:ellipsis;white-space:nowrap">'+esc(ev.title||'')+'</span>'+
+      '<button class="xbtn" data-plan="'+esc(p.id)+'">CANCEL</button></div>'
+  }).join('');
+  for(const b of box.querySelectorAll('button[data-plan]'))
+    b.onclick=function(){newsCancel(this.getAttribute('data-plan'))}
+}
+async function newsCancel(id){
+  try{
+    const j=await post('/api/news/cancel',{id:String(id)});
+    toast(j.detail||('news plan #'+id+' cancelled'),true);
+    newsLoadPlans()
+  }catch(e){toast(e.message,false)}
+}
+$id('newsBg').addEventListener('click',function(e){
+  if(e.target===this)closeNews()
+});
 /* ---------------- account integration engine ---------------- */
 function engState(s){
  if(s.running)return '<span style="color:var(--yellow,#eab308)">● '+esc(s.running.op)+'…</span>';

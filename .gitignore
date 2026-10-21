@@ -17,3 +17,5 @@ known_accounts.json
 access_points.env
 access_points.json
 instructions.txt
+news_plans.json
+news_plans.json.tmp

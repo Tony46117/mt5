@@ -46,12 +46,14 @@ PAGES = {
 # The trading panel is static HTML+JS, so what the desk gets is visible in
 # the served markup: the StopExe bracket and its button must both be there.
 PAGE_NEEDLES = {
-    "/panel": ["\u00b11.0 pips (2.0 total)", "EXECUTE STOPEXE"],
+    "/panel": ["\u00b11.0 pips (2 total)", "EXECUTE STOPEXE",
+               "NEWS TRADER", "newsTrade()", "DECLINE"],
 }
 
 # JSON endpoints the pages call on first paint; each must answer ok=true
 # (/health is checked separately - it reports {"status": "healthy"})
-APIS = ["/api/dashboard", "/api/panel", "/api/spots", "/api/accounts"]
+APIS = ["/api/dashboard", "/api/panel", "/api/spots", "/api/accounts",
+        "/api/news/plans", "/api/news/events"]
 
 
 def fetch(url: str, timeout: float = 10.0) -> tuple[int, bytes]:
@@ -70,12 +72,16 @@ def stopexe_defaults() -> None:
     import stopexe
 
     default = inspect.signature(stopexe.stopexe_levels).parameters["distance_pips"].default
-    assert default == 1.6, f"stopexe_levels default is {default}, expected 1.6"
+    assert default == 1.0, f"stopexe_levels default is {default}, expected 1.0"
+    assert stopexe.STOPEXE_SL_PIPS == 1.2, (
+        f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 1.2")
     spot.read_spots = lambda *a, **k: {"XAUUSD": ("4150.00", "4150.50", "ci")}
     spot.resolve_symbol = lambda symbol, account: symbol
     lv = stopexe.stopexe_levels("XAUUSD", 1)
-    assert lv["buy_price"] == 4152.1, lv
-    assert lv["sell_price"] == 4148.4, lv
+    assert lv["buy_price"] == 4151.5, lv
+    assert lv["sell_price"] == 4149.0, lv
+    assert lv["buy_sl"] == 4150.3, lv
+    assert lv["sell_sl"] == 4150.2, lv
 
 
 def port_free(host: str, port: int) -> bool:
@@ -210,7 +216,8 @@ def main() -> int:
 
         try:
             stopexe_defaults()
-            print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), SL 2 pips")
+            print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), "
+                  "SL 1.2 pips")
         except Exception as exc:                       # noqa: BLE001 - reported below
             failures.append(f"stopexe defaults: {exc}")
             print(f"FAIL stopexe   <- {exc}", file=sys.stderr)
