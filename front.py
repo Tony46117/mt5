@@ -243,7 +243,7 @@ a{color:var(--blue);text-decoration:none}
 .btn.danger{color:#ffb4b4}
 .btn.mini{padding:3px 10px;font-size:10px;border-radius:7px}
 .tradebtns{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.tbtn{padding:19px 0;font-size:16px;font-weight:700;letter-spacing:2.5px;color:#fff;
+.tbtn{padding:13px 0;font-size:16px;font-weight:700;letter-spacing:2.5px;color:#fff;
   cursor:pointer;border:1px solid transparent;border-radius:0px;transition:all .15s}
 .tbtn:hover{filter:brightness(1.15);box-shadow:var(--glow-strong)}
 .tbtn:active{transform:translateY(1px)}
@@ -251,6 +251,13 @@ a{color:var(--blue);text-decoration:none}
   border-color:var(--blue);box-shadow:0 0 22px rgba(77,166,255,.22)}
 .tsell{background:linear-gradient(160deg,var(--red2),var(--red3));
   border-color:var(--red);box-shadow:0 0 22px rgba(255,92,92,.15)}
+/* MT5-style execution buttons: side label + live price (SELL=bid, BUY=ask) */
+.tbtn .lbl{display:block;font-size:11px;letter-spacing:2.5px;opacity:.92}
+.tbtn .px{display:block;margin-top:3px;font-size:15px;font-weight:600;
+  letter-spacing:.5px;font-family:ui-monospace,Consolas,monospace}
+.tbtn.off,.tbtn.off:hover{background:#20242c;border-color:#3a4150;
+  color:var(--dim);box-shadow:none;cursor:not-allowed;filter:none}
+.tbtn.off:active{transform:none}
 .lotrow{display:flex;gap:0;align-items:stretch;border-radius:0px;overflow:hidden}
 .lotrow button{width:38px;background:var(--panel3);border:1px solid var(--line2);
   color:#fff;font-size:16px;cursor:pointer}
@@ -477,7 +484,14 @@ function linkOffline(){
  const pill=$id('sysPill');
  if(pill){pill.className='status-pill bad';
   $id('sysLbl').textContent='OFFLINE'}
- const d=$id('sysdot');if(d)d.className='dot off'}
+ const d=$id('sysdot');if(d)d.className='dot off'
+ /* bridge down: park the execution buttons grey until data flows again
+    (ids only exist on the panel page - skip elsewhere) */
+ for(const n of ['1','2']){
+  for(const bid of ['sellbtn'+n,'buybtn'+n]){
+   const b=$id(bid);if(b){b.classList.add('off');b.disabled=true}}
+  const spx=$id('sellpx'+n),apx=$id('buypx'+n);
+  if(spx)spx.textContent='-';if(apx)apx.textContent='-'}}
 function liveLink(sys){
  /* a terminal whose feed runs but which reports MT5's LOGGED-OUT marker
     (login 0) is NOT healthy: it must degrade the pill and show LOGOUT,
@@ -505,6 +519,35 @@ function filterSelect(selId,q){
     o.hidden=!hit;
     if(hit){visible++;if(!first)first=o}}
   if(visible===1&&first){sel.value=first.value||first.text}}
+/* suggestion drop-down under the *.symsearch inputs: the pair <select>
+   holds the whole broker feed, so one generic helper serves the
+   manual-execution, ORDER-ticket and schedule pickers alike.  The search
+   box just filters the select; the .symlist paints the tappable hits. */
+const SUGG={};
+function symSearch(selId,boxId,inputId){
+  const inp=$id(inputId);if(!inp)return;
+  filterSelect(selId,inp.value);
+  symSuggest(selId,boxId,inputId)}
+function symSuggest(selId,boxId,inputId){
+  const sel=$id(selId),box=$id(boxId),inp=$id(inputId);if(!sel)return;
+  const q=String((inp&&inp.value)||'').trim().toUpperCase();
+  const hits=[];
+  for(const o of sel.options){
+    const t=String(o.text||o.value||'');
+    if(!q||t.toUpperCase().indexOf(q)>=0)hits.push(t);
+    if(hits.length>=14)break}
+  SUGG[selId]=hits;
+  if(!box)return;
+  if(!hits.length){box.classList.remove('open');box.innerHTML='';return}
+  box.innerHTML=hits.map((s,i)=>'<div class="opt'+(s===sel.value?' on':'')+
+   '" onclick="symPick(\\''+selId+'\\',\\''+boxId+'\\',\\''+inputId+'\\','+i+')">'+
+   '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
+  box.classList.add('open')}
+function symPick(selId,boxId,inputId,i){
+  const s=(SUGG[selId]||[])[i];if(!s)return;
+  const sel=$id(selId);if(sel)sel.value=s;
+  const inp=$id(inputId);if(inp)inp.value=s;
+  const box=$id(boxId);if(box){box.classList.remove('open');box.innerHTML=''}}
 /* ring gauge: pct 0..100, returns svg */
 function ring(pct,col){
  pct=Math.max(0,Math.min(100,pct||0));
@@ -617,7 +660,8 @@ function schedModalHTML(n,edit){
   '<button class="closex" onclick="closeModal()">×</button></div>'+
   '<div class="frow">'+
   '<div class="fgroup" style="grid-column:span 2"><label>Pair · search the broker feed</label>'+
-   '<div class="symsearch"><input type="text" id="sps'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'sp'+n+'\\',this.value)"></div>'+
+   '<div class="symsearch"><input type="text" id="sps'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="symSearch(\\'sp'+n+'\\',\\'sphits'+n+'\\',\\'sps'+n+'\\')"></div>'+
+   '<div class="symlist" id="sphits'+n+'"></div>'+
    '<select id="sp'+n+'">'+
    (edit?'<option>'+esc(edit.pair)+'</option>':'')+'</select></div>'+
   '<div class="fgroup"><label>Side</label><select id="sdf'+n+'">'+
@@ -1011,7 +1055,7 @@ PANEL_JS = COMMON_JS + """
 let P=null,SCH=null,BUILT=false,MODAL_ACC=null,INFLIGHT={},ENG=null,ENGOPS=null;
 function num(v){return (v===null||v===undefined||isNaN(+v))?0:+v}
 function setBusy(n,busy){for(const b of document.querySelectorAll('#acc'+n+' .tbtn'))
- b.disabled=busy}
+ b.disabled=busy||b.classList.contains('off')}
 function hhmmss(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
 /* Schedules are stored and fired in UTC.  The panel used to render bare
    H:M:S with no zone, so an operator in UTC+3 who scheduled 14:30 saw the
@@ -1052,7 +1096,8 @@ function buildPanel(n){
  '<div class="body">'+
   '<div class="frow" style="margin-bottom:10px">'+
    '<div class="fgroup" style="grid-column:span 2"><label>Symbol · search the broker feed</label>'+
-    '<div class="symsearch"><input type="text" id="symsearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'sym'+n+'\\',this.value)"></div>'+
+    '<div class="symsearch"><input type="text" id="symsearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="symSearch(\\'sym'+n+'\\',\\'symhits'+n+'\\',\\'symsearch'+n+'\\')"></div>'+
+    '<div class="symlist" id="symhits'+n+'"></div>'+
     '<select id="sym'+n+'"></select></div>'+
    '<div class="fgroup"><label>Lot</label>'+
     '<div class="lotrow"><button type="button" onclick="stepLot('+n+',-0.01)">-</button>'+
@@ -1066,8 +1111,8 @@ function buildPanel(n){
   '<div class="chiprow" id="lchips'+n+'"></div>'+
   '<div class="chiprow" id="ochips'+n+'"></div>'+
   '<div class="tradebtns" style="margin-top:12px">'+
-   '<button class="tbtn tsell" onclick="doTrade('+n+',\\'SELL\\')">SELL</button>'+
-   '<button class="tbtn tbuy" onclick="doTrade('+n+',\\'BUY\\')">BUY</button>'+
+   '<button class="tbtn tsell off" id="sellbtn'+n+'" disabled onclick="doTrade('+n+',\\'SELL\\')"><span class="lbl">SELL</span><span class="px" id="sellpx'+n+'">-</span></button>'+
+   '<button class="tbtn tbuy off" id="buybtn'+n+'" disabled onclick="doTrade('+n+',\\'BUY\\')"><span class="lbl">BUY</span><span class="px" id="buypx'+n+'">-</span></button>'+
   '</div>'+
   '<div class="feedback" id="fb'+n+'">market execution via bridge</div>'+
   '<div class="order-wrap" style="gap:8px;flex-wrap:wrap">'+
@@ -1077,7 +1122,7 @@ function buildPanel(n){
    '<button class="btn order-mini" onclick="asmrPop(this);stexJump('+n+')">STOPEXE ↓</button></div>'+
   '</div>'+
   '<div class="sect"><h4>StopExe · straddle stops</h4>'+
-   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1.6 pips</b></span></div></div>'+
+   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1.0 pips</b></span></div></div>'+
   '<div class="body" id="stexbody'+n+'">'+
    '<div class="fgroup"><label>Search pair · broker feed</label>'+
     '<div class="symsearch"><input type="text" id="stexsearch'+n+'" placeholder="type XAU, EUR, GBP... (live quotes only)" autocomplete="off" oninput="stexFilter('+n+')"></div>'+
@@ -1085,10 +1130,9 @@ function buildPanel(n){
    '<div class="stex-live"><span class="chip">PAIR <b id="stexsym'+n+'">-</b></span>'+
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
-   '<div class="stex-bracket">'+
-    '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.6 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
+   '<div class="stex-bracket">'+     '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.0 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
      '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 2 pips</div></div>'+
-    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.6 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
+    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.0 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
      '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 2 pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
@@ -1097,11 +1141,11 @@ function buildPanel(n){
      '<input id="stexlot'+n+'" type="number" step="0.01" min="0.01" value="0.01">'+
      '<button type="button" onclick="stexStepLot('+n+',0.01)">+</button></div></div>'+
     '<div class="fgroup" style="grid-column:span 2"><label>Bracket</label>'+
-     '<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
-      '<option value="1.6" selected>±1.6 pips (3.2 total)</option>'+
-      '<option value="1">±1 pip (2 total)</option>'+
-      '<option value="2">±2 pips (4 total)</option>'+
-      '<option value="5">±5 pips (10 total)</option></select></div>'+
+'<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
+       '<option value="1.0" selected>±1.0 pips (2 total)</option>'+
+       '<option value="1">±1 pip (2 total)</option>'+
+       '<option value="2">±2 pips (4 total)</option>'+
+       '<option value="5">±5 pips (10 total)</option></select></div>'+
    '</div>'+
    '<div class="tradebtns" style="margin-top:2px">'+
     '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">EXECUTE STOPEXE</button>'+
@@ -1201,6 +1245,15 @@ async function closeAllBoth(el){
 function stexUniverse(n){
   const a=(P.accounts||{})[n]||{};const sp=a.spreads||{};
   return Object.keys(sp)}
+/* live [bid,ask,ts] row for a symbol from the panel's spots feed
+   (case-insensitive; null when the symbol is not streaming) */
+function spotRow(sym){
+  const s=(P&&P.spots)||{};
+  sym=String(sym||'').trim();if(!sym)return null;
+  let r=s[sym];
+  if(!r){const up=sym.toUpperCase();
+   for(const k in s){if(k.toUpperCase()===up){r=s[k];break}}}
+  return (r&&r[0])?r:null}
 function stexSel(n){const el=$id('stexsym'+n);
   return el?String(el.textContent||'').trim():''}
 function stexSetSel(n,sym){
@@ -1229,7 +1282,7 @@ function stexFilter(n){
    '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
   box.classList.add('open')}
 function stexPips(n){const el=$id('stexpips'+n);
-  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:1.6}
+  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:1.0}
 function stexJump(n){const b=$id('stexbody'+n);
   if(b)b.scrollIntoView({behavior:'smooth',block:'start'});
   const inp=$id('stexsearch'+n);if(inp)inp.focus({preventScroll:true})}
@@ -1336,7 +1389,8 @@ function orderModalHTML(n){
   '<button class="closex" onclick="closeModal()">×</button></div>'+
   '<div class="frow">'+
    '<div class="fgroup" style="grid-column:span 2"><label>Pair · search the broker feed</label>'+
-    '<div class="symsearch"><input type="text" id="osearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="filterSelect(\\'osym'+n+'\\',this.value)"></div>'+
+    '<div class="symsearch"><input type="text" id="osearch'+n+'" placeholder="type to filter - e.g. XAU, EUR..." autocomplete="off" oninput="symSearch(\\'osym'+n+'\\',\\'ohits'+n+'\\',\\'osearch'+n+'\\')"></div>'+
+    '<div class="symlist" id="ohits'+n+'"></div>'+
     '<select id="osym'+n+'"></select></div>'+
    '<div class="fgroup" style="grid-column:span 2"><label>Order type</label>'+
     '<select id="otyp'+n+'">'+['BUY LIMIT','BUY STOP','SELL LIMIT','SELL STOP']
@@ -1473,6 +1527,16 @@ function updAcc(n){const a=(P.accounts||{})[n]||{};
   '<span class="chip">FEED <b>'+(a.live?'LIVE':'STALE')+'</b></span>';
   const sym=$id('sym'+n).value;
   if(sym&&sp[sym]!=null){$id('tspr'+n).textContent=fmt(sp[sym],0)+' pts'}
+  /* MT5-style execution buttons: SELL carries the live BID, BUY the live
+     ASK (spots rows are [bid,ask,ts]); greyed + disabled while this
+     account's feed is not live so nobody fires into a dead terminal. */
+  const row=spotRow(sym);
+  const canTrade=!!(a.live&&!loggedOut&&!syncing&&row&&row[0]);
+  for(const bid of ['sellbtn'+n,'buybtn'+n]){
+   const b=$id(bid);if(b){b.classList.toggle('off',!canTrade);b.disabled=!canTrade}}
+  const spx=$id('sellpx'+n),apx=$id('buypx'+n);
+  if(spx)spx.textContent=canTrade?String(row[0]):'-';
+  if(apx)apx.textContent=canTrade?(row[1]||'-'):'-';
   posTable(n);pendTable(n);stexLive(n)}
 function renderSchedCount(n){const rows=(SCH||[]).filter(s=>String(s.account)===String(n));
  const cnt=$id('schcnt'+n);

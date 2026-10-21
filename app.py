@@ -710,7 +710,9 @@ def api_panel():
                 snap["accounts"][n] = _acc_panel(snap["accounts"][n], int(n))
         snap["system"] = _system()
         snap["spots"] = read_spots()
-        return jsonify({"ok": True, "ts": snap["ts"], "accounts": snap["accounts"], "system": _system()})
+        return jsonify({"ok": True, "ts": snap["ts"], "accounts": snap["accounts"],
+                        "system": snap["system"],
+                        "spots": {k: [b, a] for k, (b, a, _t) in snap["spots"].items() if b}})
     except Exception as exc:
         log.error(f"/api/panel error: {exc}")
         return jsonify({"ok": False, "error": str(exc), "accounts": {"1": {}, "2": {}}, "system": _system()}), 500
@@ -959,7 +961,7 @@ def api_stopexe_preview():
         return _fail("symbol is required")
     try:
         dpips = float(request.args.get("pips",
-                                       request.args.get("distance_pips", 1.6)))
+                                       request.args.get("distance_pips", 1.0)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:
@@ -981,9 +983,9 @@ def api_stopexe_preview():
 @app.post("/api/stopexe")
 @rate_limit(max_requests=60, window=60)
 def api_stopexe():
-    """StopExe: open a BUY STOP (ask + 1.6 pips) + SELL STOP (bid - 1.6
-    pips) straddle of `lot` around the live price - 3.2 pips bracket total
-    (gold at 4150 -> 4151.6 / 4148.4), both legs flighted async in one exec
+    """StopExe: open a BUY STOP (ask + 1.0 pips) + SELL STOP (bid - 1.0
+    pips) straddle of `lot` around the live price - 2.0 pips bracket total
+    (gold at 4150 -> 4151.0 / 4149.0), both legs flighted async in one exec
     command, each leg carrying its 2-pip protective SL."""
     d = request.get_json(silent=True) or {}
     try:

@@ -3,9 +3,9 @@
 """StopExe - stop-order execution framework (straddle stops).
 
 One EXECUTE opens a two-leg straddle around the live price:
+BUY STOP  at ask + 1.0 pips  with SL at entry - 2 pips
 
-    BUY STOP  at ask + 1.6 pips  with SL at entry - 2 pips
-    SELL STOP at bid - 1.6 pips  with SL at entry + 2 pips   (3.2-pip bracket)
+     SELL STOP at bid - 1.0 pips  with SL at entry + 2 pips   (2-pip bracket)
 
 Both legs travel in ONE exec command (EA v1.80 STOPEXESL): one file, one
 pass, both legs flighted async in the SAME tick with the SL attached,
@@ -87,7 +87,7 @@ def digits_for(symbol: str, price: str = "") -> int:
 
 
 def stopexe_levels(symbol: str, account: int,
-                   distance_pips: float = 1.6,
+                   distance_pips: float = 1.0,
                    sl_pips: float = STOPEXE_SL_PIPS) -> dict:
     """Bracket prices for a StopExe straddle, SLs included.  Raises
     ValueError with a human message when there is no live quote."""
@@ -152,7 +152,7 @@ def stopexe_levels(symbol: str, account: int,
 
 
 def place_stopexe(account: int, symbol: str, lot: float,
-                   distance_pips: float = 1.6,
+                   distance_pips: float = 1.0,
                    sl_pips: float = STOPEXE_SL_PIPS,
                    timeout: float = 10.0) -> dict:
     """Place the two-leg StopExe straddle in ONE exec round trip, each

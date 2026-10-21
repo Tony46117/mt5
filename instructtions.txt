@@ -1,0 +1,6 @@
+listen remove the words link live and hud live ,just let the beaming signal tell all
+improve the visualization in the dashboard its too rigid though do not add round corners,just improve the outlook
+also make the buy and sell buttons in accounts panels show live bid ask price values just like mt5
+make the execute stopexe button a bit smaller and rename it to stopexe
+and also factory should not be under scheduled trades it should be just below it
+

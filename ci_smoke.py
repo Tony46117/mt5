@@ -46,7 +46,7 @@ PAGES = {
 # The trading panel is static HTML+JS, so what the desk gets is visible in
 # the served markup: the StopExe bracket and its button must both be there.
 PAGE_NEEDLES = {
-    "/panel": ["\u00b11.6 pips (3.2 total)", "EXECUTE STOPEXE"],
+    "/panel": ["\u00b11.0 pips (2.0 total)", "EXECUTE STOPEXE"],
 }
 
 # JSON endpoints the pages call on first paint; each must answer ok=true
@@ -210,7 +210,7 @@ def main() -> int:
 
         try:
             stopexe_defaults()
-            print("OK   stopexe   <- default bracket \u00b11.6 pips (3.2 total), SL 2 pips")
+            print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), SL 2 pips")
         except Exception as exc:                       # noqa: BLE001 - reported below
             failures.append(f"stopexe defaults: {exc}")
             print(f"FAIL stopexe   <- {exc}", file=sys.stderr)
