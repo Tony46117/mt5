@@ -4,8 +4,8 @@
 
 The panel's NEWS panel slides through the next week of events (the feed is
 factory.py's ForexFactory calendar, high impact by default with an opt-out
-toggle).  Choosing an event and pressing TRADE arms N buy stops + N sell
-stops through the StopExe straddle 5 s BEFORE the release; with the closer
+toggle).  Choosing an event and pressing TRADE arms the chosen number of
+buy stops and sell stops 5 s BEFORE the release; with the closer
 toggle on, every position on that account is closed 5 s AFTER the release,
 so the whole execution window is 10 s wide (T-5 .. T+5).
 
@@ -382,6 +382,8 @@ def _public(plan: dict) -> dict:
         "symbol": plan["symbol"],
         "lot": plan["lot"],
         "orders": plan["orders"],
+        "buy_orders": plan.get("buy_orders", plan["orders"]),
+        "sell_orders": plan.get("sell_orders", plan["orders"]),
         "closer": plan["closer"],
         "distance_pips": plan.get("distance_pips", 1.0),
         "sl_pips": plan.get("sl_pips"),
@@ -449,6 +451,8 @@ def _load() -> None:
             pid = str(row["id"])
             row["event"] = dict(row.get("event") or {})
             row.setdefault("status", "scheduled")
+            row.setdefault("buy_orders", row.get("orders", 1))
+            row.setdefault("sell_orders", row.get("orders", 1))
             with _plans_lock:
                 _plans[pid] = row
         except Exception:
@@ -527,9 +531,11 @@ def _fire(pid: str) -> dict | None:
     with _plans_lock:
         _plans[pid]["status"] = "firing"
     try:
-        out = stopexe.place_stopexe_multi(
+        out = stopexe.place_stopexe_counts(
             int(plan["account"]), plan["symbol"], float(plan["lot"]),
-            int(plan["orders"]), float(plan.get("distance_pips", 1.0)),
+            int(plan.get("buy_orders", plan["orders"])),
+            int(plan.get("sell_orders", plan["orders"])),
+            float(plan.get("distance_pips", 1.0)),
             float(plan.get("sl_pips", stopexe.STOPEXE_SL_PIPS)),
             timeout=CONFIG.exec_timeout_seconds)
     except Exception as exc:
@@ -560,12 +566,15 @@ def _close(account: int) -> tuple[float, str]:
 def plan_event(account: int, symbol: str, lot: float, orders: int,
                event: dict, closer: bool,
                distance_pips: float = 1.0,
-               sl_pips: float | None = None) -> dict:
+               sl_pips: float | None = None,
+               buy_orders: int | None = None,
+               sell_orders: int | None = None) -> dict:
     """Arm one news event: straddle at T-5 s, optional flat at T+5 s.
 
     `event` is the calendar row the panel selected (dt_ms/dt, title,
     currency, impact); it is copied into the plan so a later feed refresh
-    cannot change what was traded.
+    cannot change what was traded.  `orders` is the legacy per-side count;
+    `buy_orders`/`sell_orders` let the panel size each side separately.
     """
     _load()
     account = int(account)
@@ -580,6 +589,12 @@ def plan_event(account: int, symbol: str, lot: float, orders: int,
     orders = int(orders)
     if not 1 <= orders <= 50:
         raise ValueError("orders must be 1..50")
+    buy = int(orders if buy_orders is None else buy_orders)
+    sell = int(orders if sell_orders is None else sell_orders)
+    if not 0 <= buy <= 50 or not 0 <= sell <= 50:
+        raise ValueError("buy/sell orders must be 0..50 each")
+    if buy + sell <= 0:
+        raise ValueError("at least one buy or sell stop is required")
     ms = _event_ms(event.get("dt_ms", event.get("dt")))
     if ms is None:
         raise ValueError("event needs a release time")
@@ -594,7 +609,9 @@ def plan_event(account: int, symbol: str, lot: float, orders: int,
         "account": account,
         "symbol": symbol,
         "lot": lot,
-        "orders": orders,
+        "orders": max(buy, sell),
+        "buy_orders": buy,
+        "sell_orders": sell,
         "closer": bool(closer),
         "distance_pips": float(distance_pips),
         "sl_pips": sl,

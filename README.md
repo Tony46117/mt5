@@ -313,12 +313,14 @@ paths and file ownership stay consistent.
   until the filter chip is toggled off, draws the release country from
   factory.py's Natural Earth borders (`/api/news/map`) and picks the pair
   from the broker probe's tradeable, live-quoted symbols
-  (`/api/news/quotes`). **TRADE** arms N buy stops + N sell stops through
-  the StopExe straddle 5 s before the release, each leg carrying a
-  1.2-pip SL; the **CLOSER** toggle (top right) additionally closes every
-  position on that account 5 s after the release, so the whole execution
-  window is 10 s. Plans survive a restart (`news_plans.json`) and are
-  re-armed on boot without firing twice. **DECLINE** closes the panel.
+  (`/api/news/quotes`). **TRADE** takes separate buy-stop and sell-stop
+  counts and arms them 5 s before the release, each leg carrying a
+  1.2-pip SL (equal counts use the atomic StopExe straddle, unequal
+  counts use one PENDING batch); the **CLOSER** toggle (top right)
+  additionally closes every position on that account 5 s after the
+  release, so the whole execution window is 10 s. Plans survive a
+  restart (`news_plans.json`) and are re-armed on boot without firing
+  twice. **DECLINE** closes the panel.
 - CLI:
 
 ```bash

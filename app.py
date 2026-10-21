@@ -548,7 +548,7 @@ def api_news_plans():
 @app.post("/api/news/plan")
 @rate_limit(max_requests=30, window=60)
 def api_news_plan():
-    """Arm an event: N buy stops + N sell stops at T-5 s, flat at T+5 s."""
+    """Arm an event: buy stops + sell stops at T-5 s, flat at T+5 s."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
@@ -562,6 +562,8 @@ def api_news_plan():
     try:
         lot = float(d.get("lot", 0))
         orders = int(d.get("orders", d.get("n", 1)))
+        buy = int(d.get("buy_orders", orders))
+        sell = int(d.get("sell_orders", orders))
         dpips = float(d.get("distance_pips", 1.0))
     except (TypeError, ValueError):
         return _fail("bad lot / orders / distance")
@@ -569,6 +571,10 @@ def api_news_plan():
         return _fail("lot out of range")
     if not 1 <= orders <= 50:
         return _fail("orders must be 1..50")
+    if not 0 <= buy <= 50 or not 0 <= sell <= 50:
+        return _fail("buy/sell orders must be 0..50 each")
+    if buy + sell <= 0:
+        return _fail("at least one buy or sell stop is required")
     if not 0.5 <= dpips <= 100:
         return _fail("distance must be 0.5..100 pips")
     event = d.get("event") or {}
@@ -591,7 +597,8 @@ def api_news_plan():
         return _fail(lot_err)
     try:
         plan = news_mod.plan_event(account, symbol, lot, orders, event,
-                                   bool(d.get("closer")), dpips)
+                                   bool(d.get("closer")), dpips,
+                                   buy_orders=buy, sell_orders=sell)
     except ValueError as exc:
         return _fail(str(exc))
     except Exception as exc:

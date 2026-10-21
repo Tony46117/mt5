@@ -19,9 +19,11 @@ batch (same single round trip).
 `place_stopexe_multi` arms N straddles (N buy stops + N sell stops) in
 ONE `send_batch`: all command files land before the EA's next drain, so
 the whole stack is flighted in a single round trip instead of N serial
-ones - that is what the news module uses to bracket a release 5 s out.
-The audit rows are written on a daemon thread so logging never sits on
-the execution path.
+ones.  `place_stopexe_counts` accepts separate buy/sell counts: equal
+counts use that straddle path, unequal counts use one PENDING batch with
+the same SLs - that is what the news module uses to bracket a release
+5 s out.  The audit rows are written on a daemon thread so logging never
+sits on the execution path.
 
 Pip size follows the quote itself:
 
@@ -220,6 +222,102 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
     straddles = [_straddle_from_detail(lv, ok, detail)
                  for ok, detail in results]
     return _stopexe_result(symbol, account, lot, lv, straddles, ms)
+
+
+def place_stopexe_counts(account: int, symbol: str, lot: float,
+                         buy_orders: int, sell_orders: int,
+                         distance_pips: float = 1.0,
+                         sl_pips: float = STOPEXE_SL_PIPS,
+                         timeout: float = 20.0) -> dict:
+    """Arm an arbitrary number of buy stops and sell stops in ONE batch.
+
+    Equal counts use the atomic STOPEXESL straddle path.  Unequal counts
+    fly 0..50 BUYSTOPs + 0..50 SELLSTOPs through the PENDING batch, each
+    leg carrying the same protective SL on the OrderSend.
+    """
+    buy = int(buy_orders)
+    sell = int(sell_orders)
+    if not 0 <= buy <= 50 or not 0 <= sell <= 50:
+        raise ValueError("buy/sell orders must be 0..50 each")
+    if buy + sell <= 0:
+        raise ValueError("at least one buy or sell stop is required")
+    if buy == sell:
+        out = place_stopexe_multi(account, symbol, lot, buy, distance_pips,
+                                  sl_pips, timeout)
+        out.setdefault("buy_orders", buy)
+        out.setdefault("sell_orders", sell)
+        return out
+
+    from executor import sender_for
+
+    lv = stopexe_levels(symbol, account, distance_pips, sl_pips)
+    broker_sym = lv["broker_symbol"]
+    digits = lv["digits"]
+    sender = sender_for(account)
+    buy_cmd = ("PENDING", broker_sym, "BUYSTOP", f"{lot:.2f}",
+               f"{lv['buy_price']:.{digits}f}",
+               f"{lv['buy_sl']:.{digits}f}", "0",
+               str(STOPEXE_MAGIC), STOPEXE_COMMENT)
+    sell_cmd = ("PENDING", broker_sym, "SELLSTOP", f"{lot:.2f}",
+                f"{lv['sell_price']:.{digits}f}",
+                f"{lv['sell_sl']:.{digits}f}", "0",
+                str(STOPEXE_MAGIC), STOPEXE_COMMENT)
+    t0 = time.perf_counter()
+    try:
+        results = list(sender.send_batch(*([buy_cmd] * buy + [sell_cmd] * sell),
+                                         timeout=timeout))
+    except Exception as exc:
+        raise ValueError(str(exc))
+    ms = (time.perf_counter() - t0) * 1000.0
+
+    legs: list[dict] = []
+    for i, (ok, detail) in enumerate(results):
+        is_buy = i < buy
+        legs.append({
+            "type": "BUYSTOP" if is_buy else "SELLSTOP",
+            "price": lv["buy_price"] if is_buy else lv["sell_price"],
+            "ok": bool(ok),
+            "ticket": detail.split("|")[1] if ok and "|" in detail else "",
+            "sl": lv["buy_sl"] if is_buy else lv["sell_sl"],
+            "detail": detail,
+        })
+    placed = [leg for leg in legs if leg["ok"]]
+    bad = next((leg for leg in legs if not leg["ok"]), None)
+    if not placed:
+        raise ValueError(f"STOPEXE rejected - {bad['detail'] if bad else 'no ack'}")
+    out = {
+        "symbol": symbol,
+        "broker_symbol": broker_sym,
+        "account": account,
+        "lot": lot,
+        "bid": lv["bid"],
+        "ask": lv["ask"],
+        "buy_price": lv["buy_price"],
+        "sell_price": lv["sell_price"],
+        "distance_pips": lv["distance_pips"],
+        "buy_sl": lv["buy_sl"],
+        "sell_sl": lv["sell_sl"],
+        "sl_pips": lv["sl_pips"],
+        "legs": legs,
+        "ok": len(placed),
+        "orders": buy + sell,
+        "buy_orders": buy,
+        "sell_orders": sell,
+        "n": len(legs),
+        "ms": round(ms, 1),
+        "tickets": [leg["ticket"] for leg in placed],
+    }
+    threading.Thread(target=_log_legs, args=(account, symbol, lot, legs, ms),
+                     daemon=True, name="stopexe-log").start()
+    if len(placed) == len(legs):
+        out["detail"] = (f"STOPEXE {symbol} {lot:g} - {buy} BUY STOP(S) @ "
+                         f"{lv['buy_price']} SL {lv['buy_sl']} + {sell} SELL "
+                         f"STOP(S) @ {lv['sell_price']} SL {lv['sell_sl']}")
+    else:
+        out["detail"] = (f"PARTIAL {symbol} - {len(placed)}/{len(legs)} stops "
+                         f"placed; rejected: {bad['detail'] if bad else 'no ack'} "
+                         f"- CLOSE deletes the rest")
+    return out
 
 
 def _straddle_from_detail(lv: dict, ok: bool, detail: str) -> dict:

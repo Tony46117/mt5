@@ -1718,7 +1718,7 @@ refresh();setInterval(refresh,600);
    the release (/api/news/plan).  With CLOSER on, the account is closed
    through close.py's fast path 5 s after the release - a 10 s window. */
 let NW={open:false,acc:1,idx:0,high:true,closer:false,events:[],map:{},
-        pending:{},quotes:{},sel:{symbol:'',lot:0.01,orders:1},plans:[],
+        pending:{},quotes:{},sel:{symbol:'',lot:0.01,buy:1,sell:1},plans:[],
         busy:false,timer:null,plansTs:0,key:'',retry:null,eventCloser:false};
 function newsEvent(){return NW.events[NW.idx]||null}
 function newsKey(e){return String(e.dt_ms)+'|'+String(e.title)}
@@ -1903,15 +1903,19 @@ function newsControls(){
    '<div class="fgroup"><label>Lot (each stop)</label>'+
     '<input id="newsLot" type="number" step="0.01" min="0.01" value="'+
     Number(NW.sel.lot||0.01).toFixed(2)+'" oninput="newsPickSym()"></div>'+
-   '<div class="fgroup"><label>Buy stops + sell stops</label>'+
-    '<input id="newsOrd" type="number" step="1" min="1" max="50" value="'+
-    Number(NW.sel.orders||1)+'" oninput="newsPickSym()"></div>'
+   '<div class="fgroup"><label>Sell stops</label>'+
+    '<input id="newsOrdSell" type="number" step="1" min="0" max="50" value="'+
+    Number(NW.sel.sell||0)+'" oninput="newsPickSym()"></div>'+
+   '<div class="fgroup"><label>Buy stops</label>'+
+    '<input id="newsOrdBuy" type="number" step="1" min="0" max="50" value="'+
+    Number(NW.sel.buy||0)+'" oninput="newsPickSym()"></div>'
 }
 function newsPickSym(){
-  const s=$id('newsSym'),l=$id('newsLot'),o=$id('newsOrd');
+  const s=$id('newsSym'),l=$id('newsLot'),so=$id('newsOrdSell'),bo=$id('newsOrdBuy');
   if(s)NW.sel.symbol=String(s.value||'').trim();
   if(l)NW.sel.lot=parseFloat(l.value)||0.01;
-  if(o)NW.sel.orders=Math.max(1,Math.min(50,parseInt(o.value,10)||1));
+  if(so)NW.sel.sell=Math.max(0,Math.min(50,parseInt(so.value,10)||0));
+  if(bo)NW.sel.buy=Math.max(0,Math.min(50,parseInt(bo.value,10)||0));
   newsPaintQuote()
 }
 function newsSetAcc(n){NW.acc=(+n===2)?2:1;NW.sel.symbol='';newsQuotes();newsPaintPlans()}
@@ -1932,7 +1936,8 @@ function newsPaintQuote(){
   box.innerHTML='<span class="chip">BID <b>'+esc(r.bid)+'</b></span>'+
     '<span class="chip">ASK <b>'+(r.ask==null?'-':esc(r.ask))+'</b></span>'+
     '<span class="chip">SPREAD <b>'+esc(spr)+'</b></span>'+
-    '<span class="chip">STOPS <b>'+(NW.sel.orders*2)+'</b></span>'+
+    '<span class="chip">STOPS <b>'+((NW.sel.buy||0)+(NW.sel.sell||0))+
+      '</b> ('+(NW.sel.buy||0)+'B / '+(NW.sel.sell||0)+'S)</span>'+
     '<span class="chip">BRACKET <b>±1.0 pips</b></span>'+
     '<span class="chip">SL <b>1.2 pips</b></span>'+
     '<span class="chip">CLOSER <b>'+(NW.eventCloser?'T+5s':'off')+'</b></span>'+
@@ -1945,11 +1950,15 @@ async function newsTrade(){
   const rows=NW.quotes[NW.acc]||[];
   if(!rows.some(function(r){return r.symbol===NW.sel.symbol})){
     toast('pick an exact quote from the probed feed first',false);return}
+  if((NW.sel.buy||0)+(NW.sel.sell||0)<1){
+    toast('set at least one buy or sell stop',false);return}
   NW.busy=true;
   const btn=$id('newsTradeBtn');if(btn)btn.disabled=true;
   try{
     const j=await post('/api/news/plan',{account:NW.acc,symbol:NW.sel.symbol,
-      lot:parseFloat(NW.sel.lot),orders:parseInt(NW.sel.orders,10),
+      lot:parseFloat(NW.sel.lot),
+      orders:Math.max(NW.sel.buy||0,NW.sel.sell||0),
+      buy_orders:NW.sel.buy||0,sell_orders:NW.sel.sell||0,
       closer:!!NW.eventCloser,event:{dt:e.dt,dt_ms:e.dt_ms,currency:e.currency,
       impact:e.impact,title:e.title,forecast:e.forecast,previous:e.previous,
       country:e.country}});
@@ -1982,7 +1991,9 @@ function newsPaintPlans(){
     const ev=p.event||{};
     return '<div class="prow"><span class="st'+(bad?' bad':'')+'">'+esc(st)+
       '</span><span class="mono">'+esc(p.symbol)+'</span>'+
-      '<span class="mut">'+p.orders+'x'+Number(p.lot).toFixed(2)+'</span>'+
+      '<span class="mut">'+(p.buy_orders!=null?p.buy_orders:p.orders)+'B + '+
+      (p.sell_orders!=null?p.sell_orders:p.orders)+'S x'+
+      Number(p.lot).toFixed(2)+'</span>'+
       '<span class="mut">'+esc(t.toLocaleTimeString('en-GB'))+'</span>'+
       (p.closer?'<span class="chip">CLOSER</span>':'')+
       '<span class="mut" style="flex:1;min-width:110px;overflow:hidden;'+
@@ -2327,7 +2338,8 @@ function renderSched(){
     pair: p.symbol,
     side: 'STRADDLE',
     lot: p.lot,
-    n_positions: p.orders,
+    n_positions: (p.buy_orders!=null?p.buy_orders:p.orders)+
+      (p.sell_orders!=null?p.sell_orders:p.orders),
     exec_h: '', exec_m: '', exec_s: '',
     close_h: '', close_m: '', close_s: '',
     next_fire: p.event_ms?new Date(Number(p.event_ms)).toISOString():'',
