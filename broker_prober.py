@@ -38,6 +38,28 @@ def _cat_quoted(fields: list[str]) -> bool:
     except ValueError:
         return False
 
+# Brokers name spot metals differently: FxPro lists GOLD/GOLDoz, not
+# XAUUSD.  The catalogue knows the name but a symbol the terminal never
+# selected reports bid/ask 0, so the prober has to PROBE it once to make
+# the EA subscribe it; the next catalogue/spots dump then carries the quote.
+QUOTE_ALIASES = ("XAU", "GOLD", "XAG", "SILVER")
+
+
+def _unquoted_quote_aliases(cat: dict[str, dict]) -> list[str]:
+    """Catalogue metals whose quote is still zero (not yet subscribed)."""
+    out: list[str] = []
+    for sym, info in cat.items():
+        up = str(sym).upper()
+        if not any(up.startswith(alias) for alias in QUOTE_ALIASES):
+            continue
+        try:
+            if float((info or {}).get("bid") or 0.0) > 0.0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        out.append(sym)
+    return out
+
 def catalogue_symbols_for(inst: int) -> list[str]:
     """Every symbol this account can see, broker-quoted ones first.
 
@@ -399,8 +421,10 @@ class BrokerProber:
                      f"symbols - full quote universe (no round trips)")
             try:
                 missing = [s for s in probe_symbols_for(inst) if s not in cat]
-                if missing:
-                    self.probe_terminal(inst, missing)
+                unquoted = [s for s in _unquoted_quote_aliases(cat)
+                            if s not in missing]
+                if missing or unquoted:
+                    self.probe_terminal(inst, missing + unquoted)
             except Exception as exc:
                 log.debug(f"prober: terminal {inst} gap probe skipped: {exc}")
             return

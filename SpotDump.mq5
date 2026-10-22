@@ -551,7 +551,9 @@ bool IsClassicPair(string name)
        "EURGBP","EURJPY","GBPJPY","AUDJPY","CHFJPY","EURCHF","EURAUD",
        "GBPCHF","CADJPY","AUDNZD","GBPAUD","EURNZD","AUDCAD","NZDJPY",
        "GBPNZD","EURCAD","GBPCAD","AUDCHF","NZDCHF","CADCHF",
-       "XAUUSD","XAGUSD",
+       // Metals: prefix-matched so every broker name (XAUUSD, XAUUSD.raw,
+       // FxPro's GOLD/GOLDoz/GOLDEURO, XAGUSD, SILVER) is subscribed.
+       "XAU","XAG","GOLD","SILVER",
        // Deriv synthetics (Boom/Crash/Jump/Volatility/Step/RangeBreak):
        // prefix-matched, so they are dumped, probed and tradeable even
        // when the operator never added them to Market Watch.
@@ -1551,9 +1553,10 @@ void ExecuteLine(string line)
          return;
         }
 
+      int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       AppendOut(id, "OK",
                 sym + "|" +
-                IntegerToString(SymbolInfoInteger(sym, SYMBOL_DIGITS)) + "|" +
+                IntegerToString(dg) + "|" +
                 IntegerToString(SymbolInfoInteger(sym, SYMBOL_FILLING_MODE)) + "|" +
                 IntegerToString(SymbolInfoInteger(sym, SYMBOL_TRADE_EXEMODE)) + "|" +
                 IntegerToString(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE)) + "|" +
@@ -1566,7 +1569,9 @@ void ExecuteLine(string line)
                 IntegerToString(SymbolInfoInteger(sym, SYMBOL_SPREAD)) + "|" +
                 DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_CONTRACT_SIZE), 2) + "|" +
                 DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE), 8) + "|" +
-                DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE), 8));
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE), 8) + "|" +
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_BID), dg) + "|" +
+                DoubleToString(SymbolInfoDouble(sym, SYMBOL_ASK), dg));
       return;
      }
 
