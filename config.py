@@ -27,6 +27,11 @@ ACCESS_POINT_FILE = Path(__file__).resolve().parent / "access_points.env"
 # first manual/one-click success without retyping host:port.  Runtime state,
 # not config - safe to delete.
 ACCESS_POINT_CACHE_FILE = Path(__file__).resolve().parent / "access_points.json"
+# The saved-accounts book.  config only reads it to auto-discover the trade
+# servers of accounts the operator has added ("new accounts + their server
+# details"), so a fresh account can be reached before its first successful
+# login has taught the cache anything.
+KNOWN_ACCOUNTS_FILE = Path(__file__).resolve().parent / "known_accounts.json"
 
 TERMINALS = {
     1: {
@@ -112,7 +117,72 @@ SERVER_ACCESS_POINTS: dict[str, str] = {
                                     "mt5-global11.dcglobalfarm.com:21101"),
     "HFMarketsKE-Live15": os.getenv("MT5_AP_HFM_LIVE15",
                                     "mt5-ga-8.dcglobalfarm.com:21501"),
+    "FxPro-MT5": os.getenv("MT5_AP_FXPRO_MT5",
+                           "ecn-london.fxpro.com:443"),
 }
+
+# Broker families whose server names are auto-resolved even when they are
+# not in the exact table above (FxPro renames its clusters "FxPro-MT5
+# Live02", "FxPro.Global-MT5", ...; they all answer on the same gateway).
+# Each entry: (server-name fragments, candidate host:port list, fastest
+# first).  A fragment match only supplies candidates - an explicit
+# access_points.env entry or a learned address still wins.
+BROKER_ACCESS_POINT_GUESSES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("FXPRO-MT5", "FXPRO.GLOBAL-MT5"),
+     ("ecn-london.fxpro.com:443", "149.5.86.199:443",
+      "195.88.176.132:443")),
+)
+_AP_FILE_TTL_S = 5.0
+_SAVED_SERVERS_CACHE: tuple[float, tuple[int, int] | None,
+                            dict[str, str]] | None = None
+
+
+def saved_account_servers() -> dict[str, str]:
+    """login -> trade server for every account in known_accounts.json.
+
+    Read directly (accounts.py imports config, so importing it back would
+    cycle) and memoized on (mtime_ns, size): new accounts are picked up as
+    soon as the book changes, with no restart and no per-call parse.
+    """
+    global _SAVED_SERVERS_CACHE
+    import time
+    try:
+        st = KNOWN_ACCOUNTS_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    now = time.monotonic()
+    if (_SAVED_SERVERS_CACHE and _SAVED_SERVERS_CACHE[1] == key
+            and now - _SAVED_SERVERS_CACHE[0] < _AP_FILE_TTL_S):
+        return _SAVED_SERVERS_CACHE[2]
+    out: dict[str, str] = {}
+    if key is not None:
+        try:
+            import json
+            doc = json.loads(KNOWN_ACCOUNTS_FILE.read_text())
+            for acc in doc.get("accounts", []) if isinstance(doc, dict) else []:
+                login = str(acc.get("login", "")).strip()
+                server = str(acc.get("server", "")).strip()
+                if login and server:
+                    out[login] = server
+        except (OSError, ValueError, AttributeError):
+            out = {}
+    _SAVED_SERVERS_CACHE = (now, key, out)
+    return out
+
+
+def _guessed_access_points(server: str) -> list[str]:
+    """Access points inferred from a broker family name (no hardcoding of
+    individual account logins - any saved FXPro account gets these)."""
+    name = str(server or "").upper()
+    out: list[str] = []
+    for fragments, addresses in BROKER_ACCESS_POINT_GUESSES:
+        if any(frag in name for frag in fragments):
+            for address in addresses:
+                norm = normalize_access_point(address)
+                if norm and norm not in out:
+                    out.append(norm)
+    return out
 
 _ACCESS_POINT_RE = re.compile(r"^([^\s:/]+):(\d{1,5})$")
 
@@ -144,7 +214,6 @@ def normalize_access_point(address: str) -> str:
 
 
 _AP_FILE_CACHE: tuple[float, tuple[int, int] | None, dict[str, str]] | None = None
-_AP_FILE_TTL_S = 5.0
 
 
 def _parse_access_point_text(text: str) -> dict[str, str]:
@@ -240,9 +309,11 @@ def access_point_candidates(server: str) -> list[str]:
         return []
     out: list[str] = []
     env = os.getenv(_access_point_env_key(name), "").strip()
-    for cand in (env, learned_access_points().get(name, ""),
-                 _registry_file_points().get(name, ""),
-                 SERVER_ACCESS_POINTS.get(name, "")):
+    candidates = [env, learned_access_points().get(name, ""),
+                  _registry_file_points().get(name, ""),
+                  SERVER_ACCESS_POINTS.get(name, "")]
+    candidates.extend(_guessed_access_points(name))
+    for cand in candidates:
         norm = normalize_access_point(cand) if cand else ""
         if norm and norm not in out:
             out.append(norm)
@@ -303,6 +374,15 @@ def all_access_points() -> dict[str, dict]:
         out[server] = {"address": addr, "source": "registry"}
     for server, addr in learned_access_points().items():
         out[server] = {"address": addr, "source": "learned"}
+    # Newly saved accounts: surface their trade servers (and any broker-
+    # family access point we can infer) without waiting for a first login
+    # to teach the learned cache.
+    for server in sorted(set(saved_account_servers().values())):
+        if server in out:
+            continue
+        guesses = _guessed_access_points(server)
+        if guesses:
+            out[server] = {"address": guesses[0], "source": "saved-account"}
     for key, value in os.environ.items():
         if key.startswith("MT5_AP_") and value.strip():
             out[f"env:{key}"] = {"address": normalize_access_point(value),

@@ -95,7 +95,7 @@ shortcut (`setup`, `run`, `stop`, `docker`, `logs`, `shell`, `down`,
 | `close.py`      | Database-free concurrent close of all positions (one atomic `CLOSEALL` per terminal). |
 | `monitor.py`    | Dual-account live dashboard: open positions only, strict identity checks, no event log. |
 | `session.py`    | Obfuscated credential store (`session.json`), stat-validated on every read so account changes propagate live across all processes. |
-| `config.py`     | Paths, tunables and the access-point registry (`access_points.env` + `MT5_AP_*` env + the auto-learned `access_points.json`). |
+| `config.py`     | Paths, tunables and the access-point registry (`access_points.env` + `MT5_AP_*` env + the auto-learned `access_points.json`). It also reads the saved-account book (`known_accounts.json`) so a newly added account's trade server is discovered on the next login, and resolves FxPro cluster names (`FxPro-MT5*`, `FxPro.Global-MT5*`) through their gateway. |
 | `account_engine.py` | Account Integration Engine: concurrent per-terminal login/switch/adopt/logout of any account (live or demo) with pre-validation, broker-verified results (a login only counts once the trade server authorized it, not when the EA merely echoes the number), demo/live detection, access-point registry (`--access-point`, `--servers`), an operation registry, CLI (`--login/--adopt/--status/...`) and `/api/engine/*` endpoints for the panel. |
 | `database.py`   | SQLite/Postgres storage for schedules and the fired log. |
 | `broker_prober.py` | Probes the account's full quote universe and order-fill behaviour. The EA writes every symbol the account can see to `symbols.csv`, so the prober reports the whole broker catalogue (including Deriv's Boom/Crash/Jump/Volatility indices and any symbol a broker renames with extra letters, e.g. `XAUUSD247`, `EURUSD.Z`) with no exec round trips, then only PROBEs what the catalogue is missing. Both terminals probe concurrently. |
@@ -227,8 +227,10 @@ header even echoes it back - but never opens a connection and never writes
 a single line to its journal. That is the "login takes forever and then
 says the password is wrong" symptom.
 
-The fix is to hand MT5 the server's **access point** (host:port) once. Add
-it to `access_points.env` in this directory:
+The fix is to hand MT5 the server's **access point** (host:port) once.
+Saved accounts are auto-discovered from `known_accounts.json`; known broker
+families (FxPro MT5) are resolved through their gateway; anything else goes
+in `access_points.env` in this directory:
 
 ```
 # server name exactly as the broker writes it = host:port
@@ -315,8 +317,9 @@ paths and file ownership stay consistent.
   from the broker probe's tradeable, live-quoted symbols
   (`/api/news/quotes`). **TRADE** takes separate buy-stop and sell-stop
   counts and arms them 5 s before the release, each leg carrying a
-  1.0-pip SL (equal counts use the atomic StopExe straddle, unequal
-  counts use one PENDING batch); the **CLOSER** toggle (top right)
+  1.0-pip SL, widened automatically to the broker's stops/freeze minimum
+  (equal counts use the atomic StopExe straddle, unequal counts use one
+  PENDING batch); the **CLOSER** toggle (top right)
   additionally closes every position on that account 5 s after the
   release, so the whole execution window is 10 s. Plans survive a
   restart (`news_plans.json`) and are re-armed on boot without firing

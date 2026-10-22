@@ -7,6 +7,9 @@ BUY STOP  at ask + 1.0 pips  with SL at entry - 1.0 pips
 
      SELL STOP at bid - 1.0 pips  with SL at entry + 1.0 pips   (2-pip bracket)
 
+Both distances are widened automatically when the broker's stops/freeze
+level for that symbol demands it (e.g. HFM NZDUSD -> 3.1 pips).
+
 Both legs travel in ONE exec command (EA v1.80 STOPEXESL): one file, one
 pass, both legs flighted async in the SAME tick with the SL attached,
 one ack - either both legs rest on the broker together or neither
@@ -33,12 +36,20 @@ Pip size follows the quote itself:
     * 5- and 3-digit forex -> 10 * point (0.0001 / 0.01)
     * everything else -> 1 * point
 
+The bracket (and its protective SL) is never tighter than the broker's
+own SYMBOL_TRADE_STOPS_LEVEL / SYMBOL_TRADE_FREEZE_LEVEL.  Those levels
+are read per account and symbol from the terminal catalogue, converted
+from points to pips, and given one point of cushion: HFM's NZDUSD (30
+points = 3.0 pips) therefore arms at 3.1, while FXPro's zero-level pairs
+keep the desk's 1.0-pip bracket.  No symbol-name hardcoding.
+
 Digits come from the broker probe when available, else from the live
 price string (a quoted price always carries its own precision).
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -54,25 +65,88 @@ STOPEXE_COMMENT = "stopexe"
 STOPEXE_SLOTS = 8
 # Protective stop attached to every straddle leg at OrderSend time.
 STOPEXE_SL_PIPS = 1.0
-# HFM quotes NZDUSD with SYMBOL_TRADE_STOPS_LEVEL = 30 points (3 pips), so a
-# stop closer to the quote is refused by the EA precheck and by the server
-# (10016).  Only NZDUSD gets the floor: XAUUSD / EURUSD report 0 and keep the
-# desk's 1-pip bracket.
-NZDUSD_MIN_DISTANCE_PIPS = 3.0
 # The broker compares the level against the bid/ask AT OrderSend, not against
-# the quote we priced from, so a level sitting exactly on the 3.0-pip minimum
-# is rejected as soon as the price ticks ("sell stop must sit BELOW the bid",
+# the quote we priced from, so a level sitting exactly on its minimum is
+# rejected as soon as the price ticks ("sell stop must sit BELOW the bid",
 # retcode 10015).  One point of cushion keeps the level outside the minimum
 # without widening the bracket more than the broker forces.
-STOP_DRIFT_PIPS = 0.1
+STOP_CUSHION_POINTS = float(os.getenv("MT5_STOP_CUSHION_POINTS", "1") or 1)
 
 
-def min_distance_pips(symbol: str) -> float:
-    """Broker-mandated minimum entry offset for `symbol`, in pips."""
-    s = str(symbol or "").upper()
-    if "NZDUSD" in s:
-        return NZDUSD_MIN_DISTANCE_PIPS + STOP_DRIFT_PIPS
-    return 0.0
+def symbol_trade_levels(symbol: str, account: int | None = None) -> dict:
+    """Broker trade levels for `symbol` on `account`.
+
+    Reads the terminal's own catalogue first (written by the EA, no round
+    trip); when that is unavailable, falls back to the broker probe.  The
+    fields mirror PROBE: digits, stops_level and freeze_level are points.
+    """
+    sym = str(symbol or "")
+    try:
+        inst = int(account) if account is not None else None
+    except (TypeError, ValueError):
+        inst = None
+    if inst in (1, 2):
+        try:
+            from spot import read_symbol_catalogue
+            rows = read_symbol_catalogue(inst)
+            row = rows.get(sym)
+            if row is None:
+                for key, value in rows.items():
+                    if str(key).upper() == sym.upper():
+                        row = value
+                        break
+            if row and len(row) >= 8:
+                return {"digits": max(0, int(row[1])),
+                        "stops_level": max(0, int(row[6])),
+                        "freeze_level": max(0, int(row[7]))}
+        except Exception:
+            pass
+    try:
+        import broker_prober
+        terminals = broker_prober.get_prober().report()["terminals"]
+        targets = [str(inst)] if inst in (1, 2) else ["1", "2"]
+        for key in targets:
+            rows = terminals.get(key) or {}
+            info = rows.get(sym)
+            if info is None:
+                for name, value in rows.items():
+                    if str(name).upper() == sym.upper():
+                        info = value
+                        break
+            if info and info.get("digits") is not None:
+                return {"digits": max(0, int(info["digits"])),
+                        "stops_level": max(0, int(info.get("stops_level") or 0)),
+                        "freeze_level": max(0, int(info.get("freeze_level") or 0))}
+    except Exception:
+        pass
+    return {}
+
+
+def broker_min_distance_pips(symbol: str, account: int | None = None,
+                             digits: int | None = None) -> float:
+    """Smallest offset this broker/trade server accepts for `symbol`, in pips.
+
+    The minimum is per broker AND per symbol: HFM quotes NZDUSD with
+    SYMBOL_TRADE_STOPS_LEVEL = 30 points (3.0 pips), while FXPro and most
+    majors report 0 and keep the desk's 1-pip bracket.  Converting points to
+    pips keeps gold/silver/3- and 5-digit forex correct automatically.
+    """
+    info = symbol_trade_levels(symbol, account)
+    d = int(digits if digits is not None else (info.get("digits")
+                                               or digits_for(symbol)))
+    levels = max(int(info.get("stops_level") or 0),
+                 int(info.get("freeze_level") or 0))
+    if levels <= 0:
+        return 0.0
+    point = 10.0 ** (-max(0, d))
+    pip = pip_size(symbol, d)
+    return round(levels * point / pip + STOP_CUSHION_POINTS * point / pip, 4)
+
+
+def min_distance_pips(symbol: str, account: int | None = None,
+                      digits: int | None = None) -> float:
+    """Compatibility name for `broker_min_distance_pips`."""
+    return broker_min_distance_pips(symbol, account, digits)
 
 
 def pip_size(symbol: str, digits: int) -> float:
@@ -146,7 +220,8 @@ def stopexe_levels(symbol: str, account: int,
         raise ValueError(f"no live quote for {symbol}")
     digits = digits_for(broker_sym, bid_s)
     pip = pip_size(broker_sym, digits)
-    dist_pips = max(float(distance_pips), min_distance_pips(broker_sym))
+    level_pips = broker_min_distance_pips(broker_sym, account, digits)
+    dist_pips = max(float(distance_pips), level_pips)
     dist = dist_pips * pip
     buy_price = round(ask + dist, digits)
     sell_price = round(bid - dist, digits)
@@ -154,10 +229,11 @@ def stopexe_levels(symbol: str, account: int,
         buy_price = round(ask + 10 ** (-digits), digits)
     if sell_price >= bid:
         sell_price = round(bid - 10 ** (-digits), digits)
-    # Protective stops: 1.0 pips against the leg (buy SL below its entry,
-    # sell SL above its entry), attached AT OrderSend time - never a
-    # second trip, so the legs are never unprotected on the broker.
-    sl_pips = float(sl_pips)
+    # Protective stops: the desk's 1.0 pip, widened automatically to the
+    # broker's stops/freeze level for this symbol (the EA applies the same
+    # floor on its side), attached AT OrderSend time - never a second trip,
+    # so the legs are never unprotected on the broker.
+    sl_pips = max(float(sl_pips), level_pips)
     sl_dist = sl_pips * pip
     tick = 10 ** (-digits)
     buy_sl = round(buy_price - sl_dist, digits)
@@ -205,7 +281,7 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
     the whole stack is flighted in about the time of a single straddle
     instead of N serial round trips (the news module arms its bracket 5 s
     before a release, so the extra round trips used to eat the window).
-    Each leg still carries its 1.0-pip SL on the same OrderSend.
+    Each leg still carries its broker-adjusted SL on the same OrderSend.
 
     Returns a JSON-friendly dict.  The EA places both legs back-to-back
     and acks `buyprice|buyticket|sellprice|sell...|buysl|sellsl`; a half

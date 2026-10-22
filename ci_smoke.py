@@ -77,11 +77,35 @@ def stopexe_defaults() -> None:
         f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 1.0")
     spot.read_spots = lambda *a, **k: {"XAUUSD": ("4150.00", "4150.50", "ci")}
     spot.resolve_symbol = lambda symbol, account: symbol
+    stopexe.symbol_trade_levels = lambda symbol, account=None: {}
     lv = stopexe.stopexe_levels("XAUUSD", 1)
     assert lv["buy_price"] == 4151.5, lv
     assert lv["sell_price"] == 4149.0, lv
     assert lv["buy_sl"] == 4150.5, lv
     assert lv["sell_sl"] == 4150.0, lv
+
+    # The bracket must follow the BROKER's stops/freeze level, not a
+    # symbol-name table: the same NZDUSD is 3.1 pips on HFM (30 points)
+    # and the desk's 1.0 on a zero-level broker such as FXPro.
+    spot.read_spots = lambda *a, **k: {
+        "NZDUSD": ("0.56851", "0.56871", "ci")}
+    levels = {"NZDUSD": {"digits": 5, "stops_level": 30, "freeze_level": 0}}
+    stopexe.symbol_trade_levels = lambda symbol, account=None: levels[
+        str(symbol).upper()]
+    lv = stopexe.stopexe_levels("NZDUSD", 1)
+    assert lv["distance_pips"] == 3.1, lv
+    assert lv["sl_pips"] == 3.1, lv
+    assert lv["buy_price"] == 0.56902, lv
+    assert lv["sell_price"] == 0.56820, lv
+    assert lv["buy_sl"] == 0.56871, lv
+    assert lv["sell_sl"] == 0.56851, lv
+
+    levels["NZDUSD"] = {"digits": 5, "stops_level": 0, "freeze_level": 0}
+    lv = stopexe.stopexe_levels("NZDUSD", 1)
+    assert lv["distance_pips"] == 1.0, lv
+    assert lv["sl_pips"] == 1.0, lv
+    assert lv["buy_price"] == 0.56881, lv
+    assert lv["sell_price"] == 0.56841, lv
 
 
 def port_free(host: str, port: int) -> bool:
@@ -217,7 +241,7 @@ def main() -> int:
         try:
             stopexe_defaults()
             print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), "
-                  "SL 1.0 pips")
+                  "broker-adaptive SL")
         except Exception as exc:                       # noqa: BLE001 - reported below
             failures.append(f"stopexe defaults: {exc}")
             print(f"FAIL stopexe   <- {exc}", file=sys.stderr)

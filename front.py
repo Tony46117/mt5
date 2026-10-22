@@ -1273,9 +1273,9 @@ function buildPanel(n){
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
     '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
    '<div class="stex-bracket">'+     '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.0 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · 1.0 pips</div></div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · <span id="stexbuyslp'+n+'">-</span> pips</div></div>'+
     '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.0 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · 1.0 pips</div></div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · <span id="stexsellslp'+n+'">-</span> pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
     '<div class="fgroup"><label>Lot (each leg)</label>'+
@@ -1449,6 +1449,9 @@ async function stexPreview(n,force){
    if(sell)sell.textContent=j.sell_price;
    if(bsl)bsl.textContent=j.buy_sl==null?'-':j.buy_sl;
    if(ssl)ssl.textContent=j.sell_sl==null?'-':j.sell_sl;
+   const bspl=$id('stexbuyslp'+n),sspl=$id('stexsellslp'+n);
+   if(bspl)bspl.textContent=j.sl_pips==null?'-':j.sl_pips;
+   if(sspl)sspl.textContent=j.sl_pips==null?'-':j.sl_pips;
    const br=$id('stexbr'+n);
    const pu=(+j.distance_pips===1)?' pip':' pips';
    if(br)br.textContent='±'+j.distance_pips+pu;
@@ -1472,7 +1475,7 @@ async function doStopexe(n){
   INFLIGHT['sx'+n]=true;if(btn)btn.disabled=true;
   if(btn)asmrPop(btn);
    if(fb){fb.className='feedback';
-   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + 1.0-pip SLs ... placing both legs';}
+   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + broker-adaptive SLs ... placing both legs';}
    try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
     distance_pips:stexPips(n),sl_pips:1.0});
    if(fb){fb.className='feedback ok';
