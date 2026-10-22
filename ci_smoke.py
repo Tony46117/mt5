@@ -73,15 +73,15 @@ def stopexe_defaults() -> None:
 
     default = inspect.signature(stopexe.stopexe_levels).parameters["distance_pips"].default
     assert default == 1.0, f"stopexe_levels default is {default}, expected 1.0"
-    assert stopexe.STOPEXE_SL_PIPS == 1.2, (
-        f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 1.2")
+    assert stopexe.STOPEXE_SL_PIPS == 1.0, (
+        f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 1.0")
     spot.read_spots = lambda *a, **k: {"XAUUSD": ("4150.00", "4150.50", "ci")}
     spot.resolve_symbol = lambda symbol, account: symbol
     lv = stopexe.stopexe_levels("XAUUSD", 1)
     assert lv["buy_price"] == 4151.5, lv
     assert lv["sell_price"] == 4149.0, lv
-    assert lv["buy_sl"] == 4150.3, lv
-    assert lv["sell_sl"] == 4150.2, lv
+    assert lv["buy_sl"] == 4150.5, lv
+    assert lv["sell_sl"] == 4150.0, lv
 
 
 def port_free(host: str, port: int) -> bool:
@@ -217,7 +217,7 @@ def main() -> int:
         try:
             stopexe_defaults()
             print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), "
-                  "SL 1.2 pips")
+                  "SL 1.0 pips")
         except Exception as exc:                       # noqa: BLE001 - reported below
             failures.append(f"stopexe defaults: {exc}")
             print(f"FAIL stopexe   <- {exc}", file=sys.stderr)

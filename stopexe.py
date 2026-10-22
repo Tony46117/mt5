@@ -3,9 +3,9 @@
 """StopExe - stop-order execution framework (straddle stops).
 
 One EXECUTE opens a two-leg straddle around the live price:
-BUY STOP  at ask + 1.0 pips  with SL at entry - 1.2 pips
+BUY STOP  at ask + 1.0 pips  with SL at entry - 1.0 pips
 
-     SELL STOP at bid - 1.0 pips  with SL at entry + 1.2 pips   (2-pip bracket)
+     SELL STOP at bid - 1.0 pips  with SL at entry + 1.0 pips   (2-pip bracket)
 
 Both legs travel in ONE exec command (EA v1.80 STOPEXESL): one file, one
 pass, both legs flighted async in the SAME tick with the SL attached,
@@ -49,7 +49,26 @@ log = setup_logging(__name__)
 STOPEXE_MAGIC = 777003
 STOPEXE_COMMENT = "stopexe"
 # Protective stop attached to every straddle leg at OrderSend time.
-STOPEXE_SL_PIPS = 1.2
+STOPEXE_SL_PIPS = 1.0
+# HFM quotes NZDUSD with SYMBOL_TRADE_STOPS_LEVEL = 30 points (3 pips), so a
+# stop closer to the quote is refused by the EA precheck and by the server
+# (10016).  Only NZDUSD gets the floor: XAUUSD / EURUSD report 0 and keep the
+# desk's 1-pip bracket.
+NZDUSD_MIN_DISTANCE_PIPS = 3.0
+# The broker compares the level against the bid/ask AT OrderSend, not against
+# the quote we priced from, so a level sitting exactly on the 3.0-pip minimum
+# is rejected as soon as the price ticks ("sell stop must sit BELOW the bid",
+# retcode 10015).  One point of cushion keeps the level outside the minimum
+# without widening the bracket more than the broker forces.
+STOP_DRIFT_PIPS = 0.1
+
+
+def min_distance_pips(symbol: str) -> float:
+    """Broker-mandated minimum entry offset for `symbol`, in pips."""
+    s = str(symbol or "").upper()
+    if "NZDUSD" in s:
+        return NZDUSD_MIN_DISTANCE_PIPS + STOP_DRIFT_PIPS
+    return 0.0
 
 
 def pip_size(symbol: str, digits: int) -> float:
@@ -123,14 +142,15 @@ def stopexe_levels(symbol: str, account: int,
         raise ValueError(f"no live quote for {symbol}")
     digits = digits_for(broker_sym, bid_s)
     pip = pip_size(broker_sym, digits)
-    dist = float(distance_pips) * pip
+    dist_pips = max(float(distance_pips), min_distance_pips(broker_sym))
+    dist = dist_pips * pip
     buy_price = round(ask + dist, digits)
     sell_price = round(bid - dist, digits)
     if buy_price <= ask:
         buy_price = round(ask + 10 ** (-digits), digits)
     if sell_price >= bid:
         sell_price = round(bid - 10 ** (-digits), digits)
-    # Protective stops: 1.2 pips against the leg (buy SL below its entry,
+    # Protective stops: 1.0 pips against the leg (buy SL below its entry,
     # sell SL above its entry), attached AT OrderSend time - never a
     # second trip, so the legs are never unprotected on the broker.
     sl_pips = float(sl_pips)
@@ -150,7 +170,7 @@ def stopexe_levels(symbol: str, account: int,
         "ask": ask,
         "digits": digits,
         "pip": pip,
-        "distance_pips": float(distance_pips),
+        "distance_pips": dist_pips,
         "distance_price": round(dist, digits + 2),
         "buy_price": buy_price,
         "sell_price": sell_price,
@@ -181,7 +201,7 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
     the whole stack is flighted in about the time of a single straddle
     instead of N serial round trips (the news module arms its bracket 5 s
     before a release, so the extra round trips used to eat the window).
-    Each leg still carries its 1.2-pip SL on the same OrderSend.
+    Each leg still carries its 1.0-pip SL on the same OrderSend.
 
     Returns a JSON-friendly dict.  The EA places both legs back-to-back
     and acks `buyprice|buyticket|sellprice|sell...|buysl|sellsl`; a half

@@ -1125,7 +1125,7 @@ def api_stopexe():
     """StopExe: open a BUY STOP (ask + 1.0 pips) + SELL STOP (bid - 1.0
     pips) straddle of `lot` around the live price - 2.0 pips bracket total
     (gold at 4150 -> 4151.0 / 4149.0), both legs flighted async in one exec
-    command, each leg carrying its 1.2-pip protective SL."""
+    command, each leg carrying its 1.0-pip protective SL."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
