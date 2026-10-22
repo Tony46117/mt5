@@ -3,12 +3,16 @@
 """StopExe - stop-order execution framework (straddle stops).
 
 One EXECUTE opens a two-leg straddle around the live price:
-BUY STOP  at ask + 1.0 pips  with SL at entry - 1.0 pips
+BUY STOP  at ask + 0.5 pips  with SL at entry - 0.5 pips
 
-     SELL STOP at bid - 1.0 pips  with SL at entry + 1.0 pips   (2-pip bracket)
+     SELL STOP at bid - 0.5 pips  with SL at entry + 0.5 pips   (1-pip bracket)
 
 Both distances are widened automatically when the broker's stops/freeze
-level for that symbol demands it (e.g. HFM NZDUSD -> 3.1 pips).
+level for that symbol demands it (e.g. HFM NZDUSD -> 3.1 pips).  The SL
+is also floored just beyond the live bid/ask spread (plus an optional
+`spread_cushion_pips`), so a tight stop cannot start already violated when
+the stop order triggers.  The cushion is adjustable per request and via
+MT5_STOPEXE_SPREAD_CUSHION_PIPS.
 
 Both legs travel in ONE exec command (EA v1.80 STOPEXESL): one file, one
 pass, both legs flighted async in the SAME tick with the SL attached,
@@ -41,7 +45,7 @@ own SYMBOL_TRADE_STOPS_LEVEL / SYMBOL_TRADE_FREEZE_LEVEL.  Those levels
 are read per account and symbol from the terminal catalogue, converted
 from points to pips, and given one point of cushion: HFM's NZDUSD (30
 points = 3.0 pips) therefore arms at 3.1, while FXPro's zero-level pairs
-keep the desk's 1.0-pip bracket.  No symbol-name hardcoding.
+keep the desk's 0.5-pip bracket.  No symbol-name hardcoding.
 
 Digits come from the broker probe when available, else from the live
 price string (a quoted price always carries its own precision).
@@ -64,7 +68,14 @@ STOPEXE_COMMENT = "stopexe"
 # chunk is acked before the next is written, which means the slots are free.
 STOPEXE_SLOTS = 8
 # Protective stop attached to every straddle leg at OrderSend time.
-STOPEXE_SL_PIPS = 1.0
+STOPEXE_SL_PIPS = 0.5
+# Default offset from the live price to each stop entry (one pip total).
+STOPEXE_DISTANCE_PIPS = 0.5
+# Extra clearance past the live spread added to the SL floor.  Zero still
+# keeps one point of clearance, so the SL can never sit exactly at the
+# spread where a fresh tick would immediately stop the leg out.
+STOPEXE_SPREAD_CUSHION_PIPS = max(
+    0.0, float(os.getenv("MT5_STOPEXE_SPREAD_CUSHION_PIPS", "0") or 0))
 # The broker compares the level against the bid/ask AT OrderSend, not against
 # the quote we priced from, so a level sitting exactly on its minimum is
 # rejected as soon as the price ticks ("sell stop must sit BELOW the bid",
@@ -128,8 +139,8 @@ def broker_min_distance_pips(symbol: str, account: int | None = None,
 
     The minimum is per broker AND per symbol: HFM quotes NZDUSD with
     SYMBOL_TRADE_STOPS_LEVEL = 30 points (3.0 pips), while FXPro and most
-    majors report 0 and keep the desk's 1-pip bracket.  Converting points to
-    pips keeps gold/silver/3- and 5-digit forex correct automatically.
+    majors report 0 and keep the desk's 0.5-pip bracket.  Converting points
+    to pips keeps gold/silver/3- and 5-digit forex correct automatically.
     """
     info = symbol_trade_levels(symbol, account)
     d = int(digits if digits is not None else (info.get("digits")
@@ -194,8 +205,9 @@ def digits_for(symbol: str, price: str = "") -> int:
 
 
 def stopexe_levels(symbol: str, account: int,
-                   distance_pips: float = 1.0,
-                   sl_pips: float = STOPEXE_SL_PIPS) -> dict:
+                   distance_pips: float = STOPEXE_DISTANCE_PIPS,
+                   sl_pips: float = STOPEXE_SL_PIPS,
+                   spread_cushion_pips: float | None = None) -> dict:
     """Bracket prices for a StopExe straddle, SLs included.  Raises
     ValueError with a human message when there is no live quote."""
     from spot import read_spots, resolve_symbol
@@ -220,22 +232,32 @@ def stopexe_levels(symbol: str, account: int,
         raise ValueError(f"no live quote for {symbol}")
     digits = digits_for(broker_sym, bid_s)
     pip = pip_size(broker_sym, digits)
+    tick = 10 ** (-digits)
+    spread = max(0.0, ask - bid)
+    spread_pips = round(spread / pip, 4) if pip > 0 else 0.0
+    if spread_cushion_pips is None:
+        cushion_pips = STOPEXE_SPREAD_CUSHION_PIPS
+    else:
+        cushion_pips = max(0.0, float(spread_cushion_pips))
     level_pips = broker_min_distance_pips(broker_sym, account, digits)
     dist_pips = max(float(distance_pips), level_pips)
     dist = dist_pips * pip
     buy_price = round(ask + dist, digits)
     sell_price = round(bid - dist, digits)
     if buy_price <= ask:
-        buy_price = round(ask + 10 ** (-digits), digits)
+        buy_price = round(ask + tick, digits)
     if sell_price >= bid:
-        sell_price = round(bid - 10 ** (-digits), digits)
-    # Protective stops: the desk's 1.0 pip, widened automatically to the
-    # broker's stops/freeze level for this symbol (the EA applies the same
-    # floor on its side), attached AT OrderSend time - never a second trip,
-    # so the legs are never unprotected on the broker.
-    sl_pips = max(float(sl_pips), level_pips)
+        sell_price = round(bid - tick, digits)
+    # Protective stops: the desk's 0.5 pip, widened automatically to the
+    # broker's stops/freeze level for this symbol AND to just beyond the
+    # live bid/ask spread (the EA applies the same floor on its side),
+    # attached AT OrderSend time - never a second trip, so the legs are
+    # never unprotected on the broker.  Without the spread floor a 0.5-pip
+    # SL on a 0.7-pip-spread symbol would be stopped out on the next tick.
+    spread_sl_pips = (spread_pips + tick / pip + cushion_pips
+                      if spread > 0 and pip > 0 else 0.0)
+    sl_pips = round(max(float(sl_pips), level_pips, spread_sl_pips), 4)
     sl_dist = sl_pips * pip
-    tick = 10 ** (-digits)
     buy_sl = round(buy_price - sl_dist, digits)
     sell_sl = round(sell_price + sl_dist, digits)
     if buy_sl >= buy_price:
@@ -248,6 +270,9 @@ def stopexe_levels(symbol: str, account: int,
         "account": account,
         "bid": bid,
         "ask": ask,
+        "spread": round(spread, digits + 2),
+        "spread_pips": spread_pips,
+        "spread_cushion_pips": round(cushion_pips, 4),
         "digits": digits,
         "pip": pip,
         "distance_pips": dist_pips,
@@ -262,19 +287,21 @@ def stopexe_levels(symbol: str, account: int,
 
 
 def place_stopexe(account: int, symbol: str, lot: float,
-                   distance_pips: float = 1.0,
+                   distance_pips: float = STOPEXE_DISTANCE_PIPS,
                    sl_pips: float = STOPEXE_SL_PIPS,
-                   timeout: float = 10.0) -> dict:
+                   timeout: float = 10.0,
+                   spread_cushion_pips: float | None = None) -> dict:
     """Place ONE two-leg StopExe straddle (see `place_stopexe_multi`)."""
     return place_stopexe_multi(account, symbol, lot, 1, distance_pips,
-                               sl_pips, timeout)
+                               sl_pips, timeout, spread_cushion_pips)
 
 
 def place_stopexe_multi(account: int, symbol: str, lot: float,
                         orders: int = 1,
-                        distance_pips: float = 1.0,
+                        distance_pips: float = STOPEXE_DISTANCE_PIPS,
                         sl_pips: float = STOPEXE_SL_PIPS,
-                        timeout: float = 20.0) -> dict:
+                        timeout: float = 20.0,
+                        spread_cushion_pips: float | None = None) -> dict:
     """Arm `orders` straddles - N buy stops + N sell stops - in ONE trip.
 
     Every STOPEXESL command file is written before the EA's next drain, so
@@ -294,7 +321,8 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
     n = int(orders)
     if not 1 <= n <= 50:
         raise ValueError("orders must be 1..50")
-    lv = stopexe_levels(symbol, account, distance_pips, sl_pips)
+    lv = stopexe_levels(symbol, account, distance_pips, sl_pips,
+                        spread_cushion_pips)
     broker_sym = lv["broker_symbol"]
     digits = lv["digits"]
     sender = sender_for(account)
@@ -334,9 +362,10 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
 
 def place_stopexe_counts(account: int, symbol: str, lot: float,
                          buy_orders: int, sell_orders: int,
-                         distance_pips: float = 1.0,
+                         distance_pips: float = STOPEXE_DISTANCE_PIPS,
                          sl_pips: float = STOPEXE_SL_PIPS,
-                         timeout: float = 20.0) -> dict:
+                         timeout: float = 20.0,
+                         spread_cushion_pips: float | None = None) -> dict:
     """Arm an arbitrary number of buy stops and sell stops in ONE batch.
 
     Equal counts use the atomic STOPEXESL straddle path.  Unequal counts
@@ -351,14 +380,15 @@ def place_stopexe_counts(account: int, symbol: str, lot: float,
         raise ValueError("at least one buy or sell stop is required")
     if buy == sell:
         out = place_stopexe_multi(account, symbol, lot, buy, distance_pips,
-                                  sl_pips, timeout)
+                                  sl_pips, timeout, spread_cushion_pips)
         out.setdefault("buy_orders", buy)
         out.setdefault("sell_orders", sell)
         return out
 
     from executor import sender_for
 
-    lv = stopexe_levels(symbol, account, distance_pips, sl_pips)
+    lv = stopexe_levels(symbol, account, distance_pips, sl_pips,
+                        spread_cushion_pips)
     broker_sym = lv["broker_symbol"]
     digits = lv["digits"]
     sender = sender_for(account)

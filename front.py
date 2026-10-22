@@ -385,6 +385,10 @@ td.num,th.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
 .symsearch input::placeholder{color:var(--dim2)}
 /* ---------- StopExe straddle panel ---------- */
 .stex-live{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.stex-spr{background:var(--bg);border:1px solid var(--line2);color:#fff;
+  padding:7px 9px;font-size:12px;outline:none;width:100%;border-radius:0px;
+  font-family:ui-monospace,Consolas,monospace}
+.stex-spr:focus{border-color:var(--blue);box-shadow:var(--glow)}
 .stex-bracket{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
 .stex-bracket>div{flex:1;min-width:140px;background:var(--panel);
   border:1px solid var(--line);border-radius:0px;padding:8px 12px}
@@ -1264,35 +1268,39 @@ function buildPanel(n){
    ' title="upcoming news - slide the week, arm a straddle 5 s before the release">◈ NEWS</button></div>'+
   '</div>'+
   '<div class="sect"><h4>StopExe · straddle stops</h4>'+
-   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±1.0 pips</b></span></div></div>'+
+   '<div class="right"><span class="chip">BRACKET <b id="stexbr'+n+'">±0.5 pips</b></span></div></div>'+
   '<div class="body" id="stexbody'+n+'">'+
    '<div class="fgroup"><label>Search pair · broker feed</label>'+
     '<div class="symsearch"><input type="text" id="stexsearch'+n+'" placeholder="type XAU, EUR, GBP... (live quotes only)" autocomplete="off" oninput="stexFilter('+n+')"></div>'+
     '<div class="symlist" id="stexlist'+n+'"></div></div>'+
    '<div class="stex-live"><span class="chip">PAIR <b id="stexsym'+n+'">-</b></span>'+
     '<span class="chip">BID <b id="stexbid'+n+'">-</b></span>'+
-    '<span class="chip">ASK <b id="stexask'+n+'">-</b></span></div>'+
-   '<div class="stex-bracket">'+     '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 1.0 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · <span id="stexbuyslp'+n+'">-</span> pips</div></div>'+
-    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 1.0 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
-     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · <span id="stexsellslp'+n+'">-</span> pips</div></div>'+
+    '<span class="chip">ASK <b id="stexask'+n+'">-</b></span>'+
+    '<span class="chip">SPREAD <b id="stexspread'+n+'">-</b></span></div>'+
+   '<div class="stex-bracket">'+     '<div><div class="k" id="stexbuyk'+n+'">Buy stop · ask + 0.5 pips</div><div class="v buy" id="stexbuy'+n+'">-</div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexbuysl'+n+'">-</span> · <span id="stexbuyslp'+n+'">0.5</span> pips</div></div>'+
+    '<div><div class="k" id="stexsellk'+n+'">Sell stop · bid - 0.5 pips</div><div class="v sell" id="stexsell'+n+'">-</div>'+
+     '<div class="mut" style="font-size:11px;margin-top:2px">SL <span class="mono" id="stexsellsl'+n+'">-</span> · <span id="stexsellslp'+n+'">0.5</span> pips</div></div>'+
    '</div>'+
    '<div class="frow" style="margin-bottom:10px">'+
     '<div class="fgroup"><label>Lot (each leg)</label>'+
      '<div class="lotrow"><button type="button" onclick="stexStepLot('+n+',-0.01)">-</button>'+
      '<input id="stexlot'+n+'" type="number" step="0.01" min="0.01" value="0.01">'+
      '<button type="button" onclick="stexStepLot('+n+',0.01)">+</button></div></div>'+
-    '<div class="fgroup" style="grid-column:span 2"><label>Bracket</label>'+
+    '<div class="fgroup"><label>Bracket</label>'+
 '<select id="stexpips'+n+'" onchange="stexPreview('+n+',true)">'+
-       '<option value="1.0" selected>±1.0 pips (2 total)</option>'+
+       '<option value="0.5" selected>±0.5 pips (1 total)</option>'+
        '<option value="1">±1 pip (2 total)</option>'+
        '<option value="2">±2 pips (4 total)</option>'+
        '<option value="5">±5 pips (10 total)</option></select></div>'+
+    '<div class="fgroup"><label>SL spread cushion</label>'+
+     '<input class="stex-spr" id="stexspr'+n+'" type="number" step="0.1" min="0" max="100" value="0" '+
+      'onchange="stexPreview('+n+',true)" title="extra pips added past the live bid/ask spread to the SL floor"></div>'+
    '</div>'+
    '<div class="tradebtns" style="margin-top:2px">'+
     '<button class="tbtn stex" id="stexbtn'+n+'" onclick="doStopexe('+n+')">EXECUTE STOPEXE</button>'+
    '</div>'+
-   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price · each leg carries a 1.0-pip SL from the same OrderSend</div>'+
+   '<div class="feedback" id="stexfb'+n+'">straddle: buy stop + sell stop around the live price · each leg carries a 0.5-pip SL, floored just beyond the live spread</div>'+
   '</div>'+
   '<div class="sect"><h4>Open positions</h4><div class="right">'+
    '<span class="chip">P/L <b id="pospl'+n+'">-</b></span></div></div>'+
@@ -1424,7 +1432,9 @@ function stexFilter(n){
    '<span class="mono">'+esc(s)+'</span><span class="pr">tap to arm</span></div>').join('');
   box.classList.add('open')}
 function stexPips(n){const el=$id('stexpips'+n);
-  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:1.0}
+  const v=parseFloat(el&&el.value);return (v>=0.5&&v<=100)?v:0.5}
+function stexCushion(n){const el=$id('stexspr'+n);
+  const v=parseFloat(el&&el.value);return (v>=0&&v<=100)?v:0}
 function stexJump(n){const b=$id('stexbody'+n);
   if(b)b.scrollIntoView({behavior:'smooth',block:'start'});
   const inp=$id('stexsearch'+n);if(inp)inp.focus({preventScroll:true})}
@@ -1440,18 +1450,23 @@ async function stexPreview(n,force){
    const sym=stexSel(n);
    const buy=$id('stexbuy'+n),sell=$id('stexsell'+n);
    const bsl=$id('stexbuysl'+n),ssl=$id('stexsellsl'+n);
+   const bslp=$id('stexbuyslp'+n),sslp=$id('stexsellslp'+n);
+   const sprd=$id('stexspread'+n);
    if(!sym||sym==='-'){if(buy)buy.textContent='-';if(sell)sell.textContent='-';
-    if(bsl)bsl.textContent='-';if(ssl)ssl.textContent='-';return}
+    if(bsl)bsl.textContent='-';if(ssl)ssl.textContent='-';
+    if(bslp)bslp.textContent='-';if(sslp)sslp.textContent='-';
+    if(sprd)sprd.textContent='-';return}
    try{const j=await api('/api/stopexe/preview?account='+n+
-    '&symbol='+encodeURIComponent(sym)+'&pips='+stexPips(n));
+    '&symbol='+encodeURIComponent(sym)+'&pips='+stexPips(n)+
+    '&spread_cushion='+stexCushion(n));
    if(stexSel(n)!==sym)return;             // stale reply after re-arm
    if(buy)buy.textContent=j.buy_price;
    if(sell)sell.textContent=j.sell_price;
    if(bsl)bsl.textContent=j.buy_sl==null?'-':j.buy_sl;
    if(ssl)ssl.textContent=j.sell_sl==null?'-':j.sell_sl;
-   const bspl=$id('stexbuyslp'+n),sspl=$id('stexsellslp'+n);
-   if(bspl)bspl.textContent=j.sl_pips==null?'-':j.sl_pips;
-   if(sspl)sspl.textContent=j.sl_pips==null?'-':j.sl_pips;
+   if(bslp)bslp.textContent=fmt(j.sl_pips,2);
+   if(sslp)sslp.textContent=fmt(j.sl_pips,2);
+   if(sprd)sprd.textContent=fmt(j.spread_pips,2)+' pips';
    const br=$id('stexbr'+n);
    const pu=(+j.distance_pips===1)?' pip':' pips';
    if(br)br.textContent='±'+j.distance_pips+pu;
@@ -1475,11 +1490,11 @@ async function doStopexe(n){
   INFLIGHT['sx'+n]=true;if(btn)btn.disabled=true;
   if(btn)asmrPop(btn);
    if(fb){fb.className='feedback';
-   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + broker-adaptive SLs ... placing both legs';}
+   fb.textContent='STOPEXE '+sym+' '+lot.toFixed(2)+' ±'+stexPips(n)+' pips + 0.5-pip SL (floored past the live spread) ... placing both legs';}
    try{const j=await post('/api/stopexe',{account:+n,symbol:sym,lot:lot,
-    distance_pips:stexPips(n),sl_pips:1.0});
+    distance_pips:stexPips(n),sl_pips:0.5,spread_cushion:stexCushion(n)});
    if(fb){fb.className='feedback ok';
-    fb.textContent='ARMED '+j.detail+' ('+j.ms+' ms) - CLOSE deletes both legs';}
+    fb.textContent='ARMED '+j.detail+' · SL '+fmt(j.sl_pips,2)+' pips ('+j.ms+' ms) - CLOSE deletes both legs';}
    toast('STOPEXE '+sym+': buy '+j.buy_price+' (SL '+j.buy_sl+') / sell '+j.sell_price+' (SL '+j.sell_sl+')',true);
    refresh()}
   catch(e){if(fb){fb.className='feedback err';fb.textContent='REJECTED: '+e.message}
@@ -1866,7 +1881,7 @@ function newsTick(){
     else if(s>0)txt=s+'s';
     else txt='released '+(-s)+'s ago';
     cd.innerHTML=(s>0?'releases in <b>':'release <b>')+esc(txt)+
-      (s>0?'</b> · straddle arms T-5 s (':('</b> · '))+'SL 1.0 pips'+
+      (s>0?'</b> · straddle arms T-5 s (':('</b> · '))+'SL 0.5 pips'+
       (s>0?')':'')
   }
   if(Date.now()-(NW.plansTs||0)>5000)newsLoadPlans()
@@ -1941,8 +1956,8 @@ function newsPaintQuote(){
     '<span class="chip">SPREAD <b>'+esc(spr)+'</b></span>'+
     '<span class="chip">STOPS <b>'+((NW.sel.buy||0)+(NW.sel.sell||0))+
       '</b> ('+(NW.sel.buy||0)+'B / '+(NW.sel.sell||0)+'S)</span>'+
-    '<span class="chip">BRACKET <b>±1.0 pips</b></span>'+
-    '<span class="chip">SL <b>1.0 pips</b></span>'+
+    '<span class="chip">BRACKET <b>±0.5 pips</b></span>'+
+    '<span class="chip">SL <b>0.5 pips</b></span>'+
     '<span class="chip">CLOSER <b>'+(NW.eventCloser?'T+5s':'off')+'</b></span>'+
     '<span class="mut" style="font-size:10px">'+esc(NW.qsrc||'')+'</span>'
 }

@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 from config import setup_logging
+import stopexe
 
 log = setup_logging(__name__)
 
@@ -388,7 +389,8 @@ def _public(plan: dict) -> dict:
         "buy_orders": plan.get("buy_orders", plan["orders"]),
         "sell_orders": plan.get("sell_orders", plan["orders"]),
         "closer": plan["closer"],
-        "distance_pips": plan.get("distance_pips", 1.0),
+        "distance_pips": plan.get("distance_pips",
+                                  stopexe.STOPEXE_DISTANCE_PIPS),
         "sl_pips": plan.get("sl_pips"),
         "event_ms": plan["event_ms"],
         "event": plan["event"],
@@ -538,7 +540,8 @@ def _fire(pid: str) -> dict | None:
             int(plan["account"]), plan["symbol"], float(plan["lot"]),
             int(plan.get("buy_orders", plan["orders"])),
             int(plan.get("sell_orders", plan["orders"])),
-            float(plan.get("distance_pips", 1.0)),
+            float(plan.get("distance_pips",
+                           stopexe.STOPEXE_DISTANCE_PIPS)),
             float(plan.get("sl_pips", stopexe.STOPEXE_SL_PIPS)),
             timeout=CONFIG.exec_timeout_seconds)
     except Exception as exc:
@@ -568,7 +571,7 @@ def _close(account: int) -> tuple[float, str]:
 
 def plan_event(account: int, symbol: str, lot: float, orders: int,
                event: dict, closer: bool,
-               distance_pips: float = 1.0,
+               distance_pips: float = 0.5,
                sl_pips: float | None = None,
                buy_orders: int | None = None,
                sell_orders: int | None = None) -> dict:

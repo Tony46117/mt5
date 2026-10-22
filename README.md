@@ -317,8 +317,9 @@ paths and file ownership stay consistent.
   from the broker probe's tradeable, live-quoted symbols
   (`/api/news/quotes`). **TRADE** takes separate buy-stop and sell-stop
   counts and arms them 5 s before the release, each leg carrying a
-  1.0-pip SL, widened automatically to the broker's stops/freeze minimum
-  (equal counts use the atomic StopExe straddle, unequal counts use one
+  0.5-pip SL, widened automatically to the broker's stops/freeze minimum
+  and floored just beyond the live spread (equal counts use the atomic
+  StopExe straddle, unequal counts use one
   PENDING batch); the **CLOSER** toggle (top right)
   additionally closes every position on that account 5 s after the
   release, so the whole execution window is 10 s. Plans survive a

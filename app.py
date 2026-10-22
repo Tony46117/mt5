@@ -564,7 +564,8 @@ def api_news_plan():
         orders = int(d.get("orders", d.get("n", 1)))
         buy = int(d.get("buy_orders", orders))
         sell = int(d.get("sell_orders", orders))
-        dpips = float(d.get("distance_pips", 1.0))
+        dpips = float(d.get("distance_pips",
+                            stopexe_mod.STOPEXE_DISTANCE_PIPS))
     except (TypeError, ValueError):
         return _fail("bad lot / orders / distance")
     if not 0 < lot <= 100:
@@ -1099,8 +1100,9 @@ def api_stopexe_preview():
     if not symbol:
         return _fail("symbol is required")
     try:
-        dpips = float(request.args.get("pips",
-                                       request.args.get("distance_pips", 1.0)))
+        dpips = float(request.args.get(
+            "pips", request.args.get("distance_pips",
+                                     stopexe_mod.STOPEXE_DISTANCE_PIPS)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:
@@ -1113,7 +1115,15 @@ def api_stopexe_preview():
     if not 0.5 <= slpips <= 100:
         return _fail("sl must be 0.5..100 pips")
     try:
-        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips)
+        scush = float(request.args.get(
+            "spread_cushion", stopexe_mod.STOPEXE_SPREAD_CUSHION_PIPS))
+    except (TypeError, ValueError):
+        return _fail("bad spread cushion")
+    if not 0 <= scush <= 100:
+        return _fail("spread cushion must be 0..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips,
+                                        scush)
     except ValueError as exc:
         return _fail(str(exc))
     return _ok(lv)
@@ -1122,12 +1132,13 @@ def api_stopexe_preview():
 @app.post("/api/stopexe")
 @rate_limit(max_requests=60, window=60)
 def api_stopexe():
-    """StopExe: open a BUY STOP (ask + 1.0 pips) + SELL STOP (bid - 1.0
-    pips) straddle of `lot` around the live price - 2.0 pips bracket total
-    (gold at 4150 -> 4151.0 / 4149.0), both legs flighted async in one exec
+    """StopExe: open a BUY STOP (ask + 0.5 pips) + SELL STOP (bid - 0.5
+    pips) straddle of `lot` around the live price - 1.0 pip bracket total
+    (gold at 4150 -> 4150.5 / 4149.5), both legs flighted async in one exec
     command, each leg carrying its protective SL.  The bracket and SL are
     widened automatically to the broker's stops/freeze level for the
-    account's symbol (e.g. HFM NZDUSD -> 3.1 pips, FXPro majors -> 1.0)."""
+    account's symbol (e.g. HFM NZDUSD -> 3.1 pips) and the SL is floored
+    just beyond the live spread, plus an optional spread cushion."""
     d = request.get_json(silent=True) or {}
     try:
         account = int(d.get("account", 0))
@@ -1145,7 +1156,8 @@ def api_stopexe():
     if lot <= 0 or lot > 100:
         return _fail("lot out of range")
     try:
-        dpips = float(d.get("distance_pips", d.get("pips", 1.0)))
+        dpips = float(d.get("distance_pips", d.get(
+            "pips", stopexe_mod.STOPEXE_DISTANCE_PIPS)))
     except (TypeError, ValueError):
         return _fail("bad distance")
     if not 0.5 <= dpips <= 100:
@@ -1158,7 +1170,15 @@ def api_stopexe():
     if not 0.5 <= slpips <= 100:
         return _fail("sl must be 0.5..100 pips")
     try:
-        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips)
+        scush = float(d.get("spread_cushion",
+                            stopexe_mod.STOPEXE_SPREAD_CUSHION_PIPS))
+    except (TypeError, ValueError):
+        return _fail("bad spread cushion")
+    if not 0 <= scush <= 100:
+        return _fail("spread cushion must be 0..100 pips")
+    try:
+        lv = stopexe_mod.stopexe_levels(symbol, account, dpips, slpips,
+                                        scush)
     except ValueError as exc:
         return _fail(str(exc))
     try:
@@ -1179,7 +1199,8 @@ def api_stopexe():
     if lot_err:
         return _fail(lot_err)
     try:
-        res = stopexe_mod.place_stopexe(account, symbol, lot, dpips, slpips)
+        res = stopexe_mod.place_stopexe(account, symbol, lot, dpips, slpips,
+                                        spread_cushion_pips=scush)
     except ValueError as exc:
         return _fail(str(exc))
     except Exception as exc:

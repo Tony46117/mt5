@@ -46,7 +46,7 @@ PAGES = {
 # The trading panel is static HTML+JS, so what the desk gets is visible in
 # the served markup: the StopExe bracket and its button must both be there.
 PAGE_NEEDLES = {
-    "/panel": ["\u00b11.0 pips (2 total)", "EXECUTE STOPEXE",
+    "/panel": ["\u00b10.5 pips (1 total)", "EXECUTE STOPEXE",
                "NEWS TRADER", "newsTrade()", "DECLINE"],
 }
 
@@ -72,21 +72,29 @@ def stopexe_defaults() -> None:
     import stopexe
 
     default = inspect.signature(stopexe.stopexe_levels).parameters["distance_pips"].default
-    assert default == 1.0, f"stopexe_levels default is {default}, expected 1.0"
-    assert stopexe.STOPEXE_SL_PIPS == 1.0, (
-        f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 1.0")
+    assert default == 0.5, f"stopexe_levels default is {default}, expected 0.5"
+    assert stopexe.STOPEXE_SL_PIPS == 0.5, (
+        f"STOPEXE_SL_PIPS is {stopexe.STOPEXE_SL_PIPS}, expected 0.5")
     spot.read_spots = lambda *a, **k: {"XAUUSD": ("4150.00", "4150.50", "ci")}
     spot.resolve_symbol = lambda symbol, account: symbol
     stopexe.symbol_trade_levels = lambda symbol, account=None: {}
     lv = stopexe.stopexe_levels("XAUUSD", 1)
-    assert lv["buy_price"] == 4151.5, lv
-    assert lv["sell_price"] == 4149.0, lv
-    assert lv["buy_sl"] == 4150.5, lv
-    assert lv["sell_sl"] == 4150.0, lv
+    assert lv["buy_price"] == 4151.0, lv
+    assert lv["sell_price"] == 4149.5, lv
+    # A 0.5-pip SL sits inside the 0.5-pip gold spread, so the floor lifts
+    # it one tick past the live spread to avoid an instant stop-out.
+    assert lv["spread_pips"] == 0.5, lv
+    assert lv["sl_pips"] == 0.51, lv
+    assert lv["buy_sl"] == 4150.49, lv
+    assert lv["sell_sl"] == 4150.01, lv
+    lv = stopexe.stopexe_levels("XAUUSD", 1, spread_cushion_pips=0.5)
+    assert lv["sl_pips"] == 1.01, lv
+    assert lv["buy_sl"] == 4149.99, lv
+    assert lv["sell_sl"] == 4150.51, lv
 
     # The bracket must follow the BROKER's stops/freeze level, not a
     # symbol-name table: the same NZDUSD is 3.1 pips on HFM (30 points)
-    # and the desk's 1.0 on a zero-level broker such as FXPro.
+    # and the desk's 0.5 on a zero-level broker such as FXPro.
     spot.read_spots = lambda *a, **k: {
         "NZDUSD": ("0.56851", "0.56871", "ci")}
     levels = {"NZDUSD": {"digits": 5, "stops_level": 30, "freeze_level": 0}}
@@ -102,10 +110,13 @@ def stopexe_defaults() -> None:
 
     levels["NZDUSD"] = {"digits": 5, "stops_level": 0, "freeze_level": 0}
     lv = stopexe.stopexe_levels("NZDUSD", 1)
-    assert lv["distance_pips"] == 1.0, lv
-    assert lv["sl_pips"] == 1.0, lv
-    assert lv["buy_price"] == 0.56881, lv
-    assert lv["sell_price"] == 0.56841, lv
+    assert lv["distance_pips"] == 0.5, lv
+    assert lv["spread_pips"] == 2.0, lv
+    assert lv["sl_pips"] == 2.1, lv
+    assert lv["buy_price"] == 0.56876, lv
+    assert lv["sell_price"] == 0.56846, lv
+    assert lv["buy_sl"] == 0.56855, lv
+    assert lv["sell_sl"] == 0.56867, lv
 
 
 def port_free(host: str, port: int) -> bool:
@@ -240,8 +251,8 @@ def main() -> int:
 
         try:
             stopexe_defaults()
-            print("OK   stopexe   <- default bracket \u00b11.0 pips (2.0 total), "
-                  "broker-adaptive SL")
+            print("OK   stopexe   <- default bracket \u00b10.5 pips (1.0 total), "
+                  "broker/spread-adaptive SL")
         except Exception as exc:                       # noqa: BLE001 - reported below
             failures.append(f"stopexe defaults: {exc}")
             print(f"FAIL stopexe   <- {exc}", file=sys.stderr)
