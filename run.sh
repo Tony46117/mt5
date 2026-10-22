@@ -75,6 +75,69 @@ T0_NS="$(date +%s%N)"
 elapsed() { awk -v a="$T0_NS" -v b="$(date +%s%N)" 'BEGIN{printf "%.1f", (b-a)/1e9}'; }
 note() { printf '  %5ss  %s\n' "$(elapsed)" "$*"; }
 
+spawn_browser() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >/dev/null 2>&1 &
+  else
+    nohup "$@" >/dev/null 2>&1 &
+  fi
+}
+
+# Open the panel in the workstation's default browser, falling back to any
+# installed GUI browser (Firefox last).  Set MT5_OPEN_BROWSER=0 to skip.
+open_panel() {
+  local url="http://127.0.0.1:8000/"
+  local opener browser
+  local -a bcmd
+
+  [ "${MT5_OPEN_BROWSER:-1}" = "0" ] && return 0
+  if [ "${OS_UNAME:-}" != "Darwin" ] \
+     && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    return 0
+  fi
+
+  if [ "${OS_UNAME:-}" = "Darwin" ] && command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  # Give the desktop's own handler first refusal; it knows the default browser.
+  for opener in xdg-open x-www-browser sensible-browser; do
+    if command -v "$opener" >/dev/null 2>&1; then
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 5 "$opener" "$url" >/dev/null 2>&1 && return 0
+      else
+        "$opener" "$url" >/dev/null 2>&1 && return 0
+      fi
+    fi
+  done
+  if command -v gio >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 5 gio open "$url" >/dev/null 2>&1 && return 0
+    else
+      gio open "$url" >/dev/null 2>&1 && return 0
+    fi
+  fi
+
+  if [ -n "${BROWSER:-}" ]; then
+    read -r -a bcmd <<< "$BROWSER"
+    if [ "${#bcmd[@]}" -gt 0 ] && command -v "${bcmd[0]}" >/dev/null 2>&1; then
+      spawn_browser "${bcmd[@]}" "$url"
+      return 0
+    fi
+  fi
+
+  for browser in firefox firefox-esr google-chrome chromium \
+                 chromium-browser brave-browser microsoft-edge; do
+    if command -v "$browser" >/dev/null 2>&1; then
+      spawn_browser "$browser" "$url"
+      return 0
+    fi
+  done
+
+  echo "  (no graphical browser found - open $url manually)"
+}
+
 ensure_python() {
   # Native runs want a working venv with flask+waitress.  install.sh
   # builds ~/python312, but a fresh checkout on another computer usually
@@ -287,6 +350,7 @@ if ! kill -0 "$APP_PID" 2>/dev/null; then
 fi
 if curl -s --max-time 1 http://127.0.0.1:8000/health >/dev/null 2>&1; then
   note "web panel ready:  http://127.0.0.1:8000"
+  open_panel
 else
   note "(web panel not answering yet - see $APP_LOG; app pid $APP_PID is running)"
 fi
