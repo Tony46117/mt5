@@ -35,6 +35,9 @@ down: ## stop the container stack (state volume kept)
 wipe: ## stop the container stack AND delete all state
 	docker compose down -v
 
+.build: ## build: install MT5, wine, and Python dependencies
+	bash build.sh
+
 .env:
 	@printf 'MT5_MACHINE_KEY=%s\n' "$$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $@
 	@echo "created .env with a random MT5_MACHINE_KEY (keep it - it decrypts session.json)"
@@ -42,4 +45,4 @@ wipe: ## stop the container stack AND delete all state
 data:
 	@mkdir -p data
 
-.PHONY: help setup run stop docker docker-up logs shell down wipe
+.PHONY: help setup run stop docker docker-up logs shell down wipe .build

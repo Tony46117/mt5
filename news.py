@@ -37,7 +37,10 @@ log = setup_logging(__name__)
 OPEN_LEAD_S = 5.0
 CLOSE_LAG_S = 5.0
 WEEK_S = 7 * 86400
-HOURS_PAST = 1.0
+# A release stays listed for a day after it lands: the panel is read all day
+# and dropping the event an hour in hides the print the desk just traded
+# (e.g. NZD CPI at 00:45 was gone by 01:45).
+HOURS_PAST = 24.0
 PLAN_FILE = Path(__file__).resolve().parent / "news_plans.json"
 
 # Currencies -> Natural Earth ISO A3 codes, used by the mini map.  The nine

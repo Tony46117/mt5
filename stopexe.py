@@ -48,6 +48,10 @@ log = setup_logging(__name__)
 
 STOPEXE_MAGIC = 777003
 STOPEXE_COMMENT = "stopexe"
+# The EA keeps MAX_STOPEXE (8) async straddles in flight and answers
+# "stopexe busy - retry" beyond that, so bigger stacks go out in chunks: each
+# chunk is acked before the next is written, which means the slots are free.
+STOPEXE_SLOTS = 8
 # Protective stop attached to every straddle leg at OrderSend time.
 STOPEXE_SL_PIPS = 1.0
 # HFM quotes NZDUSD with SYMBOL_TRADE_STOPS_LEVEL = 30 points (3 pips), so a
@@ -227,11 +231,19 @@ def place_stopexe_multi(account: int, symbol: str, lot: float,
                f"{lv['buy_sl']:.{digits}f}",
                f"{lv['sell_sl']:.{digits}f}",
                str(STOPEXE_MAGIC), STOPEXE_COMMENT)
+    # More straddles than the EA keeps in flight: send the next wave as soon
+    # as the previous one acks, so the surplus still rests (a single wave of
+    # >8 answers "stopexe busy" for the overflow).
     t0 = time.perf_counter()
-    try:
-        results = list(sender.send_batch(*([command] * n), timeout=timeout))
-    except Exception as exc:
-        raise ValueError(str(exc))
+    results: list = []
+    for start in range(0, n, STOPEXE_SLOTS):
+        chunk = [command] * min(STOPEXE_SLOTS, n - start)
+        try:
+            results.extend(sender.send_batch(*chunk, timeout=timeout))
+        except Exception as exc:
+            raise ValueError(str(exc))
+        if start + len(chunk) < n:
+            time.sleep(0.05)
     ms = (time.perf_counter() - t0) * 1000.0
     if results and all((not ok) and "unknown cmd" in str(detail).lower()
                        for ok, detail in results):
